@@ -1674,15 +1674,15 @@ ipv6_policy(struct __ctx_buff *ctx, struct ipv6hdr *ip6, __u32 src_label,
 		goto redirect_to_proxy;
 
 	/* Not redirected to host / proxy. */
-	send_trace_notify6(ctx, TRACE_TO_LXC, src_label, SECLABEL_IPV6, &orig_sip,
-			   LXC_ID, ifindex, trace.reason, trace.monitor);
+	send_trace_notify_xlated6(ctx, TRACE_TO_LXC, src_label, SECLABEL_IPV6, &orig_sip,
+				  LXC_ID, ifindex, trace.reason, trace.monitor);
 
 	return CTX_ACT_OK;
 
 redirect_to_proxy:
-	send_trace_notify6(ctx, TRACE_TO_PROXY, src_label, SECLABEL_IPV6, &orig_sip,
-			   bpf_ntohs(*proxy_port), ifindex, trace.reason,
-			   trace.monitor);
+	send_trace_notify_xlated6(ctx, TRACE_TO_PROXY, src_label, SECLABEL_IPV6, &orig_sip,
+				  bpf_ntohs(*proxy_port), ifindex, trace.reason,
+				  trace.monitor);
 	if (tuple_out)
 		memcpy(tuple_out, tuple, sizeof(*tuple));
 	return POLICY_ACT_PROXY_REDIRECT;
@@ -2020,15 +2020,15 @@ ipv4_policy(struct __ctx_buff *ctx, struct iphdr *ip4, __u32 src_label,
 		goto redirect_to_proxy;
 
 	/* Not redirected to host / proxy. */
-	send_trace_notify4(ctx, TRACE_TO_LXC, src_label, SECLABEL_IPV4, orig_sip,
-			   LXC_ID, ifindex, trace.reason, trace.monitor);
+	send_trace_notify_xlated4(ctx, TRACE_TO_LXC, src_label, SECLABEL_IPV4, orig_sip,
+				  LXC_ID, ifindex, trace.reason, trace.monitor);
 
 	return CTX_ACT_OK;
 
 redirect_to_proxy:
-	send_trace_notify4(ctx, TRACE_TO_PROXY, src_label, SECLABEL_IPV4, orig_sip,
-			   bpf_ntohs(*proxy_port), ifindex, trace.reason,
-			   trace.monitor);
+	send_trace_notify_xlated4(ctx, TRACE_TO_PROXY, src_label, SECLABEL_IPV4, orig_sip,
+				  bpf_ntohs(*proxy_port), ifindex, trace.reason,
+				  trace.monitor);
 	if (tuple_out)
 		*tuple_out = *tuple;
 	return POLICY_ACT_PROXY_REDIRECT;

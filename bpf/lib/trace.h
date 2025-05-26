@@ -401,17 +401,17 @@ _send_trace_notify6(struct __ctx_buff *ctx, enum trace_point obs_point,
 	__MAGIC_LINE__, __MAGIC_FILE__)
 
 /*
- * send_trace_notify4 emits a trace notify from an IPv4 codepath while also specifying the
+ * send_trace_notify_xlated4 emits a trace notify from an IPv4 codepath while also specifying the
  * original IPv4 address before translation (orig_addr).
  */
-#define send_trace_notify4(ctx, obs_point, src, dst, orig_addr, dst_id, ifindex, reason, monitor) \
+#define send_trace_notify_xlated4(ctx, obs_point, src, dst, orig_addr, dst_id, ifindex, reason, monitor) \
 	_send_trace_notify4(ctx, obs_point, src, dst, orig_addr, dst_id, ifindex, reason, monitor, \
 	__MAGIC_LINE__, __MAGIC_FILE__)
 
 /*
- * send_trace_notify6 emits a trace notify from an IPv6 codepath while also specifying the
+ * send_trace_notify_xlated6 emits a trace notify from an IPv6 codepath while also specifying the
  * original IPv6 address before translation (orig_addr).
  */
-#define send_trace_notify6(ctx, obs_point, src, dst, orig_addr, dst_id, ifindex, reason, monitor) \
+#define send_trace_notify_xlated6(ctx, obs_point, src, dst, orig_addr, dst_id, ifindex, reason, monitor) \
 	_send_trace_notify6(ctx, obs_point, src, dst, orig_addr, dst_id, ifindex, reason, monitor, \
 	__MAGIC_LINE__, __MAGIC_FILE__)
