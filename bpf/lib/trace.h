@@ -243,7 +243,7 @@ _send_trace_notify(struct __ctx_buff *ctx, enum trace_point obs_point,
 			return;
 	}
 
-	flags = ctx_classify(ctx);
+	flags = ctx_classify(ctx, 0);
 
 	msg = (typeof(msg)) {
 		__notify_common_hdr(CILIUM_NOTIFY_TRACE, obs_point),
@@ -292,8 +292,7 @@ _send_trace_notify4(struct __ctx_buff *ctx, enum trace_point obs_point,
 			return;
 	}
 
-	flags = ctx_classify(ctx);
-
+	flags = ctx_classify(ctx, bpf_htons(ETH_P_IP));
 
 	msg = (typeof(msg)) {
 		__notify_common_hdr(CILIUM_NOTIFY_TRACE, obs_point),
@@ -342,7 +341,7 @@ _send_trace_notify6(struct __ctx_buff *ctx, enum trace_point obs_point,
 			return;
 	}
 
-	flags = ctx_classify(ctx) | CLS_FLAG_IPV6;
+	flags = ctx_classify(ctx, bpf_htons(ETH_P_IPV6)) | CLS_FLAG_IPV6;
 
 	msg = (typeof(msg)) {
 		__notify_common_hdr(CILIUM_NOTIFY_TRACE, obs_point),

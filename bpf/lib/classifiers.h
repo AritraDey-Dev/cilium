@@ -37,6 +37,7 @@ enum {
 /**
  * ctx_classify
  * @ctx: socket buffer
+ * @proto: the layer 3 protocol (ETH_P_IP, ETH_P_IPV6). 0 if unknown.
  *
  * Compute classifiers (CLS_FLAG_*) for the given packet to be used during
  * trace/drop notification events. In the worst case, three different checks
@@ -54,14 +55,13 @@ enum {
  * needed to execute, make sure to use `revalidate_data_pull` before `ctx_classify`.
  */
 static __always_inline cls_flags_t
-ctx_classify(struct __ctx_buff *ctx)
+ctx_classify(struct __ctx_buff *ctx, __be16 proto)
 {
 	cls_flags_t flags = CLS_FLAG_NONE;
 	struct {
 		__be16 sport;
 		__be16 dport;
 	} l4;
-	__be16 proto = 0;
 	__u8 l4_proto;
 	int l3_hdrlen;
 #if defined(ENABLE_IPV6) || defined(ENABLE_IPV4)
@@ -82,7 +82,8 @@ ctx_classify(struct __ctx_buff *ctx)
 	 */
 	if (ETH_HLEN == 0) {
 		flags |= CLS_FLAG_L3_DEV;
-		proto = ctx_get_protocol(ctx);
+		if (!proto)
+			proto = ctx_get_protocol(ctx);
 		if (proto == bpf_htons(ETH_P_IPV6))
 			flags |=  CLS_FLAG_IPV6;
 	}

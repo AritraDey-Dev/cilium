@@ -97,6 +97,7 @@ check(struct __ctx_buff *ctx, bool is_ipv4)
 	struct ipv6hdr *ip6;
 	struct udphdr *udp;
 	cls_flags_t flags;
+	__be16 proto = is_ipv4 ? bpf_htons(ETH_P_IP) : bpf_htons(ETH_P_IPV6);
 
 	/* Parse L3/L4 once. */
 	if (is_ipv4) {
@@ -116,7 +117,7 @@ check(struct __ctx_buff *ctx, bool is_ipv4)
 	 * - CLS_FLAG_IPv6 is set with IPv6 packets and ETH_HLEN is zero.
 	 */
 	TEST("native", {
-		flags = ctx_classify(ctx);
+		flags = ctx_classify(ctx, proto);
 		L3_DEVICE_CHECK(flags, is_ipv4);
 	})
 
@@ -125,7 +126,7 @@ check(struct __ctx_buff *ctx, bool is_ipv4)
 	 */
 	TEST("overlay-by-mark", {
 		ctx->mark = MARK_MAGIC_OVERLAY;
-		flags = ctx_classify(ctx);
+		flags = ctx_classify(ctx, proto);
 		L3_DEVICE_CHECK(flags, is_ipv4);
 		assert(flags & CLS_FLAG_VXLAN);
 	})
@@ -136,7 +137,7 @@ check(struct __ctx_buff *ctx, bool is_ipv4)
 	TEST("overlay-by-headers", {
 		ctx->mark = 0;
 		udp->source = bpf_htons(TUNNEL_PORT);
-		flags = ctx_classify(ctx);
+		flags = ctx_classify(ctx, proto);
 		L3_DEVICE_CHECK(flags, is_ipv4);
 		assert(flags & CLS_FLAG_VXLAN);
 	})
