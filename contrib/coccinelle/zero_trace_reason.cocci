@@ -20,7 +20,7 @@ position p;
 @@
 
 (
-  send_trace_notify@f(e1, e2, e3, e4, e5, e6,
+  \(send_trace_notify@f\|send_trace_notify4@f\|send_trace_notify6@f\)(e1, e2, e3, e4, e5, e6,
 - 0@p,
 + TRACE_REASON_UNKNOWN,
   e7);
