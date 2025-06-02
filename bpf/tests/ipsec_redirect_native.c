@@ -52,10 +52,8 @@ int ipsec_redirect_setup(struct __ctx_buff *ctx, bool is_ipv4)
 
 	map_update_elem(&cilium_encrypt_state, &encrypt_key, &cfg, BPF_ANY);
 
-	if (is_ipv4)
-		node_v4_add_entry(DST_NODE_IP, DST_NODE_ID, TARGET_SPI);
-	else
-		node_v6_add_entry((const union v6addr *)DST_NODE_IP_6, DST_NODE_ID, TARGET_SPI);
+	/* Setup IPv4 only has we're using a IPv4 tunnel endpoint in all cases. */
+	node_v4_add_entry(DST_NODE_IP, DST_NODE_ID, TARGET_SPI);
 
 	set_src_identity(is_ipv4, SOURCE_IDENTITY);
 	set_dst_identity(is_ipv4, DST_IDENTITY);
