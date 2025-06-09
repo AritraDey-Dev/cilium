@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
 
-#include "common.h"
-
 #include <bpf/ctx/skb.h>
+#include "common.h"
 #include "pktgen.h"
-
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
 
 /* Enable code paths under test */
 #define ENABLE_IPV6
@@ -16,12 +12,7 @@
 #define DSR_ENCAP_GENEVE	3
 #define ENABLE_HOST_ROUTING
 
-#define DISABLE_LOOPBACK_LB
 #define ENABLE_SKIP_FIB		1
-
-/* Skip ingress policy checks, not needed to validate hairpin flow */
-#define USE_BPF_PROG_FOR_INGRESS_POLICY
-#undef FORCE_LOCAL_POLICY_EVAL_AT_SOURCE
 
 #define CLIENT_IP	{ .addr = { 0x1, 0x0, 0x0, 0x0, 0x0, 0x0 } }
 #define CLIENT_PORT	__bpf_htons(111)
@@ -32,11 +23,36 @@
 #define BACKEND_IP	{ .addr = { 0x3, 0x0, 0x0, 0x0, 0x0, 0x0 } }
 #define BACKEND_PORT	__bpf_htons(8080)
 
+#define BACKEND_EP_ID		127
+
 static volatile const __u8 *client_mac = mac_one;
 static volatile const __u8 *node_mac = mac_three;
 static volatile const __u8 *backend_mac = mac_four;
 
-#define SECCTX_FROM_IPCACHE 1
+__section_entry
+int mock_handle_policy(struct __ctx_buff *ctx __maybe_unused)
+{
+	return TC_ACT_REDIRECT;
+}
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(max_entries, 256);
+	__array(values, int());
+} mock_policy_call_map __section(".maps") = {
+	.values = {
+		[BACKEND_EP_ID] = &mock_handle_policy,
+	},
+};
+
+#define tail_call_dynamic mock_tail_call_dynamic
+static __always_inline __maybe_unused void
+mock_tail_call_dynamic(struct __ctx_buff *ctx __maybe_unused,
+		       const void *map __maybe_unused, __u32 slot __maybe_unused)
+{
+	tail_call(ctx, &mock_policy_call_map, slot);
+}
 
 #include "bpf_host.c"
 
@@ -102,7 +118,7 @@ int nodeport_dsr_backend_pktgen(struct __ctx_buff *ctx)
 
 	opt->opt_type = DSR_IPV6_OPT_TYPE;
 	opt->opt_len = DSR_IPV6_OPT_LEN;
-	ipv6_addr_copy((union v6addr *)&opt->addr, &frontend_ip);
+	ipv6_addr_copy_unaligned((union v6addr *)&opt->addr, &frontend_ip);
 	opt->port = FRONTEND_PORT;
 
 	/* Push TCP header */
@@ -129,13 +145,13 @@ int nodeport_dsr_backend_setup(struct __ctx_buff *ctx)
 	union v6addr backend_ip = BACKEND_IP;
 
 	/* add local backend */
-	endpoint_v6_add_entry(&backend_ip, 0, 0, 0,
+	endpoint_v6_add_entry(&backend_ip, 0, BACKEND_EP_ID, 0, 0,
 			      (__u8 *)backend_mac, (__u8 *)node_mac);
 
 	ipcache_v6_add_entry(&backend_ip, 0, 112233, 0, 0);
 
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, FROM_NETDEV);
+	tail_call_static(ctx, entry_call_map, FROM_NETDEV);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
 }
@@ -215,12 +231,21 @@ int nodeport_dsr_backend_check(struct __ctx_buff *ctx)
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
 
-	struct ipv6_ct_tuple tuple;
+	struct ipv6_ct_tuple tuple __align_stack_8;
 	struct ct_entry *ct_entry;
-	int l4_off, ret;
+	fraginfo_t fraginfo;
+	int l3_off, l4_off, ret;
 
-	ret = lb6_extract_tuple(ctx, l3, sizeof(*status_code) + ETH_HLEN,
-				&l4_off, &tuple);
+	l3_off = sizeof(*status_code) + ETH_HLEN;
+
+	tuple.nexthdr = l3->nexthdr;
+	ret = ipv6_hdrlen_offset(ctx, l3_off, &tuple.nexthdr, &fraginfo);
+	if (ret < 0)
+		return ret;
+
+	l4_off = l3_off + ret;
+
+	ret = lb6_extract_tuple(ctx, l3, fraginfo, l4_off, &tuple);
 	assert(!IS_ERR(ret));
 
 	tuple.flags = TUPLE_F_IN;
@@ -229,8 +254,8 @@ int nodeport_dsr_backend_check(struct __ctx_buff *ctx)
 	ct_entry = map_lookup_elem(get_ct_map6(&tuple), &tuple);
 	if (!ct_entry)
 		test_fatal("no CT entry for DSR found");
-	if (!ct_entry->dsr)
-		test_fatal("CT entry doesn't have the .dsr flag set");
+	if (!ct_entry->dsr_internal)
+		test_fatal("CT entry doesn't have the .dsr_internal flag set");
 
 	struct ipv6_nat_entry *nat_entry;
 
@@ -248,6 +273,7 @@ int nodeport_dsr_backend_check(struct __ctx_buff *ctx)
 	test_finish();
 }
 
+static __always_inline
 int build_reply(struct __ctx_buff *ctx)
 {
 	union v6addr backend_ip = BACKEND_IP;
@@ -276,6 +302,7 @@ int build_reply(struct __ctx_buff *ctx)
 	return 0;
 }
 
+static __always_inline
 int check_reply(const struct __ctx_buff *ctx)
 {
 	union v6addr frontend_ip = FRONTEND_IP;
@@ -327,6 +354,9 @@ int check_reply(const struct __ctx_buff *ctx)
 	if (l4->dest != CLIENT_PORT)
 		test_fatal("dst port has changed");
 
+	if (l4->check != bpf_htons(0x2dbc))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+
 	test_finish();
 }
 
@@ -343,7 +373,7 @@ SETUP("tc", "tc_nodeport_dsr_backend_reply")
 int nodeport_dsr_backend_reply_reply_setup(struct __ctx_buff *ctx)
 {
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, TO_NETDEV);
+	tail_call_static(ctx, entry_call_map, TO_NETDEV);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
 }

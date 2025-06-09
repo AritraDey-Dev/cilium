@@ -4,9 +4,16 @@ on:
   schedule:
     - cron: '39 0 * * *'
 
+# For testing uncomment following lines:
+#  push:
+#    branches:
+#      - your_branch_name
+
 permissions:
   # To be able to access the repository with actions/checkout
   contents: read
+  # To be able to request the JWT from GitHub's OIDC provider
+  id-token: write
 
 concurrency:
   # Structure:
@@ -28,32 +35,33 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # renovate: datasource=github-releases depName=kubernetes/kops
-  kops_version: v1.28.1
   # renovate: datasource=golang-version depName=go
-  go_version: 1.21.5
+  go_version: 1.24.3
   # Adding k8s.local to the end makes kops happy-
   # has stricter DNS naming requirements.
   test_name: node-throughput
-  cluster_base_name: ${{ github.run_id }}-${{ github.run_attempt }}.k8s.local
+  cluster_name: ${{ github.run_id }}-${{ github.run_attempt }}
   GCP_PERF_RESULTS_BUCKET: gs://cilium-scale-results
-  CILIUM_CLI_MODE: helm
+  # renovate: datasource=docker depName=google/cloud-sdk
+  gcloud_version: 524.0.0
 
 jobs:
   install-and-scaletest:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     name: Install and Scale Test
     timeout-minutes: 120
+    env:
+      job_name: "Install and Scale Test"
     steps:
       - name: Checkout context ref (trusted)
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ inputs.context-ref || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Set Environment Variables
         uses: ./.github/actions/set-env-variables
-      
+
       - name: Get Cilium's default values
         id: default_vars
         uses: ./.github/actions/helm-default
@@ -67,9 +75,12 @@ jobs:
 
           # Setup Cilium install options
           CILIUM_INSTALL_DEFAULTS="${{ steps.default_vars.outputs.cilium_install_defaults }} \
+            --helm-set=cluster.name=${{ env.cluster_name }} \
             --wait=false"
 
-          CLUSTER_NAME="${{ env.test_name }}-${{ env.cluster_base_name }}"
+          # Adding k8s.local to the end makes kops happy
+          # has stricter DNS naming requirements.
+          CLUSTER_NAME="${{ env.test_name }}-${{ env.cluster_name }}.k8s.local"
 
           echo SHA=${SHA} >> $GITHUB_OUTPUT
           echo cilium_install_defaults=${CILIUM_INSTALL_DEFAULTS} >> $GITHUB_OUTPUT
@@ -84,41 +95,63 @@ jobs:
           done
 
       - name: Install Go
-        uses: actions/setup-go@93397bea11091df50f3d7e59dc26a7711a8bcfbe # v4.1.0
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           go-version: ${{ env.go_version }}
 
-      - name: Install Cilium CLI
-        uses: cilium/cilium-cli@c1fa8afda634f0457e9905d4f638e5164c4e0fc8 # v0.15.17
-        with:
-          repository: ${{ env.CILIUM_CLI_RELEASE_REPO }}
-          release-version: ${{ env.CILIUM_CLI_VERSION }}
-
       - name: Install Kops
-        uses: cilium/scale-tests-action/install-kops@8a522b9d71254b6f6615c296e41a70610c9615ea # main
-        with:
-          release_version: ${{ env.kops_version }}
+        uses: cilium/scale-tests-action/install-kops@b83e200cdea7099967b48cdad1d7275b949f7dc0 # main
 
       - name: Setup gcloud credentials
-        uses: google-github-actions/auth@67e9c72af6e0492df856527b474995862b7b6591 # v2.0.0
+        uses: google-github-actions/auth@ba79af03959ebeac9769e648f473a284504d9193 # v2.1.10
         with:
-          credentials_json: '${{ secrets.GCP_PERF_SA_KEY }}'
+          workload_identity_provider: ${{ secrets.GCP_PERF_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_PERF_SA }}
+          create_credentials_file: true
+          export_environment_variables: true
 
       - name: Setup gcloud CLI
-        uses: google-github-actions/setup-gcloud@e30db14379863a8c79331b04a9969f4c1e225e0b # v1.1.1
+        uses: google-github-actions/setup-gcloud@77e7a554d41e2ee56fc945c52dfd3f33d12def9a # v2.1.4
         with:
           project_id: ${{ secrets.GCP_PERF_PROJECT_ID }}
-          version: "405.0.0"
-      
+          version: ${{ env.gcloud_version }}
+
       - name: Clone ClusterLoader2
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: cilium/perf-tests
-          ref: 6f1bf283e22aa4c29d5db2a7b52501b091a0912e # master
+          repository: kubernetes/perf-tests
+          # Avoid using renovate to update this dependency because: (1)
+          # perf-tests does not tag or release, so renovate will pull
+          # all updates to the default branch and (2) continually
+          # updating CL2 may impact the stability of the scale test
+          # results.
+          ref: 920c39ef245a81bd8fb39d7fecf39eb35820d9ef
           persist-credentials: false
           sparse-checkout: clusterloader2
           path: perf-tests
-      
+
+      - name: Deploy cluster
+        id: deploy-cluster
+        uses: cilium/scale-tests-action/create-cluster@b83e200cdea7099967b48cdad1d7275b949f7dc0 # main
+        timeout-minutes: 30
+        with:
+          cluster_name: ${{ steps.vars.outputs.cluster_name }}
+          control_plane_size: n2-standard-4
+          control_plane_count: 1
+          node_size: e2-standard-8
+          node_count: 1
+          kops_state: ${{ secrets.GCP_PERF_KOPS_STATE_STORE }}
+          project_id: ${{ secrets.GCP_PERF_PROJECT_ID }}
+
+      - name: Install Cilium CLI
+        uses: cilium/cilium-cli@e7f03e4ec38a7008f4f5b9855ca9df721a9db185 # v0.18.3
+        with:
+          skip-build: ${{ env.CILIUM_CLI_SKIP_BUILD }}
+          image-repo: ${{ env.CILIUM_CLI_IMAGE_REPO }}
+          image-tag: ${{ steps.vars.outputs.SHA }}
+          repository: ${{ env.CILIUM_CLI_RELEASE_REPO }}
+          release-version: ${{ env.CILIUM_CLI_VERSION }}
+
       - name: Display version info of installed tools
         run: |
           echo "--- go ---"
@@ -130,30 +163,17 @@ jobs:
           echo "--- gcloud ---"
           gcloud version
 
-      - name: Deploy cluster
-        id: deploy-cluster
-        uses: cilium/scale-tests-action/create-cluster@8a522b9d71254b6f6615c296e41a70610c9615ea # main
-        timeout-minutes: 30
-        with:
-          cluster_name: ${{ steps.vars.outputs.cluster_name }}
-          control_plane_size: n2-standard-4
-          control_plane_count: 1
-          node_size: e2-standard-8
-          node_count: 1
-          kops_state: ${{ secrets.GCP_PERF_KOPS_STATE_STORE }}
-          project_id: ${{ secrets.GCP_PERF_PROJECT_ID }}
-      
       - name: Setup firewall rules
-        uses: cilium/scale-tests-action/setup-firewall@8a522b9d71254b6f6615c296e41a70610c9615ea # main
+        uses: cilium/scale-tests-action/setup-firewall@b83e200cdea7099967b48cdad1d7275b949f7dc0 # main
         with:
           cluster_name: ${{ steps.vars.outputs.cluster_name }}
-      
+
       - name: Install Cilium
         run: |
           cilium install ${{ steps.vars.outputs.cilium_install_defaults }}
 
       - name: Wait for cluster to be ready
-        uses: cilium/scale-tests-action/validate-cluster@8a522b9d71254b6f6615c296e41a70610c9615ea # main
+        uses: cilium/scale-tests-action/validate-cluster@b83e200cdea7099967b48cdad1d7275b949f7dc0 # main
         timeout-minutes: 20
         with:
           cluster_name: ${{ steps.vars.outputs.cluster_name }}
@@ -161,8 +181,8 @@ jobs:
 
       - name: Wait for Cilium status to be ready
         run: |
-          cilium status --wait
-      
+          cilium status --wait --interactive=false
+
       - name: Run CL2
         id: run-cl2
         working-directory: ./perf-tests/clusterloader2
@@ -173,6 +193,8 @@ jobs:
         run: |
           mkdir ./report
           echo POD_STARTUP_LATENCY_THRESHOLD: 60s >> ./testoverrides.yaml
+          echo POD_COUNT: 98 >> ./testoverrides.yaml
+
           go run ./cmd/clusterloader.go \
             -v=4 \
             --testconfig=./testing/node-throughput/config.yaml \
@@ -180,27 +202,29 @@ jobs:
             --enable-exec-service=false \
             --provider=gce \
             --enable-prometheus-server \
+            --testoverrides=./testing/prometheus/not-scrape-kube-proxy.yaml \
             --tear-down-prometheus-server=false \
             --report-dir=./report \
             --kubeconfig=$HOME/.kube/config \
             2>&1 | tee cl2-output.txt
 
-      - name: Get sysdump
-        if: ${{ always() && steps.run-cl2.outcome != 'skipped' }}
-        run: |
-          cilium status
-          cilium sysdump --output-filename cilium-sysdump-final
+      - name: Run common post steps
+        if: ${{ always() }}
+        uses: ./.github/actions/post-logic
+        with:
+          artifacts_suffix: "${{ env.job_name }}"
+          job_status: "${{ job.status }}"
 
       - name: Cleanup cluster
         if: ${{ always() && steps.deploy-cluster.outcome != 'skipped' }}
-        uses: cilium/scale-tests-action/cleanup-cluster@8a522b9d71254b6f6615c296e41a70610c9615ea # main
+        uses: cilium/scale-tests-action/cleanup-cluster@b83e200cdea7099967b48cdad1d7275b949f7dc0 # main
         with:
           cluster_name: ${{ steps.vars.outputs.cluster_name }}
           kops_state: ${{ secrets.GCP_PERF_KOPS_STATE_STORE }}
 
       - name: Export results and sysdump to GS bucket
         if: ${{ always() && steps.run-cl2.outcome != 'skipped' }}
-        uses: cilium/scale-tests-action/export-results@8a522b9d71254b6f6615c296e41a70610c9615ea # main
+        uses: cilium/scale-tests-action/export-results@b83e200cdea7099967b48cdad1d7275b949f7dc0 # main
         with:
           test_name: ${{ env.test_name }}
           results_bucket: ${{ env.GCP_PERF_RESULTS_BUCKET }}

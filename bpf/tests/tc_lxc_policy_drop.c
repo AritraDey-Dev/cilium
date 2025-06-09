@@ -1,16 +1,9 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
 
-#include "common.h"
-
 #include <bpf/ctx/skb.h>
+#include "common.h"
 #include "pktgen.h"
-
-#define LXC_IPV4 (__be32)v4_pod_one
-#include "config_replacement.h"
-
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
 
 /* Enable code paths under test */
 #define ENABLE_IPV4
@@ -23,12 +16,12 @@
 
 #define NODE_IP			v4_node_one
 
-#define SECCTX_FROM_IPCACHE 1
-
 static volatile const __u8 *client_mac = mac_one;
 static volatile const __u8 *server_mac = mac_two;
 
 #include "bpf_lxc.c"
+
+ASSIGN_CONFIG(union v4addr, endpoint_ipv4, { .be32 = v4_pod_one})
 
 #include "lib/policy.h"
 
@@ -82,7 +75,7 @@ int tc_lxc_policy_drop__setup(struct __ctx_buff *ctx)
 	policy_add_egress_deny_all_entry();
 
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, FROM_CONTAINER);
+	tail_call_static(ctx, entry_call_map, FROM_CONTAINER);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
 }

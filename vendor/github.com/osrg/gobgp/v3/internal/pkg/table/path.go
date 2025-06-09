@@ -143,6 +143,30 @@ type Path struct {
 	IsWithdraw       bool
 }
 
+type FilteredType uint8
+
+const (
+	NotFiltered FilteredType = 1 << iota
+	PolicyFiltered
+	SendMaxFiltered
+)
+
+type PathDestLocalKey struct {
+	Family bgp.RouteFamily
+	Prefix string
+}
+type PathLocalKey struct {
+	PathDestLocalKey
+	Id uint32
+}
+
+func NewPathDestLocalKey(f bgp.RouteFamily, destPrefix string) *PathDestLocalKey {
+	return &PathDestLocalKey{
+		Family: f,
+		Prefix: destPrefix,
+	}
+}
+
 var localSource = &PeerInfo{}
 
 func NewPath(source *PeerInfo, nlri bgp.AddrPrefixInterface, isWithdraw bool, pattrs []bgp.PathAttributeInterface, timestamp time.Time, noImplicitWithdraw bool) *Path {
@@ -566,7 +590,7 @@ func (path *Path) String() string {
 		s.WriteString(fmt.Sprintf("{ %s EOR | src: %s }", path.GetRouteFamily(), path.GetSource()))
 		return s.String()
 	}
-	s.WriteString(fmt.Sprintf("{ %s | ", path.getPrefix()))
+	s.WriteString(fmt.Sprintf("{ %s | ", path.GetPrefix()))
 	s.WriteString(fmt.Sprintf("src: %s", path.GetSource()))
 	s.WriteString(fmt.Sprintf(", nh: %s", path.GetNexthop()))
 	if path.IsNexthopInvalid {
@@ -579,7 +603,23 @@ func (path *Path) String() string {
 	return s.String()
 }
 
-func (path *Path) getPrefix() string {
+// GetLocalKey identifies the path in the local BGP server.
+func (path *Path) GetLocalKey() PathLocalKey {
+	return PathLocalKey{
+		PathDestLocalKey: path.GetDestLocalKey(),
+		Id:               path.GetNlri().PathLocalIdentifier(),
+	}
+}
+
+// GetDestLocalKey identifies the path destination in the local BGP server.
+func (path *Path) GetDestLocalKey() PathDestLocalKey {
+	return PathDestLocalKey{
+		Family: path.GetRouteFamily(),
+		Prefix: path.GetNlri().String(),
+	}
+}
+
+func (path *Path) GetPrefix() string {
 	return path.GetNlri().String()
 }
 
@@ -618,7 +658,6 @@ func (path *Path) GetAsList() []uint32 {
 
 func (path *Path) GetAsSeqList() []uint32 {
 	return path.getAsListOfSpecificType(true, false)
-
 }
 
 func (path *Path) getAsListOfSpecificType(getAsSeq, getAsSet bool) []uint32 {
@@ -883,6 +922,16 @@ func (path *Path) SetExtCommunities(exts []bgp.ExtendedCommunityInterface, doRep
 	} else {
 		path.setPathAttr(bgp.NewPathAttributeExtendedCommunities(exts))
 	}
+}
+
+func (path *Path) GetRouteTargets() []bgp.ExtendedCommunityInterface {
+	rts := make([]bgp.ExtendedCommunityInterface, 0)
+	for _, ec := range path.GetExtCommunities() {
+		if t, st := ec.GetTypes(); t <= bgp.EC_TYPE_TRANSITIVE_FOUR_OCTET_AS_SPECIFIC && st == bgp.EC_SUBTYPE_ROUTE_TARGET {
+			rts = append(rts, ec)
+		}
+	}
+	return rts
 }
 
 func (path *Path) GetLargeCommunities() []*bgp.LargeCommunity {
@@ -1164,7 +1213,7 @@ func (p *Path) ToGlobal(vrf *Vrf) *Path {
 			nlri = bgp.NewMUPDirectSegmentDiscoveryRoute(vrf.Rd, old.Address)
 		case bgp.MUP_ROUTE_TYPE_TYPE_1_SESSION_TRANSFORMED:
 			old := n.RouteTypeData.(*bgp.MUPType1SessionTransformedRoute)
-			nlri = bgp.NewMUPType1SessionTransformedRoute(vrf.Rd, old.Prefix, old.TEID, old.QFI, old.EndpointAddress)
+			nlri = bgp.NewMUPType1SessionTransformedRoute(vrf.Rd, old.Prefix, old.TEID, old.QFI, old.EndpointAddress, old.SourceAddress)
 		case bgp.MUP_ROUTE_TYPE_TYPE_2_SESSION_TRANSFORMED:
 			old := n.RouteTypeData.(*bgp.MUPType2SessionTransformedRoute)
 			nlri = bgp.NewMUPType2SessionTransformedRoute(vrf.Rd, old.EndpointAddressLength, old.EndpointAddress, old.TEID)
@@ -1244,6 +1293,12 @@ func (p *Path) SetHash(v uint32) {
 
 func (p *Path) GetHash() uint32 {
 	return p.attrsHash
+}
+
+func (p *Path) SetSource(peerInfo *PeerInfo) {
+	if p.info != nil {
+		p.info.source = peerInfo
+	}
 }
 
 func nlriToIPNet(nlri bgp.AddrPrefixInterface) *net.IPNet {

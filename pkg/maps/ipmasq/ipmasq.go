@@ -4,12 +4,12 @@
 package ipmasq
 
 import (
-	"net"
+	"net/netip"
 	"sync"
 
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/ebpf"
-	"github.com/cilium/cilium/pkg/ip"
+	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/types"
 )
@@ -51,7 +51,7 @@ var (
 	onceIPv6   sync.Once
 )
 
-func IPMasq4Map() *bpf.Map {
+func IPMasq4Map(registry *metrics.Registry) *bpf.Map {
 	onceIPv4.Do(func() {
 		ipMasq4Map = bpf.NewMap(
 			MapNameIPv4,
@@ -60,13 +60,13 @@ func IPMasq4Map() *bpf.Map {
 			&Value{},
 			MaxEntriesIPv4,
 			bpf.BPF_F_NO_PREALLOC,
-		).WithCache().WithPressureMetric().
+		).WithCache().WithPressureMetric(registry).
 			WithEvents(option.Config.GetEventBufferConfig(MapNameIPv4))
 	})
 	return ipMasq4Map
 }
 
-func IPMasq6Map() *bpf.Map {
+func IPMasq6Map(registry *metrics.Registry) *bpf.Map {
 	onceIPv6.Do(func() {
 		ipMasq6Map = bpf.NewMap(
 			MapNameIPv6,
@@ -75,35 +75,37 @@ func IPMasq6Map() *bpf.Map {
 			&Value{},
 			MaxEntriesIPv6,
 			bpf.BPF_F_NO_PREALLOC,
-		).WithCache().WithPressureMetric().
+		).WithCache().WithPressureMetric(registry).
 			WithEvents(option.Config.GetEventBufferConfig(MapNameIPv6))
 	})
 	return ipMasq6Map
 }
 
-type IPMasqBPFMap struct{}
+type IPMasqBPFMap struct {
+	MetricsRegistry *metrics.Registry
+}
 
-func (*IPMasqBPFMap) Update(cidr net.IPNet) error {
-	if ip.IsIPv4(cidr.IP) {
+func (m *IPMasqBPFMap) Update(cidr netip.Prefix) error {
+	if cidr.Addr().Is4() {
 		if option.Config.EnableIPv4Masquerade {
-			return IPMasq4Map().Update(keyIPv4(cidr), &Value{})
+			return IPMasq4Map(m.MetricsRegistry).Update(keyIPv4(cidr), &Value{})
 		}
 	} else {
 		if option.Config.EnableIPv6Masquerade {
-			return IPMasq6Map().Update(keyIPv6(cidr), &Value{})
+			return IPMasq6Map(m.MetricsRegistry).Update(keyIPv6(cidr), &Value{})
 		}
 	}
 	return nil
 }
 
-func (*IPMasqBPFMap) Delete(cidr net.IPNet) error {
-	if ip.IsIPv4(cidr.IP) {
+func (m *IPMasqBPFMap) Delete(cidr netip.Prefix) error {
+	if cidr.Addr().Is4() {
 		if option.Config.EnableIPv4Masquerade {
-			return IPMasq4Map().Delete(keyIPv4(cidr))
+			return IPMasq4Map(m.MetricsRegistry).Delete(keyIPv4(cidr))
 		}
 	} else {
 		if option.Config.EnableIPv6Masquerade {
-			return IPMasq6Map().Delete(keyIPv6(cidr))
+			return IPMasq6Map(m.MetricsRegistry).Delete(keyIPv6(cidr))
 		}
 	}
 	return nil
@@ -115,10 +117,10 @@ func (*IPMasqBPFMap) Delete(cidr net.IPNet) error {
 // specify which protocol we need when ipMasq4Map/ipMasq6Map, or config
 // options, have not been set, as is the case when calling from the CLI, for
 // example.
-func (*IPMasqBPFMap) DumpForProtocols(ipv4Needed, ipv6Needed bool) ([]net.IPNet, error) {
-	cidrs := []net.IPNet{}
+func (*IPMasqBPFMap) DumpForProtocols(ipv4Needed, ipv6Needed bool) ([]netip.Prefix, error) {
+	cidrs := []netip.Prefix{}
 	if ipv4Needed {
-		if err := IPMasq4Map().DumpWithCallback(
+		if err := IPMasq4Map(nil).DumpWithCallback(
 			func(keyIPv4 bpf.MapKey, _ bpf.MapValue) {
 				cidrs = append(cidrs, keyToIPNetIPv4(keyIPv4.(*Key4)))
 			}); err != nil {
@@ -126,7 +128,7 @@ func (*IPMasqBPFMap) DumpForProtocols(ipv4Needed, ipv6Needed bool) ([]net.IPNet,
 		}
 	}
 	if ipv6Needed {
-		if err := IPMasq6Map().DumpWithCallback(
+		if err := IPMasq6Map(nil).DumpWithCallback(
 			func(keyIPv6 bpf.MapKey, _ bpf.MapValue) {
 				cidrs = append(cidrs, keyToIPNetIPv6(keyIPv6.(*Key6)))
 			}); err != nil {
@@ -138,46 +140,28 @@ func (*IPMasqBPFMap) DumpForProtocols(ipv4Needed, ipv6Needed bool) ([]net.IPNet,
 
 // Dump dumps the contents of the ip-masq-agent maps for IPv4 and/or IPv6, as
 // required based on configuration options.
-func (*IPMasqBPFMap) Dump() ([]net.IPNet, error) {
+func (*IPMasqBPFMap) Dump() ([]netip.Prefix, error) {
 	return (&IPMasqBPFMap{}).DumpForProtocols(option.Config.EnableIPv4Masquerade, option.Config.EnableIPv6Masquerade)
 }
 
-func keyIPv4(cidr net.IPNet) *Key4 {
-	ones, _ := cidr.Mask.Size()
+func keyIPv4(cidr netip.Prefix) *Key4 {
+	ones := cidr.Bits()
 	key := &Key4{PrefixLen: uint32(ones)}
-	copy(key.Address[:], cidr.IP.To4())
+	copy(key.Address[:], cidr.Masked().Addr().AsSlice())
 	return key
 }
 
-func keyToIPNetIPv4(key *Key4) net.IPNet {
-	var (
-		cidr net.IPNet
-		ip   types.IPv4
-	)
-
-	cidr.Mask = net.CIDRMask(int(key.PrefixLen), 32)
-	key.Address.DeepCopyInto(&ip)
-	cidr.IP = ip.IP()
-
-	return cidr
+func keyToIPNetIPv4(key *Key4) netip.Prefix {
+	return netip.PrefixFrom(key.Address.Addr(), int(key.PrefixLen))
 }
 
-func keyIPv6(cidr net.IPNet) *Key6 {
-	ones, _ := cidr.Mask.Size()
+func keyIPv6(cidr netip.Prefix) *Key6 {
+	ones := cidr.Bits()
 	key := &Key6{PrefixLen: uint32(ones)}
-	copy(key.Address[:], cidr.IP.To16())
+	copy(key.Address[:], cidr.Masked().Addr().AsSlice())
 	return key
 }
 
-func keyToIPNetIPv6(key *Key6) net.IPNet {
-	var (
-		cidr net.IPNet
-		ip   types.IPv6
-	)
-
-	cidr.Mask = net.CIDRMask(int(key.PrefixLen), 128)
-	key.Address.DeepCopyInto(&ip)
-	cidr.IP = ip.IP()
-
-	return cidr
+func keyToIPNetIPv6(key *Key6) netip.Prefix {
+	return netip.PrefixFrom(key.Address.Addr(), int(key.PrefixLen))
 }

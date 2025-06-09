@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
-	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
@@ -15,8 +14,13 @@ import (
 // Modifies the recovery behavior of your instance to disable simplified automatic
 // recovery or set the recovery behavior to default. The default configuration will
 // not enable simplified automatic recovery for an unsupported instance type. For
-// more information, see Simplified automatic recovery (https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-recover.html#instance-configuration-recovery)
-// .
+// more information, see [Simplified automatic recovery].
+//
+// Modifies the reboot migration behavior during a user-initiated reboot of an
+// instance that has a pending system-reboot event. For more information, see [Enable or disable reboot migration].
+//
+// [Simplified automatic recovery]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-recover.html#instance-configuration-recovery
+// [Enable or disable reboot migration]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/schedevents_actions_reboot.html#reboot-migration
 func (c *Client) ModifyInstanceMaintenanceOptions(ctx context.Context, params *ModifyInstanceMaintenanceOptionsInput, optFns ...func(*Options)) (*ModifyInstanceMaintenanceOptionsOutput, error) {
 	if params == nil {
 		params = &ModifyInstanceMaintenanceOptionsInput{}
@@ -48,6 +52,22 @@ type ModifyInstanceMaintenanceOptionsInput struct {
 	// UnauthorizedOperation .
 	DryRun *bool
 
+	// Specifies whether to attempt reboot migration during a user-initiated reboot of
+	// an instance that has a scheduled system-reboot event:
+	//
+	//   - default - Amazon EC2 attempts to migrate the instance to new hardware
+	//   (reboot migration). If successful, the system-reboot event is cleared. If
+	//   unsuccessful, an in-place reboot occurs and the event remains scheduled.
+	//
+	//   - disabled - Amazon EC2 keeps the instance on the same hardware (in-place
+	//   reboot). The system-reboot event remains scheduled.
+	//
+	// This setting only applies to supported instances that have a scheduled reboot
+	// event. For more information, see [Enable or disable reboot migration]in the Amazon EC2 User Guide.
+	//
+	// [Enable or disable reboot migration]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/schedevents_actions_reboot.html#reboot-migration
+	RebootMigration types.InstanceRebootMigrationState
+
 	noSmithyDocumentSerde
 }
 
@@ -59,6 +79,22 @@ type ModifyInstanceMaintenanceOptionsOutput struct {
 
 	// The ID of the instance.
 	InstanceId *string
+
+	// Specifies whether to attempt reboot migration during a user-initiated reboot of
+	// an instance that has a scheduled system-reboot event:
+	//
+	//   - default - Amazon EC2 attempts to migrate the instance to new hardware
+	//   (reboot migration). If successful, the system-reboot event is cleared. If
+	//   unsuccessful, an in-place reboot occurs and the event remains scheduled.
+	//
+	//   - disabled - Amazon EC2 keeps the instance on the same hardware (in-place
+	//   reboot). The system-reboot event remains scheduled.
+	//
+	// This setting only applies to supported instances that have a scheduled reboot
+	// event. For more information, see [Enable or disable reboot migration]in the Amazon EC2 User Guide.
+	//
+	// [Enable or disable reboot migration]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/schedevents_actions_reboot.html#reboot-migration
+	RebootMigration types.InstanceRebootMigrationState
 
 	// Metadata pertaining to the operation's result.
 	ResultMetadata middleware.Metadata
@@ -88,25 +124,28 @@ func (c *Client) addOperationModifyInstanceMaintenanceOptionsMiddlewares(stack *
 	if err = addSetLoggerMiddleware(stack, options); err != nil {
 		return err
 	}
-	if err = awsmiddleware.AddClientRequestIDMiddleware(stack); err != nil {
+	if err = addClientRequestID(stack); err != nil {
 		return err
 	}
-	if err = smithyhttp.AddComputeContentLengthMiddleware(stack); err != nil {
+	if err = addComputeContentLength(stack); err != nil {
 		return err
 	}
 	if err = addResolveEndpointMiddleware(stack, options); err != nil {
 		return err
 	}
-	if err = v4.AddComputePayloadSHA256Middleware(stack); err != nil {
+	if err = addComputePayloadSHA256(stack); err != nil {
 		return err
 	}
-	if err = addRetryMiddlewares(stack, options); err != nil {
+	if err = addRetry(stack, options); err != nil {
 		return err
 	}
-	if err = awsmiddleware.AddRawResponseToMetadata(stack); err != nil {
+	if err = addRawResponseToMetadata(stack); err != nil {
 		return err
 	}
-	if err = awsmiddleware.AddRecordResponseTiming(stack); err != nil {
+	if err = addRecordResponseTiming(stack); err != nil {
+		return err
+	}
+	if err = addSpanRetryLoop(stack, options); err != nil {
 		return err
 	}
 	if err = addClientUserAgent(stack, options); err != nil {
@@ -121,13 +160,22 @@ func (c *Client) addOperationModifyInstanceMaintenanceOptionsMiddlewares(stack *
 	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
 		return err
 	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
+		return err
+	}
+	if err = addUserAgentRetryMode(stack, options); err != nil {
+		return err
+	}
+	if err = addCredentialSource(stack, options); err != nil {
+		return err
+	}
 	if err = addOpModifyInstanceMaintenanceOptionsValidationMiddleware(stack); err != nil {
 		return err
 	}
 	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opModifyInstanceMaintenanceOptions(options.Region), middleware.Before); err != nil {
 		return err
 	}
-	if err = awsmiddleware.AddRecursionDetection(stack); err != nil {
+	if err = addRecursionDetection(stack); err != nil {
 		return err
 	}
 	if err = addRequestIDRetrieverMiddleware(stack); err != nil {
@@ -140,6 +188,18 @@ func (c *Client) addOperationModifyInstanceMaintenanceOptionsMiddlewares(stack *
 		return err
 	}
 	if err = addDisableHTTPSMiddleware(stack, options); err != nil {
+		return err
+	}
+	if err = addSpanInitializeStart(stack); err != nil {
+		return err
+	}
+	if err = addSpanInitializeEnd(stack); err != nil {
+		return err
+	}
+	if err = addSpanBuildRequestStart(stack); err != nil {
+		return err
+	}
+	if err = addSpanBuildRequestEnd(stack); err != nil {
 		return err
 	}
 	return nil

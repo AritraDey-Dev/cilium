@@ -11,10 +11,10 @@ import (
 	"reflect"
 	"testing"
 
-	v1 "k8s.io/api/core/v1" // nolint: golint
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2" // nolint: golint
+	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/test/controlplane"
 	"github.com/cilium/cilium/test/controlplane/suite"
@@ -91,7 +91,7 @@ func init() {
 					UpdateObjectsFromFile(abs("init.yaml")).
 					SetupEnvironment().
 					StartAgent(modConfig).
-					ClearEnvironment()
+					EnsureWatchers("nodes")
 
 				// Run through the test steps
 				for _, step := range steps {
@@ -99,7 +99,8 @@ func init() {
 					test.Eventually(func() error { return validateLabels(test, step.expectedLabels) })
 				}
 
-				test.StopAgent()
+				test.StopAgent().
+					ClearEnvironment()
 			})
 		}
 	})

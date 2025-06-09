@@ -1,71 +1,59 @@
 # Copyright Authors of Cilium
 # SPDX-License-Identifier: Apache-2.0
 
-# distroless images are signed by cosign. You should verify the image with the following public key:
-# $ cat cosign.pub
-# -----BEGIN PUBLIC KEY-----
-# MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEWZzVzkb8A+DbgDpaJId/bOmV8n7Q
-# OqxYbK0Iro6GzSmOzxkn+N2AKawLyXi84WSwJQBK//psATakCgAQKkNTAA==
-# -----END PUBLIC KEY-----
-# $ cosign verify --key cosign.pub $BASE_IMAGE
-# The key may be found at the following address:
-# https://raw.githubusercontent.com/GoogleContainerTools/distroless/main/cosign.pub
-ARG BASE_IMAGE=gcr.io/distroless/static-debian11:nonroot@sha256:91ca4720011393f4d4cab3a01fa5814ee2714b7d40e6c74f2505f74168398ca9
-ARG GOLANG_IMAGE=docker.io/library/golang:1.21.5@sha256:58e14a93348a3515c2becc54ebd35302128225169d166b7c6802451ab336c907
-ARG CILIUM_BUILDER_IMAGE=quay.io/cilium/cilium-builder:634e0f882f5843c3a6781aa94ccfb6723a4a508b@sha256:ccb732b2ff23d1a4401c90c1de3e1185dde0c573d12a4961a6dc905866ee27d2
+# distroless images are signed by cosign and can be verified using:
+# $ cosign verify $IMAGE_NAME --certificate-oidc-issuer https://accounts.google.com --certificate-identity keyless@distroless.iam.gserviceaccount.com
+ARG BASE_IMAGE=gcr.io/distroless/static:nonroot@sha256:188ddfb9e497f861177352057cb21913d840ecae6c843d39e00d44fa64daa51c
+ARG GOLANG_IMAGE=docker.io/library/golang:1.24.3@sha256:81bf5927dc91aefb42e2bc3a5abdbe9bb3bae8ba8b107e2a4cf43ce3402534c6
+ARG CILIUM_BUILDER_IMAGE=quay.io/cilium/cilium-builder:b78951452a89d89724b58bbbfee2c5af82a64aca@sha256:0ee75208267936dcc57715d8f23e5e17598b6ca62d1cabc080cdc62f8a0a9f83
 
 # BUILDPLATFORM is an automatic platform ARG enabled by Docker BuildKit.
 # Represents the plataform where the build is happening, do not mix with
 # TARGETARCH
-FROM --platform=${BUILDPLATFORM} ${GOLANG_IMAGE} as builder
+FROM --platform=${BUILDPLATFORM} ${CILIUM_BUILDER_IMAGE} AS builder
 
 # TARGETOS is an automatic platform ARG enabled by Docker BuildKit.
 ARG TARGETOS
 # TARGETARCH is an automatic platform ARG enabled by Docker BuildKit.
 ARG TARGETARCH
-ARG NOSTRIP
-ARG NOOPT
-ARG LOCKDEBUG
-ARG RACE
+# MODIFIERS are extra arguments to be passed to make at build time.
+ARG MODIFIERS
 
-WORKDIR /go/src/github.com/cilium/cilium/hubble-relay
-RUN --mount=type=bind,readwrite,target=/go/src/github.com/cilium/cilium --mount=target=/root/.cache,type=cache --mount=target=/go/pkg,type=cache \
-    make GOARCH=${TARGETARCH} RACE=${RACE} NOSTRIP=${NOSTRIP} NOOPT=${NOOPT} LOCKDEBUG=${LOCKDEBUG} \
-    && mkdir -p /out/${TARGETOS}/${TARGETARCH}/usr/bin && mv hubble-relay /out/${TARGETOS}/${TARGETARCH}/usr/bin
+WORKDIR /go/src/github.com/cilium/cilium
+RUN --mount=type=bind,readwrite,target=/go/src/github.com/cilium/cilium \
+    --mount=type=cache,target=/root/.cache \
+    --mount=type=cache,target=/go/pkg \
+    make GOARCH=${TARGETARCH} DESTDIR=/out/${TARGETOS}/${TARGETARCH} $(echo $MODIFIERS | tr -d '"') \
+    build-container-hubble-relay install-container-binary-hubble-relay
 
 WORKDIR /go/src/github.com/cilium/cilium
 # licenses-all is a "script" that executes "go run" so its ARCH should be set
 # to the same ARCH specified in the base image of this Docker stage (BUILDARCH)
-RUN --mount=type=bind,readwrite,target=/go/src/github.com/cilium/cilium --mount=target=/root/.cache,type=cache --mount=target=/go/pkg,type=cache \
+RUN --mount=type=bind,readwrite,target=/go/src/github.com/cilium/cilium \
+    --mount=type=cache,target=/root/.cache \
+    --mount=type=cache,target=/go/pkg \
     make GOARCH=${BUILDARCH} licenses-all && mv LICENSE.all /out/${TARGETOS}/${TARGETARCH}
 
 # BUILDPLATFORM is an automatic platform ARG enabled by Docker BuildKit.
 # Represents the plataform where the build is happening, do not mix with
 # TARGETARCH
-FROM --platform=${BUILDPLATFORM} ${GOLANG_IMAGE} as gops
+FROM --platform=${BUILDPLATFORM} ${GOLANG_IMAGE} AS gops
 
 # build-gops.sh will build both archs at the same time
 WORKDIR /go/src/github.com/cilium/cilium/images/runtime
 RUN apt-get update && apt-get install -y binutils-aarch64-linux-gnu binutils-x86-64-linux-gnu
-RUN --mount=type=bind,readwrite,target=/go/src/github.com/cilium/cilium --mount=target=/root/.cache,type=cache --mount=target=/go/pkg,type=cache \
+RUN --mount=type=bind,readwrite,target=/go/src/github.com/cilium/cilium \
+    --mount=type=cache,target=/root/.cache \
+    --mount=type=cache,target=/go/pkg \
     ./build-gops.sh
 
-#
-# gRPC health probes
-#
-FROM --platform=${BUILDPLATFORM} ${CILIUM_BUILDER_IMAGE} as grpc_health_probe
-ARG BUILDPLATFORM
-COPY images/hubble-relay/download-grpc-health-probe.sh /tmp/download-grpc-health-probe.sh
-RUN /tmp/download-grpc-health-probe.sh
-
-FROM ${BASE_IMAGE} as release
+FROM ${BASE_IMAGE} AS release
 # TARGETOS is an automatic platform ARG enabled by Docker BuildKit.
 ARG TARGETOS
 # TARGETARCH is an automatic platform ARG enabled by Docker BuildKit.
 ARG TARGETARCH
 LABEL maintainer="maintainer@cilium.io"
 COPY --from=gops /out/${TARGETOS}/${TARGETARCH}/bin/gops /bin/gops
-COPY --from=grpc_health_probe /out/${TARGETOS}/${TARGETARCH}/bin/grpc_health_probe /bin/grpc_health_probe
 COPY --from=builder /out/${TARGETOS}/${TARGETARCH}/usr/bin/hubble-relay /usr/bin/hubble-relay
 COPY --from=builder /out/${TARGETOS}/${TARGETARCH}/LICENSE.all /LICENSE.all
 # use uid:gid for the nonroot user for compatibility with runAsNonRoot

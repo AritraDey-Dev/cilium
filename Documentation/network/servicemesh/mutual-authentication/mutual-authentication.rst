@@ -45,7 +45,7 @@ mutual authentication requires a framework secure identity verification for dist
 
 .. Note::
 
-    To learn more about the the Mutual Authentication architecture for the Cilium Service Mesh, read the `CFP <https://github.com/cilium/design-cfps/blob/main/cilium/CFP-22215-mutual-auth-for-service-mesh.md>`_.
+    To learn more about the Mutual Authentication architecture for the Cilium Service Mesh, read the `CFP <https://github.com/cilium/design-cfps/blob/main/cilium/CFP-22215-mutual-auth-for-service-mesh.md>`_.
 
 .. _identity_management:
 
@@ -105,6 +105,11 @@ the mutual authentication feature:
 
    mutual-authentication-example
 
+.. admonition:: Video
+ :class: attention
+
+  If you'd like a video explanation and demo of Mutual Authentication in Cilium, check out `eCHO episode 100: Next-gen mutual authentication in Cilium <https://www.youtube.com/watch?v=BWjDlynXhzg>`__.
+
 Limitations
 ###########
 * Cilium Mutual Authentication is still in development and considered beta. Several planned security features have not been implemented yet, see below for details.
@@ -137,7 +142,7 @@ For details, see the [roadmap issue](https://github.com/cilium/cilium/issues/289
 +--------------------------------------------------+----------------------------------------------------------+
 | CiliumNetworkPolicy support                      | Beta                                                     |
 +--------------------------------------------------+----------------------------------------------------------+
-| Integrate with Wireguard                         | TODO                                                     |
+| Integrate with WireGuard                         | TODO                                                     |
 +--------------------------------------------------+----------------------------------------------------------+
 | Per-connection handshake                         | TODO                                                     |
 +--------------------------------------------------+----------------------------------------------------------+

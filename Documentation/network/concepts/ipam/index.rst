@@ -18,7 +18,7 @@ Cilium. Various IPAM modes are supported to meet the needs of different users:
 ============================ ====================== ======================== =========== =========== =============== ================= ===============
 Feature                      Kubernetes Host Scope  Cluster Scope (default)  Multi-Pool  CRD-backed  AWS ENI         Azure IPAM        GKE
 ============================ ====================== ======================== =========== =========== =============== ================= ===============
-Tunnel routing               ✅                     ✅                       ❌          ❌          ❌              ❌                ❌
+Tunnel routing               ✅                     ✅                       ✅          ❌          ❌              ❌                ❌
 Direct routing               ✅                     ✅                       ✅          ✅          ✅              ✅                ✅
 CIDR Configuration           Kubernetes             Cilium                   Cilium      External    External (AWS)  External (Azure)  External (GCP)
 Multiple CIDRs per cluster   ❌                     ✅                       ✅          N/A         N/A             N/A               N/A
@@ -39,6 +39,7 @@ If you are interested in extending Cilium to support migration between IPAM mode
    kubernetes
    multi-pool
    azure
+   azure-delegated-ipam
    eni
    gke
    crd

@@ -5,6 +5,7 @@ package v2alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	slimv1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 )
@@ -27,7 +28,8 @@ type CiliumBGPPeerConfigList struct {
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:resource:categories={cilium,ciliumbgp},singular="ciliumbgppeerconfig",path="ciliumbgppeerconfigs",scope="Cluster",shortName={cbgppeer}
 // +kubebuilder:printcolumn:JSONPath=".metadata.creationTimestamp",name="Age",type=date
-// +kubebuilder:storageversion
+// +kubebuilder:subresource:status
+// +kubebuilder:deprecatedversion
 
 type CiliumBGPPeerConfig struct {
 	// +deepequal-gen=false
@@ -37,6 +39,11 @@ type CiliumBGPPeerConfig struct {
 
 	// Spec is the specification of the desired behavior of the CiliumBGPPeerConfig.
 	Spec CiliumBGPPeerConfigSpec `json:"spec"`
+
+	// Status is the running status of the CiliumBGPPeerConfig
+	//
+	// +kubebuilder:validation:Optional
+	Status CiliumBGPPeerConfigStatus `json:"status"`
 }
 
 type CiliumBGPPeerConfigSpec struct {
@@ -88,7 +95,28 @@ type CiliumBGPPeerConfigSpec struct {
 	// If not specified, the default families of IPv6/unicast and IPv4/unicast will be created.
 	//
 	// +kubebuilder:validation:Optional
-	Families []CiliumBGPFamily `json:"families,omitempty"`
+	Families []CiliumBGPFamilyWithAdverts `json:"families,omitempty"`
+}
+
+type CiliumBGPPeerConfigStatus struct {
+	// The current conditions of the CiliumBGPPeerConfig
+	//
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	// +deepequal-gen=false
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// Conditions for CiliumBGPPeerConfig. When you add a new condition, don't
+// forget to to update the below AllBGPPeerConfigConditions list as well.
+const (
+	// Referenced auth secret is missing
+	BGPPeerConfigConditionMissingAuthSecret = "cilium.io/MissingAuthSecret"
+)
+
+var AllBGPPeerConfigConditions = []string{
+	BGPPeerConfigConditionMissingAuthSecret,
 }
 
 // CiliumBGPFamily represents a AFI/SAFI address family pair.
@@ -104,6 +132,11 @@ type CiliumBGPFamily struct {
 	// +kubebuilder:validation:Enum=unicast;multicast;mpls_label;encapsulation;vpls;evpn;ls;sr_policy;mup;mpls_vpn;mpls_vpn_multicast;route_target_constraints;flowspec_unicast;flowspec_vpn;key_value
 	// +kubebuilder:validation:Required
 	Safi string `json:"safi"`
+}
+
+// CiliumBGPFamilyWithAdverts represents a AFI/SAFI address family pair along with reference to BGP Advertisements.
+type CiliumBGPFamilyWithAdverts struct {
+	CiliumBGPFamily `json:",inline"`
 
 	// Advertisements selects group of BGP Advertisement(s) to advertise for this family.
 	//
@@ -118,14 +151,17 @@ type CiliumBGPFamily struct {
 
 // CiliumBGPTransport defines the BGP transport parameters for the peer.
 type CiliumBGPTransport struct {
+	// Deprecated
 	// LocalPort is the local port to be used for the BGP session.
 	//
-	// If not specified, defaults to TCP port 179.
+	// If not specified, ephemeral port will be picked to initiate a connection.
+	//
+	// This field is deprecated and will be removed in a future release.
+	// Local port configuration is unnecessary and is not recommended.
 	//
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
-	// +kubebuilder:default=179
 	LocalPort *int32 `json:"localPort,omitempty"`
 
 	// PeerPort is the peer port to be used for the BGP session.
@@ -139,6 +175,19 @@ type CiliumBGPTransport struct {
 	PeerPort *int32 `json:"peerPort,omitempty"`
 }
 
+func (t *CiliumBGPTransport) SetDefaults() {
+	if t.LocalPort == nil || *t.LocalPort == 0 {
+		t.LocalPort = ptr.To[int32](DefaultBGPPeerLocalPort)
+	}
+
+	if t.PeerPort == nil || *t.PeerPort == 0 {
+		t.PeerPort = ptr.To[int32](DefaultBGPPeerPort)
+	}
+}
+
+// CiliumBGPTimers defines timers configuration for a BGP peer.
+//
+// +kubebuilder:validation:XValidation:rule="self.keepAliveTimeSeconds <= self.holdTimeSeconds", message="keepAliveTimeSeconds can not be larger than holdTimeSeconds"
 type CiliumBGPTimers struct {
 	// ConnectRetryTimeSeconds defines the initial value for the BGP ConnectRetryTimer (RFC 4271, Section 8).
 	//
@@ -171,4 +220,60 @@ type CiliumBGPTimers struct {
 	// +kubebuilder:validation:Maximum=65535
 	// +kubebuilder:default=30
 	KeepAliveTimeSeconds *int32 `json:"keepAliveTimeSeconds,omitempty"`
+}
+
+func (t *CiliumBGPTimers) SetDefaults() {
+	if t.ConnectRetryTimeSeconds == nil || *t.ConnectRetryTimeSeconds == 0 {
+		t.ConnectRetryTimeSeconds = ptr.To[int32](DefaultBGPConnectRetryTimeSeconds)
+	}
+
+	if t.HoldTimeSeconds == nil || *t.HoldTimeSeconds == 0 {
+		t.HoldTimeSeconds = ptr.To[int32](DefaultBGPHoldTimeSeconds)
+	}
+
+	if t.KeepAliveTimeSeconds == nil || *t.KeepAliveTimeSeconds == 0 {
+		t.KeepAliveTimeSeconds = ptr.To[int32](DefaultBGPKeepAliveTimeSeconds)
+	}
+}
+
+func (p *CiliumBGPPeerConfigSpec) SetDefaults() {
+	if p == nil {
+		return
+	}
+
+	if p.Transport == nil {
+		p.Transport = &CiliumBGPTransport{}
+	}
+	p.Transport.SetDefaults()
+
+	if p.Timers == nil {
+		p.Timers = &CiliumBGPTimers{}
+	}
+	p.Timers.SetDefaults()
+
+	if p.EBGPMultihop == nil {
+		p.EBGPMultihop = ptr.To[int32](DefaultBGPEBGPMultihopTTL)
+	}
+
+	if p.GracefulRestart == nil {
+		p.GracefulRestart = &CiliumBGPNeighborGracefulRestart{}
+	}
+	p.GracefulRestart.SetDefaults()
+
+	if len(p.Families) == 0 {
+		p.Families = []CiliumBGPFamilyWithAdverts{
+			{
+				CiliumBGPFamily: CiliumBGPFamily{
+					Afi:  "ipv6",
+					Safi: "unicast",
+				},
+			},
+			{
+				CiliumBGPFamily: CiliumBGPFamily{
+					Afi:  "ipv4",
+					Safi: "unicast",
+				},
+			},
+		}
+	}
 }

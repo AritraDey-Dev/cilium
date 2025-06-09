@@ -7,11 +7,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -26,15 +28,17 @@ import (
 	endpointid "github.com/cilium/cilium/pkg/endpoint/id"
 	"github.com/cilium/cilium/pkg/iana"
 	"github.com/cilium/cilium/pkg/identity"
+	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/maps/policymap"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy/trafficdirection"
+	policyTypes "github.com/cilium/cilium/pkg/policy/types"
 	"github.com/cilium/cilium/pkg/u8proto"
 )
 
 // Fatalf prints the Printf formatted message to stderr and exits the program
 // Note: os.Exit(1) is not recoverable
-func Fatalf(msg string, args ...interface{}) {
+func Fatalf(msg string, args ...any) {
 	fmt.Fprintf(os.Stderr, "Error: %s\n", fmt.Sprintf(msg, args...))
 	os.Exit(1)
 }
@@ -42,7 +46,7 @@ func Fatalf(msg string, args ...interface{}) {
 // Usagef prints the Printf formatted message to stderr, prints usage help and
 // exits the program
 // Note: os.Exit(1) is not recoverable
-func Usagef(cmd *cobra.Command, msg string, args ...interface{}) {
+func Usagef(cmd *cobra.Command, msg string, args ...any) {
 	txt := fmt.Sprintf(msg, args...)
 	fmt.Fprintf(os.Stderr, "Error: %s\n\n", txt)
 	cmd.Help()
@@ -60,16 +64,6 @@ func requireEndpointID(cmd *cobra.Command, args []string) {
 		if err != nil {
 			Fatalf("Cannot parse endpoint id \"%s\": %s", args[0], err)
 		}
-	}
-}
-
-func requireEndpointIDorGlobal(cmd *cobra.Command, args []string) {
-	if len(args) < 1 {
-		Usagef(cmd, "Missing endpoint id or 'global' argument")
-	}
-
-	if args[0] != "global" {
-		requireEndpointID(cmd, args)
 	}
 }
 
@@ -140,7 +134,7 @@ func expandNestedJSON(result bytes.Buffer) (bytes.Buffer, error) {
 		}
 
 		// Determine the current indentation
-		for i := 0; i < loc[0]-1; i++ {
+		for i := range loc[0] - 1 {
 			idx := loc[0] - i - 1
 			if resBytes[idx] != ' ' {
 				break
@@ -170,7 +164,7 @@ func expandNestedJSON(result bytes.Buffer) (bytes.Buffer, error) {
 		// Decode the nested JSON
 		decoded := ""
 		if nestedEnd != 0 {
-			m := make(map[string]interface{})
+			m := make(map[string]any)
 			nested := bytes.NewBufferString(unquoted[nestedStart:nestedEnd])
 			if err := json.NewDecoder(nested).Decode(&m); err != nil {
 				return bytes.Buffer{}, fmt.Errorf("Failed to decode nested JSON: %s (\n%s\n)", err.Error(), unquoted[nestedStart:nestedEnd])
@@ -206,14 +200,14 @@ type PolicyUpdateArgs struct {
 	trafficDirection trafficdirection.TrafficDirection
 
 	// label represents the identity of the label provided as argument.
-	label uint32
+	label identity.NumericIdentity
 
 	// port represents the port associated with the command, if specified.
 	port uint16
 
 	// protocols represents the set of protocols associated with the
 	// command, if specified.
-	protocols []uint8
+	protocols []u8proto.U8proto
 
 	isDeny bool
 }
@@ -238,12 +232,12 @@ func parseTrafficString(td string) (trafficdirection.TrafficDirection, error) {
 // command, provided as a list containing the endpoint ID, traffic direction,
 // identity and optionally, a list of ports.
 // Returns a parsed representation of the command arguments.
-func parsePolicyUpdateArgs(cmd *cobra.Command, args []string, isDeny bool) *PolicyUpdateArgs {
+func parsePolicyUpdateArgs(logger *slog.Logger, cmd *cobra.Command, args []string, isDeny bool) *PolicyUpdateArgs {
 	if len(args) < 3 {
 		Usagef(cmd, "<endpoint id>, <traffic-direction>, and <identity> required")
 	}
 
-	pa, err := parsePolicyUpdateArgsHelper(args, isDeny)
+	pa, err := parsePolicyUpdateArgsHelper(logger, args, isDeny)
 	if err != nil {
 		Fatalf("%s", err)
 	}
@@ -251,7 +245,7 @@ func parsePolicyUpdateArgs(cmd *cobra.Command, args []string, isDeny bool) *Poli
 	return pa
 }
 
-func endpointToPolicyMapPath(endpointID string) (string, error) {
+func endpointToPolicyMapPath(logger *slog.Logger, endpointID string) (string, error) {
 	if endpointID == "" {
 		return "", fmt.Errorf("Need ID or label")
 	}
@@ -267,17 +261,17 @@ func endpointToPolicyMapPath(endpointID string) (string, error) {
 		return "", err
 	}
 
-	return bpf.MapPath(mapName), nil
+	return bpf.MapPath(logger, mapName), nil
 }
 
-func parsePolicyUpdateArgsHelper(args []string, isDeny bool) (*PolicyUpdateArgs, error) {
+func parsePolicyUpdateArgsHelper(logger *slog.Logger, args []string, isDeny bool) (*PolicyUpdateArgs, error) {
 	trafficDirection := args[1]
 	parsedTd, err := parseTrafficString(trafficDirection)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to convert %s to a valid traffic direction: %s", args[1], err)
+		return nil, fmt.Errorf("Failed to convert %s to a valid traffic direction: %w", args[1], err)
 	}
 
-	mapName, err := endpointToPolicyMapPath(args[0])
+	mapName, err := endpointToPolicyMapPath(logger, args[0])
 	if err != nil {
 		return nil, fmt.Errorf("Failed to parse endpointID %q", args[0])
 	}
@@ -286,24 +280,24 @@ func parsePolicyUpdateArgsHelper(args []string, isDeny bool) (*PolicyUpdateArgs,
 	if err != nil {
 		return nil, fmt.Errorf("Failed to convert %s", args[2])
 	}
-	label := uint32(peerLbl)
+	label := identity.NumericIdentity(peerLbl)
 
 	port := uint16(0)
-	protos := []uint8{}
+	protos := []u8proto.U8proto{}
 	if len(args) > 3 {
 		pp, err := parseL4PortsSlice([]string{args[3]})
 		if err != nil {
-			return nil, fmt.Errorf("Failed to parse L4: %s", err)
+			return nil, fmt.Errorf("Failed to parse L4: %w", err)
 		}
 		port = pp[0].Port
 		if port != 0 {
 			proto, _ := u8proto.ParseProtocol(pp[0].Protocol)
 			if proto == 0 {
 				for _, proto := range u8proto.ProtoIDs {
-					protos = append(protos, uint8(proto))
+					protos = append(protos, proto)
 				}
 			} else {
-				protos = append(protos, uint8(proto))
+				protos = append(protos, proto)
 			}
 		}
 	}
@@ -331,7 +325,7 @@ func updatePolicyKey(pa *PolicyUpdateArgs, add bool) {
 	// The map needs not to be transparently initialized here even if
 	// it's not present for some reason. Triggering map recreation with
 	// OpenOrCreate when some map attribute had changed would be much worse.
-	policyMap, err := policymap.Open(pa.path)
+	policyMap, err := policymap.OpenPolicyMap(logging.DefaultSlogLogger, pa.path)
 	if err != nil {
 		Fatalf("Cannot open policymap %q : %s", pa.path, err)
 	}
@@ -339,22 +333,14 @@ func updatePolicyKey(pa *PolicyUpdateArgs, add bool) {
 	for _, proto := range pa.protocols {
 		u8p := u8proto.U8proto(proto)
 		entry := fmt.Sprintf("%d %d/%s", pa.label, pa.port, u8p.String())
+		mapKey := policymap.NewKeyFromPolicyKey(policyTypes.KeyForDirection(pa.trafficDirection).WithIdentity(pa.label).WithPortProto(proto, pa.port))
 		if add {
-			var (
-				authType  uint8  // never set
-				proxyPort uint16 // never set
-				err       error
-			)
-			if pa.isDeny {
-				err = policyMap.Deny(pa.label, pa.port, u8p, pa.trafficDirection)
-			} else {
-				err = policyMap.Allow(pa.label, pa.port, u8p, pa.trafficDirection, authType, proxyPort)
-			}
-			if err != nil {
+			mapEntry := policymap.NewEntryFromPolicyEntry(mapKey, policyTypes.MapStateEntry{}.WithDeny(pa.isDeny))
+			if err := policyMap.Update(&mapKey, &mapEntry); err != nil {
 				Fatalf("Cannot add policy key '%s': %s\n", entry, err)
 			}
 		} else {
-			if err := policyMap.Delete(pa.label, pa.port, u8p, pa.trafficDirection); err != nil {
+			if err := policyMap.DeleteKey(mapKey); err != nil {
 				Fatalf("Cannot delete policy key '%s': %s\n", entry, err)
 			}
 		}
@@ -363,13 +349,7 @@ func updatePolicyKey(pa *PolicyUpdateArgs, add bool) {
 
 // dumpConfig pretty prints boolean options
 func dumpConfig(Opts map[string]string, indented bool) {
-	opts := []string{}
-	for k := range Opts {
-		opts = append(opts, k)
-	}
-	sort.Strings(opts)
-
-	for _, k := range opts {
+	for _, k := range slices.Sorted(maps.Keys(Opts)) {
 		// XXX: Reuse the format function from *option.Library
 		value = Opts[k]
 		formatStr := "%-34s: %s\n"
@@ -387,11 +367,11 @@ func dumpConfig(Opts map[string]string, indented bool) {
 	}
 }
 
-func mapKeysToLowerCase(s map[string]interface{}) map[string]interface{} {
-	m := make(map[string]interface{})
+func mapKeysToLowerCase(s map[string]any) map[string]any {
+	m := make(map[string]any)
 	for k, v := range s {
 		if reflect.ValueOf(v).Kind() == reflect.Map {
-			for i, j := range v.(map[string]interface{}) {
+			for i, j := range v.(map[string]any) {
 				m[strings.ToLower(i)] = j
 			}
 		}
@@ -400,42 +380,38 @@ func mapKeysToLowerCase(s map[string]interface{}) map[string]interface{} {
 	return m
 }
 
-// getIpv6EnableStatus api returns the EnableIPv6 status
-// by consulting the cilium-agent otherwise reads from the
-// runtime system config
-func getIpv6EnableStatus() bool {
+// getIpEnableStatuses api returns the EnableIPv6 and EnableIPv4 statuses by
+// consulting the cilium-agent otherwise reads from the runtime system config.
+func getIpEnableStatuses() (bool, bool) {
 	params := daemon.NewGetHealthzParamsWithTimeout(5 * time.Second)
 	brief := true
 	params.SetBrief(&brief)
-	// If cilium-agent is running get the ipv6 enable status
+	// If cilium-agent is running get the enable statuses
 	if _, err := client.Daemon.GetHealthz(params); err == nil {
 		if resp, err := client.ConfigGet(); err == nil {
 			if resp.Status != nil {
-				return resp.Status.Addressing.IPV6 != nil && resp.Status.Addressing.IPV6.Enabled
+				ipv4 := resp.Status.Addressing.IPV4 != nil && resp.Status.Addressing.IPV4.Enabled
+				ipv6 := resp.Status.Addressing.IPV6 != nil && resp.Status.Addressing.IPV6.Enabled
+				return ipv4, ipv6
 			}
 		}
-	} else { // else read the EnableIPv6 status from the file-system
+	} else { // else read the statuses from the file-system
 		agentConfigFile := filepath.Join(defaults.RuntimePath, defaults.StateDir,
 			"agent-runtime-config.json")
 
 		if byteValue, err := os.ReadFile(agentConfigFile); err == nil {
 			if err = json.Unmarshal(byteValue, &option.Config); err == nil {
-				return option.Config.EnableIPv6
+				return option.Config.EnableIPv4, option.Config.EnableIPv6
 			}
 		}
 	}
-	// returning the EnableIPv6 default status
-	return defaults.EnableIPv6
+	// returning the default statuses
+	return defaults.EnableIPv4, defaults.EnableIPv6
 }
 
-func mergeMaps(m1, m2 map[string]interface{}) map[string]interface{} {
-	m3 := make(map[string]interface{})
-	for k, v := range m1 {
-		m3[k] = v
-	}
-	for k, v := range m2 {
-		m3[k] = v
-	}
+func mergeMaps(m1, m2 map[string]any) map[string]any {
+	m3 := maps.Clone(m1)
+	maps.Copy(m3, m2)
 	return m3
 }
 
@@ -467,7 +443,7 @@ func parseL4PortsSlice(slice []string) ([]*models.Port, error) {
 		if !iana.IsSvcName(portStr) {
 			portUint64, err := strconv.ParseUint(portStr, 10, 16)
 			if err != nil {
-				return nil, fmt.Errorf("invalid port %q: %s", portStr, err)
+				return nil, fmt.Errorf("invalid port %q: %w", portStr, err)
 			}
 			port = uint16(portUint64)
 			portStr = ""

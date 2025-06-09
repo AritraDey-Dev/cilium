@@ -3,6 +3,8 @@ FROM docker.io/library/python:3.11-alpine3.17 AS docs-base
 
 LABEL maintainer="maintainer@cilium.io"
 
+USER root
+
 RUN apk add --no-cache --virtual --update \
     aspell-en \
     nodejs \
@@ -11,6 +13,7 @@ RUN apk add --no-cache --virtual --update \
     ca-certificates \
     enchant2 \
     enchant2-dev \
+    imagemagick \
     git \
     libc6-compat \
     py-pip \
@@ -20,11 +23,14 @@ RUN apk add --no-cache --virtual --update \
     musl-dev \
     && true
 
+RUN addgroup -S docs && adduser -S -G docs docsuser
+
 FROM docs-base AS docs-builder
 ADD ./requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt
 
 ENV HOME=/tmp
+ARG READTHEDOCS_VERSION
 ENV READTHEDOCS_VERSION=$READTHEDOCS_VERSION
 ENV MAKE_GIT_REPO_SAFE=1
 
@@ -32,3 +38,5 @@ ENV MAKE_GIT_REPO_SAFE=1
 ## write runtime data inside a system directory.
 ## We do rely on this extension, so we cannot just drop it.
 RUN install -m 0777 -d /usr/local/lib/python3.11/site-packages/versionwarning/_static/data
+
+USER docsuser

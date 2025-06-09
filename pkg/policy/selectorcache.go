@@ -4,29 +4,26 @@
 package policy
 
 import (
-	"net"
-	"net/netip"
+	"log/slog"
 	"sync"
 
-	"github.com/sirupsen/logrus"
-
 	"github.com/cilium/cilium/api/v1/models"
+	"github.com/cilium/cilium/pkg/container/versioned"
 	"github.com/cilium/cilium/pkg/identity"
-	"github.com/cilium/cilium/pkg/identity/cache"
 	k8sConst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/policy/api"
+	"github.com/cilium/cilium/pkg/policy/types"
 )
 
 // scIdentity is the information we need about a an identity that rules can select
 type scIdentity struct {
 	NID       identity.NumericIdentity
 	lbls      labels.LabelArray
-	nets      []*net.IPNet // Most specific CIDR for the identity, if any.
-	computed  bool         // nets has been computed
-	namespace string       // value of the namespace label, or ""
+	namespace string // value of the namespace label, or ""
 }
 
 // scIdentityCache is a cache of Identities keyed by the numeric identity
@@ -36,43 +33,8 @@ func newIdentity(nid identity.NumericIdentity, lbls labels.LabelArray) scIdentit
 	return scIdentity{
 		NID:       nid,
 		lbls:      lbls,
-		nets:      getLocalScopeNets(nid, lbls),
 		namespace: lbls.Get(labels.LabelSourceK8sKeyPrefix + k8sConst.PodNamespaceLabel),
-		computed:  true,
 	}
-}
-
-// getLocalScopeNets returns the most specific CIDR for a local scope identity.
-func getLocalScopeNets(id identity.NumericIdentity, lbls labels.LabelArray) []*net.IPNet {
-	if id.HasLocalScope() {
-		var (
-			maskSize         int
-			mostSpecificCidr *net.IPNet
-		)
-		for _, lbl := range lbls {
-			if lbl.Source == labels.LabelSourceCIDR {
-				_, netIP, err := net.ParseCIDR(lbl.Key)
-				if err == nil {
-					if ms, _ := netIP.Mask.Size(); ms > maskSize {
-						mostSpecificCidr = netIP
-						maskSize = ms
-					}
-				}
-			}
-		}
-		if mostSpecificCidr != nil {
-			return []*net.IPNet{mostSpecificCidr}
-		}
-	}
-	return nil
-}
-
-func getIdentityCache(ids cache.IdentityCache) scIdentityCache {
-	idCache := make(map[identity.NumericIdentity]scIdentity, len(ids))
-	for nid, lbls := range ids {
-		idCache[nid] = newIdentity(nid, lbls)
-	}
-	return idCache
 }
 
 // userNotification stores the information needed to call
@@ -81,7 +43,8 @@ func getIdentityCache(ids cache.IdentityCache) scIdentityCache {
 // in FIFO order while not holding any locks.
 type userNotification struct {
 	user     CachedSelectionUser
-	selector CachedSelector
+	selector CachedSelector // nil for a sync notification
+	txn      *versioned.Tx  // nil for non-sync notifications
 	added    []identity.NumericIdentity
 	deleted  []identity.NumericIdentity
 	wg       *sync.WaitGroup
@@ -90,11 +53,14 @@ type userNotification struct {
 // SelectorCache caches identities, identity selectors, and the
 // subsets of identities each selector selects.
 type SelectorCache struct {
+	logger *slog.Logger
+
+	versioned *versioned.Coordinator
+
 	mutex lock.RWMutex
 
-	// idAllocator is used to allocate and release identities. It is used
-	// by the NameManager to manage identities corresponding to FQDNs.
-	idAllocator cache.IdentityAllocator
+	// selectorUpdates tracks changed selectors for efficient cleanup of old versions
+	selectorUpdates versioned.VersionedSlice[*identitySelector]
 
 	// idCache contains all known identities as informed by the
 	// kv-store and the local identity facility via our
@@ -113,9 +79,34 @@ type SelectorCache struct {
 	userMutex lock.Mutex
 	// userNotes holds a FIFO list of user notifications to be made
 	userNotes []userNotification
+	// notifiedUsers is a set of all notified users
+	notifiedUsers map[CachedSelectionUser]struct{}
 
 	// used to lazily start the handler for user notifications.
 	startNotificationsHandlerOnce sync.Once
+}
+
+// GetVersionHandleFunc calls the given function with a versioned.VersionHandle for the
+// current version of SelectorCache selections while selector cache is locked for writing, so that
+// the caller may get ready for getting incremental updates that are possible right after the lock
+// is released.
+// This should only be used with trivial functions that can not lock or sleep.
+// Use the plain 'GetVersionHandle' whenever possible, as it does not lock the selector cache.
+// VersionHandle passed to 'f' must be closed with Close().
+func (sc *SelectorCache) GetVersionHandleFunc(f func(*versioned.VersionHandle)) {
+	// Lock synchronizes with UpdateIdentities() so that we do not use a stale version
+	// that may already have received partial incremental updates.
+	// Incremental updates are delivered asynchronously, so so the caller may still receive
+	// updates for older versions. These should be filtered out.
+	sc.mutex.Lock()
+	defer sc.mutex.Unlock()
+	f(sc.GetVersionHandle())
+}
+
+// GetVersionHandle returns a VersoionHandle for the current version.
+// The returned VersionHandle must be closed with Close()
+func (sc *SelectorCache) GetVersionHandle() *versioned.VersionHandle {
+	return sc.versioned.GetVersionHandle()
 }
 
 // GetModel returns the API model of the SelectorCache.
@@ -125,8 +116,13 @@ func (sc *SelectorCache) GetModel() models.SelectorCache {
 
 	selCacheMdl := make(models.SelectorCache, 0, len(sc.selectors))
 
+	// Get handle to the current version. Any concurrent updates will not be visible in the
+	// returned model.
+	version := sc.GetVersionHandle()
+	defer version.Close()
+
 	for selector, idSel := range sc.selectors {
-		selections := idSel.GetSelections()
+		selections := idSel.GetSelections(version)
 		ids := make([]int64, 0, len(selections))
 		for i := range selections {
 			ids = append(ids, int64(selections[i]))
@@ -141,6 +137,33 @@ func (sc *SelectorCache) GetModel() models.SelectorCache {
 	}
 
 	return selCacheMdl
+}
+
+func (sc *SelectorCache) Stats() selectorStats {
+	result := newSelectorStats()
+
+	sc.mutex.RLock()
+	defer sc.mutex.RUnlock()
+
+	version := sc.GetVersionHandle()
+	defer version.Close()
+
+	for _, idSel := range sc.selectors {
+		if !idSel.MaySelectPeers() {
+			// Peer selectors impact policymap cardinality, but
+			// subject selectors do not. Do not count cardinality
+			// if the selector is only used for policy subjects.
+			continue
+		}
+
+		selections := idSel.GetSelections(version)
+		class := idSel.source.metricsClass()
+		if result.maxCardinalityByClass[class] < len(selections) {
+			result.maxCardinalityByClass[class] = len(selections)
+		}
+	}
+
+	return result
 }
 
 func labelArrayToModel(arr labels.LabelArray) models.LabelArray {
@@ -168,7 +191,11 @@ func (sc *SelectorCache) handleUserNotifications() {
 		sc.userMutex.Unlock()
 
 		for _, n := range notifications {
-			n.user.IdentitySelectionUpdated(n.selector, n.added, n.deleted)
+			if n.selector == nil {
+				n.user.IdentitySelectionCommit(sc.logger, n.txn)
+			} else {
+				n.user.IdentitySelectionUpdated(sc.logger, n.selector, n.added, n.deleted)
+			}
 			n.wg.Done()
 		}
 	}
@@ -180,6 +207,10 @@ func (sc *SelectorCache) queueUserNotification(user CachedSelectionUser, selecto
 	})
 	wg.Add(1)
 	sc.userMutex.Lock()
+	if sc.notifiedUsers == nil {
+		sc.notifiedUsers = make(map[CachedSelectionUser]struct{})
+	}
+	sc.notifiedUsers[user] = struct{}{}
 	sc.userNotes = append(sc.userNotes, userNotification{
 		user:     user,
 		selector: selector,
@@ -191,15 +222,69 @@ func (sc *SelectorCache) queueUserNotification(user CachedSelectionUser, selecto
 	sc.userCond.Signal()
 }
 
+func (sc *SelectorCache) queueNotifiedUsersCommit(txn *versioned.Tx, wg *sync.WaitGroup) {
+	sc.userMutex.Lock()
+	for user := range sc.notifiedUsers {
+		wg.Add(1)
+
+		// sync notification has a nil selector
+		sc.userNotes = append(sc.userNotes, userNotification{
+			user: user,
+			txn:  txn,
+			wg:   wg,
+		})
+	}
+	sc.notifiedUsers = nil
+	sc.userMutex.Unlock()
+	sc.userCond.Signal()
+}
+
 // NewSelectorCache creates a new SelectorCache with the given identities.
-func NewSelectorCache(allocator cache.IdentityAllocator, ids cache.IdentityCache) *SelectorCache {
+func NewSelectorCache(logger *slog.Logger, ids identity.IdentityMap) *SelectorCache {
 	sc := &SelectorCache{
-		idAllocator: allocator,
-		idCache:     getIdentityCache(ids),
-		selectors:   make(map[string]*identitySelector),
+		logger:    logger,
+		idCache:   make(map[identity.NumericIdentity]scIdentity, len(ids)),
+		selectors: make(map[string]*identitySelector),
 	}
 	sc.userCond = sync.NewCond(&sc.userMutex)
+	sc.versioned = &versioned.Coordinator{
+		Cleaner: sc.oldVersionCleaner,
+		Logger:  logger,
+	}
+
+	for nid, lbls := range ids {
+		sc.idCache[nid] = newIdentity(nid, lbls)
+	}
+
 	return sc
+}
+
+func (sc *SelectorCache) RegisterMetrics() {
+	if err := metrics.Register(newSelectorCacheMetrics(sc)); err != nil {
+		sc.logger.Warn("Selector cache metrics registration failed. No metrics will be reported.", logfields.Error, err)
+	}
+}
+
+// oldVersionCleaner is called from a goroutine without holding any locks
+func (sc *SelectorCache) oldVersionCleaner(keepVersion versioned.KeepVersion) {
+	// Log before taking the lock so that if we ever have a deadlock here this log line will be seen
+	sc.logger.Debug(
+		"Cleaning old selector and identity versions",
+		logfields.Version, keepVersion,
+	)
+
+	// This is called when some versions are no longer needed, from wherever
+	// VersionHandle's may be kept, so we must take the lock to safely access
+	// 'sc.selectorUpdates'.
+	sc.mutex.Lock()
+	defer sc.mutex.Unlock()
+
+	n := 0
+	for idSel := range sc.selectorUpdates.Before(keepVersion) {
+		idSel.selections.RemoveBefore(keepVersion)
+		n++
+	}
+	sc.selectorUpdates = sc.selectorUpdates[n:]
 }
 
 // SetLocalIdentityNotifier injects the provided identityNotifier into the
@@ -212,8 +297,6 @@ func (sc *SelectorCache) SetLocalIdentityNotifier(pop identityNotifier) {
 }
 
 var (
-	// Empty slice of numeric identities used for all selectors that select nothing
-	emptySelection identity.NumericIdentitySlice
 	// wildcardSelectorKey is used to compare if a key is for a wildcard
 	wildcardSelectorKey = api.WildcardEndpointSelector.LabelSelector.String()
 	// noneSelectorKey is used to compare if a key is for "reserved:none"
@@ -222,163 +305,31 @@ var (
 
 // identityNotifier provides a means for other subsystems to be made aware of a
 // given FQDNSelector (currently pkg/fqdn) so that said subsystems can notify
-// the SelectorCache about new IPs (via CIDR Identities) which correspond to
-// said FQDNSelector. This is necessary since there is nothing intrinsic to a
-// CIDR Identity that says that it corresponds to a given FQDNSelector; this
-// relationship is contained only via DNS responses, which are handled
-// externally.
+// the IPCache about IPs which correspond to said FQDNSelector.
+// This is necessary as there is nothing intrinsic about an IP that says that
+// it corresponds to a given FQDNSelector; this relationship is contained only
+// via DNS responses, which are handled externally.
 type identityNotifier interface {
-	// Lock must be held during any calls to *Locked functions below.
-	Lock()
+	// RegisterFQDNSelector exposes this FQDNSelector so that the identity labels
+	// of IPs contained in a DNS response that matches said selector can be
+	// associated with that selector.
+	RegisterFQDNSelector(selector api.FQDNSelector)
 
-	// Unlock must be called after calls to *Locked functions below.
-	Unlock()
-
-	// RegisterForIPUpdatesLocked exposes this FQDNSelector so that identities
-	// for IPs contained in a DNS response that matches said selector can
-	// be propagated back to the SelectorCache via `UpdateFQDNSelector`.
-	//
-	// This function should only be called when the SelectorCache has been
-	// made aware of the FQDNSelector for the first time; subsequent
-	// updates to the selectors should be made via `UpdateFQDNSelector`.
-	//
-	// This function returns the set of IPs for which this selector already applies.
-	RegisterForIPUpdatesLocked(selector api.FQDNSelector) []netip.Addr
-
-	// UnregisterForIPUpdatesLocked removes this FQDNSelector from the set of
-	// FQDNSelectors which are being tracked by the identityNotifier. The result
-	// of this is that no more updates for IPs which correspond to said selector
-	// are propagated back to the SelectorCache via `UpdateFQDNSelector`.
+	// UnregisterFQDNSelector removes this FQDNSelector from the set of
+	// IPs which are being tracked by the identityNotifier. The result
+	// of this is that an IP may be evicted from IPCache if it is no longer
+	// selected by any other FQDN selector.
 	// This occurs when there are no more users of a given FQDNSelector for the
 	// SelectorCache.
-	UnregisterForIPUpdatesLocked(selector api.FQDNSelector)
-}
-
-//
-// CachedSelector implementation (== Public API)
-//
-// No locking needed.
-//
-
-// UpdateResult is a bitfield that indicates what parts of the policy engines
-// need to update in order to implement a policy
-type UpdateResult uint32
-
-const (
-	// UpdateResultUpdatePolicyMaps indicates the caller should call EndpointManager.UpdatePolicyMaps()
-	UpdateResultUpdatePolicyMaps = UpdateResult(1) << iota
-
-	// UpdateResultIdentitiesNeeded indicates the caller should wait for a complete ipcache label injection,
-	// as the selector is missing identities
-	UpdateResultIdentitiesNeeded
-
-	UpdateResultUnchanged = UpdateResult(0)
-)
-
-// UpdateFQDNSelector updates the mapping of fqdnKey (the FQDNSelector from a
-// policy rule as a string) to to the provided list of IPs.
-//
-// If the supplied IPs are already known to the SelectorCache (i.e. they already)
-// have identities allocated for them), the selector's cachedSelections changes, and
-// users are notified asynchronously. Caller must then call Wait() on the supplied
-// sync.WaitGroup before triggering any policy updates via UpdatePolicyMaps().
-// Policy updates may need Endpoint locks, so this Wait() can deadlock if the caller
-// is holding any endpoint locks. When this is the case, the returned UpdateResult has
-// the UpdateResultUpdatePolicyMaps bit set.
-//
-// In the case where identities are not found for all supplied IPs, the returned
-// result has the IdentitiesNeeded bit set to signify that an ipcache update is needed.
-//
-// The caller must always ensure that all selected IP addresses are known to the ipcache.
-//
-// Returns an UpdateResult that indicates if the caller should call UpdatePolicyMaps() and/or
-// wait for ipcache UpsertMetadata() to finish.
-func (sc *SelectorCache) UpdateFQDNSelector(fqdnSelec api.FQDNSelector, ips []netip.Addr, wg *sync.WaitGroup) UpdateResult {
-	sc.mutex.Lock()
-	defer sc.mutex.Unlock()
-	return sc.updateFQDNSelector(fqdnSelec, ips, wg)
-}
-
-func (sc *SelectorCache) updateFQDNSelector(fqdnSelec api.FQDNSelector, ips []netip.Addr, wg *sync.WaitGroup) UpdateResult {
-	key := fqdnSelec.String()
-
-	idSelector, exists := sc.selectors[key]
-	if !exists || idSelector == nil {
-		log.WithField(logfields.Selector, fqdnSelec.String()).Error("UpdateFQDNSelector of selector not registered in SelectorCache!")
-	}
-
-	fqdnSelect, ok := idSelector.source.(*fqdnSelector)
-	if !ok {
-		log.Error("UpdateFQDNSelector for non-FQDN selector!")
-		return UpdateResultUnchanged
-	}
-
-	// update wantLabels, then determine set of added and removed identities
-	fqdnSelect.setSelectorIPs(ips) // this updates wantLabels
-
-	// Note that 'added' and 'deleted' are guaranteed to be
-	// disjoint, as one of them is left as nil, or an identity
-	// being in 'identities' is a precondition for an
-	// identity to be appended to 'added', while the inverse is
-	// true for 'deleted'.
-	var added, deleted []identity.NumericIdentity
-
-	// Delete any non-matching entries from cachedSelections
-	for nid := range idSelector.cachedSelections {
-		identity := sc.idCache[nid]
-		if !idSelector.source.matches(identity) {
-			deleted = append(deleted, nid)
-			delete(idSelector.cachedSelections, nid)
-		}
-	}
-
-	// Scan the cached set of IDs to determine any new matchers
-	for nid, identity := range sc.idCache {
-		if idSelector.source.matches(identity) {
-			if _, exists := idSelector.cachedSelections[nid]; !exists {
-				added = append(added, nid)
-				idSelector.cachedSelections[nid] = struct{}{}
-			}
-		}
-	}
-
-	// Result indicates whether or not the caller should call UpdatePolicyMaps
-	// and / or wait for ipcache to finish.
-	result := UpdateResultUnchanged
-
-	// If we're missing identities, then the caller also needs to wait for ipcache to do a
-	// allocation + injection round
-	//
-	// This assumes we should have a 1:1 mapping from label to IPs, which is currently the case.
-	// If this changes, this conditional will be wrong.
-	if len(idSelector.cachedSelections) != len(fqdnSelect.wantLabels) {
-		result |= UpdateResultIdentitiesNeeded
-	}
-
-	idSelector.updateSelections()
-
-	// If the set of selections has changed, then we need to push out an
-	// incremental update. This will add an incremental change to all users,
-	// and tell the caller that a call to UpdatePolicyMaps is required.
-	if len(added)+len(deleted) > 0 {
-		result |= UpdateResultUpdatePolicyMaps
-		idSelector.notifyUsers(sc, added, deleted, wg) // disjoint sets, see the comment above
-	}
-
-	return result
+	UnregisterFQDNSelector(selector api.FQDNSelector)
 }
 
 // AddFQDNSelector adds the given api.FQDNSelector in to the selector cache. If
 // an identical EndpointSelector has already been cached, the corresponding
-// CachedSelector is returned, otherwise one is created and added to the cache.
-func (sc *SelectorCache) AddFQDNSelector(user CachedSelectionUser, lbls labels.LabelArray, fqdnSelec api.FQDNSelector) (cachedSelector CachedSelector, added bool) {
+// types.CachedSelector is returned, otherwise one is created and added to the cache.
+func (sc *SelectorCache) AddFQDNSelector(user CachedSelectionUser, lbls stringLabels, fqdnSelec api.FQDNSelector) (cachedSelector types.CachedSelector, added bool) {
 	key := fqdnSelec.String()
 
-	// Lock NameManager before the SelectorCache. Always.
-	// This is because SelectorCache and NameManager have interleaving locks,
-	// so we must always acquire the NameManager lock first
-	sc.localIdentityNotifier.Lock()
-	defer sc.localIdentityNotifier.Unlock()
 	sc.mutex.Lock()
 	defer sc.mutex.Unlock()
 
@@ -392,21 +343,23 @@ func (sc *SelectorCache) AddFQDNSelector(user CachedSelectionUser, lbls labels.L
 		selector: fqdnSelec,
 	}
 
-	// Make the FQDN subsystem aware of this selector and fetch ips
-	// that the FQDN subsystem is aware of.
-	currentIPs := sc.localIdentityNotifier.RegisterForIPUpdatesLocked(source.selector)
-	source.setSelectorIPs(currentIPs)
+	// Make the FQDN subsystem aware of this selector
+	sc.localIdentityNotifier.RegisterFQDNSelector(source.selector)
 
-	return sc.addSelector(user, key, source)
+	return sc.addSelectorLocked(user, lbls, key, source)
 }
 
-func (sc *SelectorCache) addSelector(user CachedSelectionUser, key string, source selectorSource) (CachedSelector, bool) {
+// must hold lock for writing
+func (sc *SelectorCache) addSelectorLocked(user CachedSelectionUser, lbls stringLabels, key string, source selectorSource) (types.CachedSelector, bool) {
 	idSel := &identitySelector{
+		logger:           sc.logger,
 		key:              key,
 		users:            make(map[CachedSelectionUser]struct{}),
 		cachedSelections: make(map[identity.NumericIdentity]struct{}),
 		source:           source,
+		metadataLbls:     lbls,
 	}
+
 	sc.selectors[key] = idSel
 
 	// Scan the cached set of IDs to determine any new matchers
@@ -424,7 +377,9 @@ func (sc *SelectorCache) addSelector(user CachedSelectionUser, key string, sourc
 
 	// Create the immutable slice representation of the selected
 	// numeric identities
-	idSel.updateSelections()
+	txn := sc.versioned.PrepareNextVersion()
+	idSel.updateSelections(txn)
+	txn.Commit()
 
 	return idSel, idSel.addUser(user)
 
@@ -432,19 +387,19 @@ func (sc *SelectorCache) addSelector(user CachedSelectionUser, key string, sourc
 
 // FindCachedIdentitySelector finds the given api.EndpointSelector in the
 // selector cache, returning nil if one can not be found.
-func (sc *SelectorCache) FindCachedIdentitySelector(selector api.EndpointSelector) CachedSelector {
+func (sc *SelectorCache) FindCachedIdentitySelector(selector api.EndpointSelector) types.CachedSelector {
 	key := selector.CachedString()
-	sc.mutex.Lock()
+	sc.mutex.RLock()
 	idSel := sc.selectors[key]
-	sc.mutex.Unlock()
+	sc.mutex.RUnlock()
 	return idSel
 }
 
 // AddIdentitySelector adds the given api.EndpointSelector in to the
 // selector cache. If an identical EndpointSelector has already been
-// cached, the corresponding CachedSelector is returned, otherwise one
+// cached, the corresponding types.CachedSelector is returned, otherwise one
 // is created and added to the cache.
-func (sc *SelectorCache) AddIdentitySelector(user CachedSelectionUser, lbls labels.LabelArray, selector api.EndpointSelector) (cachedSelector CachedSelector, added bool) {
+func (sc *SelectorCache) AddIdentitySelector(user types.CachedSelectionUser, lbls stringLabels, selector api.EndpointSelector) (cachedSelector types.CachedSelector, added bool) {
 	// The key returned here may be different for equivalent
 	// labelselectors, if the selector's requirements are stored
 	// in different orders. When this happens we'll be tracking
@@ -467,11 +422,11 @@ func (sc *SelectorCache) AddIdentitySelector(user CachedSelectionUser, lbls labe
 		source.namespaces = namespaces
 	}
 
-	return sc.addSelector(user, key, source)
+	return sc.addSelectorLocked(user, lbls, key, source)
 }
 
 // lock must be held
-func (sc *SelectorCache) removeSelectorLocked(selector CachedSelector, user CachedSelectionUser) {
+func (sc *SelectorCache) removeSelectorLocked(selector types.CachedSelector, user CachedSelectionUser) {
 	key := selector.String()
 	sel, exists := sc.selectors[key]
 	if exists {
@@ -482,30 +437,26 @@ func (sc *SelectorCache) removeSelectorLocked(selector CachedSelector, user Cach
 	}
 }
 
-// RemoveSelector removes CachedSelector for the user.
-func (sc *SelectorCache) RemoveSelector(selector CachedSelector, user CachedSelectionUser) {
-	sc.localIdentityNotifier.Lock()
+// RemoveSelector removes types.CachedSelector for the user.
+func (sc *SelectorCache) RemoveSelector(selector types.CachedSelector, user CachedSelectionUser) {
 	sc.mutex.Lock()
 	sc.removeSelectorLocked(selector, user)
 	sc.mutex.Unlock()
-	sc.localIdentityNotifier.Unlock()
 
 }
 
-// RemoveSelectors removes CachedSelectorSlice for the user.
-func (sc *SelectorCache) RemoveSelectors(selectors CachedSelectorSlice, user CachedSelectionUser) {
-	sc.localIdentityNotifier.Lock()
+// RemoveSelectors removes types.CachedSelectorSlice for the user.
+func (sc *SelectorCache) RemoveSelectors(selectors types.CachedSelectorSlice, user CachedSelectionUser) {
 	sc.mutex.Lock()
 	for _, selector := range selectors {
 		sc.removeSelectorLocked(selector, user)
 	}
 	sc.mutex.Unlock()
-	sc.localIdentityNotifier.Unlock()
 }
 
 // ChangeUser changes the CachedSelectionUser that gets updates on the
 // updates on the cached selector.
-func (sc *SelectorCache) ChangeUser(selector CachedSelector, from, to CachedSelectionUser) {
+func (sc *SelectorCache) ChangeUser(selector types.CachedSelector, from, to CachedSelectionUser) {
 	key := selector.String()
 	sc.mutex.Lock()
 	idSel, exists := sc.selectors[key]
@@ -519,6 +470,32 @@ func (sc *SelectorCache) ChangeUser(selector CachedSelector, from, to CachedSele
 	sc.mutex.Unlock()
 }
 
+// CanSkipUpdate returns true if a proposed update is already known to the SelectorCache
+// and thus a no-op. Is used to de-dup an ID update stream, because identical updates
+// may come from multiple sources.
+func (sc *SelectorCache) CanSkipUpdate(added, deleted identity.IdentityMap) bool {
+	sc.mutex.RLock()
+	defer sc.mutex.RUnlock()
+
+	for nid := range deleted {
+		if _, exists := sc.idCache[nid]; exists {
+			return false
+		}
+	}
+
+	for nid, lbls := range added {
+		haslbls, exists := sc.idCache[nid]
+		if !exists { // id not known to us: cannot skip
+			return false
+		}
+		if !haslbls.lbls.Equals(lbls) {
+			// labels are not equal: cannot skip
+			return false
+		}
+	}
+	return true
+}
+
 // UpdateIdentities propagates identity updates to selectors
 //
 // The caller is responsible for making sure the same identity is not
@@ -527,23 +504,36 @@ func (sc *SelectorCache) ChangeUser(selector CachedSelector, from, to CachedSele
 // Caller should Wait() on the returned sync.WaitGroup before triggering any
 // policy updates. Policy updates may need Endpoint locks, so this Wait() can
 // deadlock if the caller is holding any endpoint locks.
-func (sc *SelectorCache) UpdateIdentities(added, deleted cache.IdentityCache, wg *sync.WaitGroup) {
+//
+// Incremental deletes of mutated identities are not sent to the users, as that could
+// lead to deletion of policy map entries while other selectors may still select the mutated
+// identity.
+// In this case the return value is 'true' and the caller should trigger policy updates on all
+// endpoints to remove the affected identity only from selectors that no longer select the mutated
+// identity.
+func (sc *SelectorCache) UpdateIdentities(added, deleted identity.IdentityMap, wg *sync.WaitGroup) (mutated bool) {
 	sc.mutex.Lock()
 	defer sc.mutex.Unlock()
+
+	txn := sc.versioned.PrepareNextVersion()
 
 	// Update idCache so that newly added selectors get
 	// prepopulated with all matching numeric identities.
 	for numericID := range deleted {
 		if old, exists := sc.idCache[numericID]; exists {
-			log.WithFields(logrus.Fields{
-				logfields.Identity: numericID,
-				logfields.Labels:   old.lbls,
-			}).Debug("UpdateIdentities: Deleting identity")
+			sc.logger.Debug(
+				"UpdateIdentities: Deleting identity",
+				logfields.NewVersion, txn,
+				logfields.Identity, numericID,
+				logfields.Labels, old.lbls,
+			)
 			delete(sc.idCache, numericID)
 		} else {
-			log.WithFields(logrus.Fields{
-				logfields.Identity: numericID,
-			}).Warning("UpdateIdentities: Skipping Delete of a non-existing identity")
+			sc.logger.Warn(
+				"UpdateIdentities: Skipping Delete of a non-existing identity",
+				logfields.NewVersion, txn,
+				logfields.Identity, numericID,
+			)
 			delete(deleted, numericID)
 		}
 	}
@@ -554,36 +544,46 @@ func (sc *SelectorCache) UpdateIdentities(added, deleted cache.IdentityCache, wg
 			// sorted for the kv-store, so there should
 			// not be too many false negatives.
 			if lbls.Equals(old.lbls) {
-				log.WithFields(logrus.Fields{
-					logfields.Identity: numericID,
-				}).Debug("UpdateIdentities: Skipping add of an existing identical identity")
+				sc.logger.Debug(
+					"UpdateIdentities: Skipping add of an existing identical identity",
+					logfields.NewVersion, txn,
+					logfields.Identity, numericID,
+				)
 				delete(added, numericID)
 				continue
 			}
-			scopedLog := log.WithFields(logrus.Fields{
-				logfields.Identity:         numericID,
-				logfields.Labels:           old.lbls,
-				logfields.Labels + "(new)": lbls},
-			)
 			msg := "UpdateIdentities: Updating an existing identity"
 			// Warn if any other ID has their labels change, besides local
 			// host. The local host can have its labels change at runtime if
 			// the kube-apiserver is running on the local host, see
 			// ipcache.TriggerLabelInjection().
 			if numericID == identity.ReservedIdentityHost {
-				scopedLog.Debug(msg)
+				sc.logger.Debug(msg,
+					logfields.NewVersion, txn,
+					logfields.Identity, numericID,
+					logfields.Labels, old.lbls,
+					logfields.LabelsNew, lbls,
+				)
 			} else {
-				scopedLog.Warning(msg)
+				sc.logger.Warn(msg,
+					logfields.NewVersion, txn,
+					logfields.Identity, numericID,
+					logfields.Labels, old.lbls,
+					logfields.LabelsNew, lbls,
+				)
 			}
 		} else {
-			log.WithFields(logrus.Fields{
-				logfields.Identity: numericID,
-				logfields.Labels:   lbls,
-			}).Debug("UpdateIdentities: Adding a new identity")
+			sc.logger.Debug(
+				"UpdateIdentities: Adding a new identity",
+				logfields.NewVersion, txn,
+				logfields.Identity, numericID,
+				logfields.Labels, lbls,
+			)
 		}
 		sc.idCache[numericID] = newIdentity(numericID, lbls)
 	}
 
+	updated := false
 	if len(deleted)+len(added) > 0 {
 		// Iterate through all locally used identity selectors and
 		// update the cached numeric identities as required.
@@ -596,33 +596,45 @@ func (sc *SelectorCache) UpdateIdentities(added, deleted cache.IdentityCache, wg
 				}
 			}
 			for numericID := range added {
-				if _, exists := idSel.cachedSelections[numericID]; !exists {
-					if idSel.source.matches(sc.idCache[numericID]) {
-						adds = append(adds, numericID)
-						idSel.cachedSelections[numericID] = struct{}{}
-					}
+				matches := idSel.source.matches(sc.idCache[numericID])
+				_, exists := idSel.cachedSelections[numericID]
+				if matches && !exists {
+					adds = append(adds, numericID)
+					idSel.cachedSelections[numericID] = struct{}{}
+				} else if !matches && exists {
+					// Identity was mutated and no longer matches, the identity
+					// is deleted from the cached selections, but is not sent to
+					// users as a deletion. Instead, we return 'mutated = true'
+					// telling the caller to trigger forced policy updates on
+					// all endpoints to recompute the policy as if the mutated
+					// identity was never selected by the affected selector.
+					mutated = true
+					delete(idSel.cachedSelections, numericID)
 				}
 			}
 			if len(dels)+len(adds) > 0 {
-				idSel.updateSelections()
+				updated = true
+				sc.selectorUpdates = sc.selectorUpdates.Append(idSel, txn)
+				idSel.updateSelections(txn)
 				idSel.notifyUsers(sc, adds, dels, wg)
 			}
 		}
 	}
-}
 
-// GetNetsLocked returns the most specific CIDR for an identity. For the "World" identity
-// it returns both IPv4 and IPv6.
-func (sc *SelectorCache) GetNetsLocked(id identity.NumericIdentity) []*net.IPNet {
-	ident, ok := sc.idCache[id]
-	if !ok {
-		return nil
+	if updated {
+		// Launch a waiter that holds the new version as long as needed for users to have grabbed it
+		sc.queueNotifiedUsersCommit(txn, wg)
+
+		go func(version *versioned.VersionHandle) {
+			wg.Wait()
+			sc.logger.Debug(
+				"UpdateIdentities: Waited for incremental updates to have committed, closing handle on the new version.",
+				logfields.NewVersion, txn,
+			)
+			version.Close()
+		}(txn.GetVersionHandle())
+
+		txn.Commit()
 	}
-	if !ident.computed {
-		log.WithFields(logrus.Fields{
-			logfields.Identity: id,
-			logfields.Labels:   ident.lbls,
-		}).Warning("GetNetsLocked: Identity with missing nets!")
-	}
-	return ident.nets
+	return mutated
 }

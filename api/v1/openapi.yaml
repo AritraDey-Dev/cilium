@@ -47,30 +47,18 @@ paths:
         in: header
         required: false
         type: boolean
+      - name: require-k8s-connectivity
+        description: |
+          If set to true, failure of the agent to connect to the Kubernetes control plane will cause the agent's health status to also fail.
+        in: header
+        required: false
+        type: boolean
+        default: true
       responses:
         '200':
           description: Success
           schema:
             "$ref": "#/definitions/StatusResponse"
-  "/health":
-    get:
-      summary: Get modules health of Cilium daemon
-      description: |
-        Returns modules health and status information of the Cilium daemon.
-      tags:
-        - daemon
-      parameters:
-      - name: brief
-        description: |
-          Brief is a brief representation of the Cilium status.
-        in: header
-        required: false
-        type: boolean
-      responses:
-        '200':
-          description: Success
-          schema:
-            "$ref": "#/definitions/ModulesHealth"
   "/config":
     get:
       summary: Get configuration of Cilium daemon
@@ -146,6 +134,8 @@ paths:
       responses:
         '201':
           description: Created
+          schema:
+            "$ref": "#/definitions/Endpoint"
         '400':
           description: Invalid endpoint in request
           x-go-name: Invalid
@@ -673,98 +663,6 @@ paths:
             "$ref": "#/definitions/Service"
         '404':
           description: Service not found
-    put:
-      summary: Create or update service
-      tags:
-      - service
-      parameters:
-      - "$ref": "#/parameters/service-id"
-      - "$ref": "#/parameters/service-config"
-      responses:
-        '200':
-          description: Updated
-        '201':
-          description: Created
-        '403':
-          description: Forbidden
-        '460':
-          description: Invalid frontend in service configuration
-          x-go-name: InvalidFrontend
-          schema:
-            "$ref": "#/definitions/Error"
-        '461':
-          description: Invalid backend in service configuration
-          x-go-name: InvalidBackend
-          schema:
-            "$ref": "#/definitions/Error"
-        '500':
-          description: Error while creating service
-          x-go-name: Failure
-          schema:
-            "$ref": "#/definitions/Error"
-        '501':
-          description: Error while updating backend states
-          x-go-name: UpdateBackendFailure
-          schema:
-            "$ref": "#/definitions/Error"
-    delete:
-      summary: Delete a service
-      tags:
-      - service
-      parameters:
-      - "$ref": "#/parameters/service-id"
-      responses:
-        '200':
-          description: Success
-        '403':
-          description: Forbidden
-        '404':
-          description: Service not found
-        '500':
-          description: Service deletion failed
-          x-go-name: Failure
-          schema:
-            "$ref": "#/definitions/Error"
-
-  "/statedb/dump":
-    get:
-      produces:
-      - application/octet-stream
-      summary: Dump StateDB contents
-      tags:
-      - statedb
-      responses:
-        '200':
-          description: Success
-          schema:
-            type: string
-            format: binary
-
-  "/statedb/query/{table}":
-    get:
-      produces:
-      - application/octet-stream
-      summary: Perform a query against a StateDB table
-      tags:
-      - statedb
-      parameters:
-      - "$ref": "#/parameters/statedb-table"
-      - "$ref": "#/parameters/statedb-index"
-      - "$ref": "#/parameters/statedb-key"
-      - "$ref": "#/parameters/statedb-lowerbound"
-      responses:
-        '200':
-          description: Success
-          schema:
-            # Stream of gob encoded revision and object pairs.
-            type: string
-            format: binary
-        '400':
-          description: Invalid parameters
-          schema:
-            "$ref": "#/definitions/Error"
-        '404':
-          description: Table or Index not found
 
   "/recorder":
     get:
@@ -972,21 +870,6 @@ paths:
             format: binary
         '404':
           description: Map not found
-  "/metrics/":
-    get:
-      summary: Retrieve cilium metrics
-      tags:
-      - metrics
-      parameters: []
-      responses:
-        '200':
-          description: Success
-          schema:
-            type: array
-            items:
-              "$ref": "#/definitions/Metric"
-        '500':
-          description: Metrics cannot be retrieved
 
   "/fqdn/cache":
     get:
@@ -1087,6 +970,7 @@ paths:
       - policy
       parameters:
       - "$ref": "#/parameters/cidr"
+      - "$ref": "#/parameters/labels"
       responses:
         '200':
           description: Success
@@ -1119,7 +1003,7 @@ paths:
     get:
       summary: Lists operational state of BGP peers
       description: |
-        Retrieves current operational state of BGP peers created by 
+        Retrieves current operational state of BGP peers created by
         Cilium BGP virtual router. This includes session state, uptime,
         information per address family, etc.
       tags:
@@ -1293,30 +1177,6 @@ parameters:
     required: true
     schema:
       "$ref": "#/definitions/ServiceSpec"
-  statedb-table:
-    name: table
-    description: StateDB table name
-    required: true
-    in: path
-    type: string
-  statedb-index:
-    name: index
-    description: StateDB index name
-    required: true
-    in: query
-    type: string
-  statedb-key:
-    name: key
-    description: Query key (base64 encoded)
-    required: true
-    in: query
-    type: string
-  statedb-lowerbound:
-    name: lowerbound
-    description: If true perform a LowerBound search
-    required: true
-    in: query
-    type: boolean
   recorder-id:
     name: id
     description: ID of recorder
@@ -1432,33 +1292,6 @@ parameters:
     type: string
 
 definitions:
-  ModulesHealth:
-    description: Reports health status of agent's modules
-    properties:
-      modules:
-        description: List out modules health status
-        type: array
-        items:
-          "$ref": "#/definitions/ModuleHealth"
-  ModuleHealth:
-    description: Report module health status
-    properties:
-      module-id:
-        description: Describes the module identitier
-        type: string
-      level:
-        description: Describes the health status level
-        type: string
-      message:
-        description: Reports the associated health message
-        type: string
-      last-ok:
-        description: Time at which the last OK check occurred
-        type: string
-      last-updated:
-        description: Time of last health update
-        type: string
-
   Endpoint:
     description: An endpoint is a namespaced network interface to which cilium applies policies
     type: object
@@ -1503,6 +1336,11 @@ definitions:
       interface-index:
         description: Index of network device in host netns
         type: integer
+      parent-interface-index:
+        description: >-
+          Index of network device from which an IP was used as endpoint IP.
+          Only relevant for ENI environments.
+        type: integer
       container-interface-name:
         description: Name of network device in container netns
         type: string
@@ -1523,6 +1361,9 @@ definitions:
       k8s-namespace:
         description: Kubernetes namespace name
         type: string
+      k8s-uid:
+        description: Kubernetes pod UID
+        type: string
       datapath-map-id:
         description: ID of datapath tail call map
         type: integer
@@ -1541,8 +1382,18 @@ definitions:
           Disables lookup using legacy endpoint identifiers (container name,
           container id, pod name) for this endpoint
         type: boolean
+      netns-cookie:
+        description: Network namespace cookie
+        type: string
       datapath-configuration:
         "$ref": "#/definitions/EndpointDatapathConfiguration"
+      properties:
+        description: >-
+          Properties is used to store information about the endpoint at
+          creation.
+          Useful for tests.
+        additionalProperties:
+          type: object
   EndpointBatchDeleteRequest:
     description: |
       Properties selecting a batch of endpoints to delete.
@@ -1727,8 +1578,6 @@ definitions:
   EndpointPolicy:
     description: |-
       Policy information of an endpoint
-
-      +k8s:deepcopy-gen=true
     type: object
     properties:
       policy-revision:
@@ -1774,8 +1623,6 @@ definitions:
   PolicyRule:
     description: |-
       A policy rule including the rule labels it derives from
-
-      +k8s:deepcopy-gen=true
     properties:
       rule:
         description: The policy rule as json
@@ -1799,8 +1646,6 @@ definitions:
   L4Policy:
     description: |-
       L4 endpoint policy
-
-      +k8s:deepcopy-gen=true
     type: object
     properties:
       ingress:
@@ -1816,8 +1661,6 @@ definitions:
   CIDRPolicy:
     description: |-
       CIDR endpoint policy
-
-      +k8s:deepcopy-gen=true
     type: object
     properties:
       ingress:
@@ -2160,6 +2003,12 @@ definitions:
       kubernetes:
         description: Status of Kubernetes integration
         "$ref": "#/definitions/K8sStatus"
+      datapath-mode:
+        description: Status of datapath mode
+        "$ref": "#/definitions/DatapathMode"
+      attach-mode:
+        description: Status of core datapath attachment mode
+        "$ref": "#/definitions/AttachMode"
       kube-proxy-replacement:
         description: Status of kube-proxy replacement
         "$ref": "#/definitions/KubeProxyReplacement"
@@ -2193,9 +2042,9 @@ definitions:
       masquerading:
         description: Status of masquerading
         "$ref": "#/definitions/Masquerading"
-      host-routing:
-        description: Status of host routing
-        "$ref": "#/definitions/HostRouting"
+      routing:
+        description: Status of routing
+        "$ref": "#/definitions/Routing"
       clock-source:
         description: Status of clock source
         "$ref": "#/definitions/ClockSource"
@@ -2343,10 +2192,6 @@ definitions:
       mode:
         type: string
         enum:
-        - Disabled
-        - Strict
-        - Probe
-        - Partial
         - 'True'
         - 'False'
       devices:
@@ -2386,10 +2231,6 @@ definitions:
         type: object
         properties:
           nodePort:
-            description: |-
-
-
-              +k8s:deepcopy-gen=true
             type: object
             properties:
               enabled:
@@ -2425,19 +2266,11 @@ definitions:
               lutSize:
                 type: integer
           hostPort:
-            description: |-
-
-
-              +k8s:deepcopy-gen=true
             type: object
             properties:
               enabled:
                 type: boolean
           externalIPs:
-            description: |-
-
-
-              +k8s:deepcopy-gen=true
             type: object
             properties:
               enabled:
@@ -2456,28 +2289,17 @@ definitions:
                 items:
                   type: string
           socketLB:
-            description: |-
-
-
-              +k8s:deepcopy-gen=true
             type: object
             properties:
               enabled:
                 type: boolean
           sessionAffinity:
-            description: |-
-
-
-              +k8s:deepcopy-gen=true
             type: object
             properties:
               enabled:
                 type: boolean
           gracefulTermination:
-            description: |-
-
-
-              +k8s:deepcopy-gen=true
+            description: Deprecated
             type: object
             properties:
               enabled:
@@ -2492,10 +2314,6 @@ definitions:
               enabled:
                 type: boolean
               service:
-                description: |-
-
-
-                  +k8s:deepcopy-gen=true
                 type: object
                 properties:
                   enabled:
@@ -2514,10 +2332,6 @@ definitions:
                     items:
                       type: string
           socketLBTracing:
-            description: |-
-
-
-              +k8s:deepcopy-gen=true
             type: object
             properties:
               enabled:
@@ -2525,6 +2339,10 @@ definitions:
           bpfSocketLBHostnsOnly:
             description: flag bpf-lb-sock-hostns-only
             type: boolean
+          annotations:
+            type: array
+            items:
+              type: string
   AllocationMap:
     description: |
       Map of allocated IPs
@@ -2626,6 +2444,9 @@ definitions:
       num-shared-services:
         description: Number of services in the cluster
         type: integer
+      num-service-exports:
+        description: Number of MCS-API service exports in the cluster
+        type: integer
       num-identities:
         description: Number of identities in the cluster
         type: integer
@@ -2657,6 +2478,10 @@ definitions:
       services:
         description: Services synchronization status
         type: boolean
+      service-exports:
+        description: MCS-API service exports synchronization status (null means that the component is not watching service exports)
+        type: boolean
+        x-nullable: true
       endpoints:
         description: Endpoints synchronization status
         type: boolean
@@ -2684,6 +2509,10 @@ definitions:
       sync-canaries:
         description: Whether the remote cluster supports per-prefix "synced" canaries
         type: boolean
+      service-exports-enabled:
+        description: Whether or not MCS-API ServiceExports is enabled by the cluster (null means unsupported).
+        type: boolean
+        x-nullable: true
   MonitorStatus:
     description: Status of the node monitor
     properties:
@@ -2771,6 +2600,9 @@ definitions:
       routeMTU:
         description: MTU for network facing routes
         type: integer
+      enableRouteMTUForCNIChaining:
+        description: Enable route MTU for pod netns when CNI chaining is used
+        type: boolean
       datapathMode:
         "$ref": "#/definitions/DatapathMode"
       ipam-mode:
@@ -2791,6 +2623,11 @@ definitions:
       egress-multi-home-ip-rule-compat:
         description: Configured compatibility mode for --egress-multi-home-ip-rule-compat
         type: boolean
+      installUplinkRoutesForDelegatedIPAM:
+        description: |
+          Install ingress/egress routes through uplink on host for Pods when working with
+          delegated IPAM plugin.
+        type: boolean
       daemonConfigurationMap:
         description: Config map which contains all the active daemon configurations
         additionalProperties:
@@ -2807,11 +2644,25 @@ definitions:
       GROIPv4MaxSize:
         description: Maximum IPv4 GRO size on workload facing devices
         type: integer
+      ipLocalReservedPorts:
+        description: Comma-separated list of IP ports should be reserved in the workload network namespace
+        type: string
+      enableBBRHostNamespaceOnly:
+        description: True if BBR is enabled only in the host network namespace
+        type: boolean
   DatapathMode:
     description: Datapath mode
     type: string
     enum:
       - veth
+      - netkit
+      - netkit-l2
+  AttachMode:
+    description: Core datapath attachment mode
+    type: string
+    enum:
+      - tc
+      - tcx
   EndpointConfigurationSpec:
     description: An endpoint's configuration
     type: object
@@ -2966,8 +2817,6 @@ definitions:
   Srv6:
     description: |-
       Status of the SRv6
-
-      +k8s:deepcopy-gen=true
     type: object
     properties:
       enabled:
@@ -3043,6 +2892,9 @@ definitions:
       ip:
         description: Layer 3 address
         type: string
+      protocol:
+        description: Layer 4 protocol (TCP, UDP, etc)
+        type: string
       port:
         description: Layer 4 port number
         type: integer
@@ -3068,6 +2920,9 @@ definitions:
         type: integer
         format: uint16
         x-nullable: true
+      zone:
+        description: Optional name of the zone in which this backend runs
+        type: string
   LRPBackend:
     description: Pod backend of an LRP
     type: object
@@ -3348,8 +3203,6 @@ definitions:
   IdentityRange:
     description: |-
       Status of identity range of the cluster
-
-      +k8s:deepcopy-gen=true
     properties:
       min-identity:
         description: Minimum identity of the cluster
@@ -3425,8 +3278,6 @@ definitions:
   IPV6BigTCP:
     description: |-
       Status of IPv6 BIG TCP
-
-      +k8s:deepcopy-gen=true
     type: object
     properties:
       enabled:
@@ -3441,8 +3292,6 @@ definitions:
   IPV4BigTCP:
     description: |-
       Status of IPv4 BIG TCP
-
-      +k8s:deepcopy-gen=true
     type: object
     properties:
       enabled:
@@ -3518,8 +3367,6 @@ definitions:
   ClockSource:
     description: |-
       Status of BPF clock source
-
-      +k8s:deepcopy-gen=true
     type: object
     properties:
       mode:
@@ -3531,19 +3378,26 @@ definitions:
       hertz:
         description: Kernel Hz
         type: integer
-  HostRouting:
+  Routing:
     description: |-
-      Status of host routing
-
-      +k8s:deepcopy-gen=true
+      Status of routing
     type: object
     properties:
-      mode:
-        description: Datapath routing mode
+      inter-host-routing-mode:
+        description: Datapath routing mode for cross-cluster connectivity
+        type: string
+        enum:
+        - Native
+        - Tunnel
+      intra-host-routing-mode:
+        description: Datapath routing mode for connectivity within the host
         type: string
         enum:
         - BPF
         - Legacy
+      tunnel-protocol:
+        description: Tunnel protocol in use for cross-cluster connectivity
+        type: string
   ControllerStatuses:
     description: Collection of controller statuses
     type: array
@@ -3849,15 +3703,16 @@ definitions:
           - Wireguard
       msg:
         type: string
-        description: Human readable status/error/warning message
+        description: Human readable error/warning message
+      ipsec:
+        description: Status of the IPsec agent
+        "$ref": "#/definitions/IPsecStatus"
       wireguard:
         description: Status of the WireGuard agent
         "$ref": "#/definitions/WireguardStatus"
   CNIChainingStatus:
     description: |-
       Status of CNI chaining
-
-      +k8s:deepcopy-gen=true
     properties:
       mode:
         type: string
@@ -3867,6 +3722,31 @@ definitions:
           - flannel
           - generic-veth
           - portmap
+  IPsecStatus:
+    description: |-
+      Status of the IPsec agent
+
+      +k8s:deepcopy-gen=true
+    properties:
+      decrypt-interfaces:
+        description: IPsec decryption interfaces
+        type: array
+        items:
+          type: string
+      max-seq-number:
+        description: IPsec max sequence number
+        type: string
+      keys-in-use:
+        description: IPsec keys in use
+        type: integer
+      error-count:
+        description: IPsec error count
+        type: integer
+      xfrm-errors:
+        description: IPsec XFRM errors
+        type: object
+        additionalProperties:
+          type: integer
   WireguardStatus:
     description: |-
       Status of the WireGuard agent
@@ -3934,7 +3814,7 @@ definitions:
   BgpPeer:
     description: |-
       State of a BGP Peer
-      
+
       +k8s:deepcopy-gen=true
     properties:
       local-asn:
@@ -4001,8 +3881,6 @@ definitions:
   BgpPeerFamilies:
     description: |-
       BGP AFI SAFI state of the peer
-      
-      +k8s:deepcopy-gen=true
     properties:
       afi:
         description: BGP address family indicator
@@ -4022,18 +3900,16 @@ definitions:
   BgpGracefulRestart:
     description: |-
       BGP graceful restart parameters negotiated with the peer.
-
-      +k8s:deepcopy-gen=true
     properties:
       enabled:
         description: |-
-          When set, graceful restart capability is negotiated for all AFI/SAFIs of 
+          When set, graceful restart capability is negotiated for all AFI/SAFIs of
           this peer.
         type: boolean
       restart-time-seconds:
         description: |-
-          This is the time advertised to peer for the BGP session to be re-established 
-          after a restart. After this period, peer will remove stale routes. 
+          This is the time advertised to peer for the BGP session to be re-established
+          after a restart. After this period, peer will remove stale routes.
           (RFC 4724 section 4.2)
         type: integer
   BgpRoute:
@@ -4042,6 +3918,9 @@ definitions:
       router-asn:
         description: Autonomous System Number (ASN) identifying a BGP virtual router instance
         type: integer
+      neighbor:
+        description: IP address specifying a BGP neighbor if the source table type is adj-rib-in or adj-rib-out
+        type: string
       prefix:
         description: IP prefix of the route
         type: string
@@ -4122,6 +4001,11 @@ definitions:
         type: array
         items:
           type: string
+      match-families:
+        description:  Matches any of the provided address families. If empty matches all address families.
+        type: array
+        items:
+          "$ref": "#/definitions/BgpFamily"
       match-prefixes:
         description:  Matches any of the provided prefixes. If empty matches all prefixes.
         type: array
@@ -4147,6 +4031,18 @@ definitions:
       set-local-preference:
         description: BGP local preference value to be set on the matched route
         type: integer
+      nexthop:
+        description: BGP nexthop action
+        "$ref": "#/definitions/BgpRoutePolicyNexthopAction"
+  BgpRoutePolicyNexthopAction:
+    description: BGP nexthop action
+    properties:
+      self:
+        description: Set nexthop to the IP address of itself
+        type: boolean
+      unchanged:
+        description: Don't change nexthop
+        type: boolean
   BgpRoutePolicyPrefixMatch:
     description: Matches a CIDR prefix in a BGP route policy
     properties:

@@ -9,6 +9,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/cilium/pkg/testutils"
@@ -33,11 +34,12 @@ func TestCompile(t *testing.T) {
 	} {
 		name := fmt.Sprintf("%s:%s", prog.OutputType, prog.Output)
 		t.Run(name, func(t *testing.T) {
-			path, err := compile(context.Background(), prog, dirs)
-			require.Nil(t, err)
+			logger := hivetest.Logger(t)
+			path, err := compile(context.Background(), logger, prog, dirs)
+			require.NoError(t, err)
 
 			stat, err := os.Stat(path)
-			require.Nil(t, err)
+			require.NoError(t, err)
 			require.False(t, stat.IsDir())
 			require.NotZero(t, stat.Size())
 		})

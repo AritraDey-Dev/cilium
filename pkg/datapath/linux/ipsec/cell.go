@@ -5,14 +5,12 @@ package ipsec
 
 import (
 	"fmt"
-	"runtime/pprof"
+	"log/slog"
 
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
 
 	"github.com/cilium/cilium/pkg/datapath/types"
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/hive/job"
 	"github.com/cilium/cilium/pkg/node"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/time"
@@ -31,43 +29,37 @@ var Cell = cell.Module(
 type custodianParameters struct {
 	cell.In
 
-	Logger         logrus.FieldLogger
-	Scope          cell.Scope
-	JobRegistry    job.Registry
+	Log            *slog.Logger
+	Health         cell.Health
+	JobGroup       job.Group
 	LocalNodeStore *node.LocalNodeStore
 }
 
-func newKeyCustodian(lc hive.Lifecycle, p custodianParameters) types.IPsecKeyCustodian {
-	group := p.JobRegistry.NewGroup(
-		p.Scope,
-		job.WithLogger(p.Logger),
-		job.WithPprofLabels(pprof.Labels("cell", "ipsec-key-custodian")),
-	)
-
+func newKeyCustodian(lc cell.Lifecycle, p custodianParameters) types.IPsecKeyCustodian {
 	ipsec := &keyCustodian{
+		log:       p.Log,
 		localNode: p.LocalNodeStore,
-		jobs:      group,
+		jobs:      p.JobGroup,
 	}
 
 	lc.Append(ipsec)
-	lc.Append(group)
 	return ipsec
 }
 
-func (kc *keyCustodian) Start(hive.HookContext) error {
+func (kc *keyCustodian) Start(cell.HookContext) error {
 	if !option.Config.EncryptNode {
-		DeleteIPsecEncryptRoute()
+		DeleteIPsecEncryptRoute(kc.log)
 	}
 	if !option.Config.EnableIPSec {
 		return nil
 	}
 
 	var err error
-	kc.authKeySize, kc.spi, err = LoadIPSecKeysFile(option.Config.IPSecKeyFile)
+	kc.authKeySize, kc.spi, err = LoadIPSecKeysFile(kc.log, option.Config.IPSecKeyFile)
 	if err != nil {
 		return err
 	}
-	if err := SetIPSecSPI(kc.spi); err != nil {
+	if err := SetIPSecSPI(kc.log, kc.spi); err != nil {
 		return err
 	}
 
@@ -81,17 +73,17 @@ func (kc *keyCustodian) Start(hive.HookContext) error {
 // StartBackgroundJobs starts the keyfile watcher and stale key reclaimer jobs.
 func (kc *keyCustodian) StartBackgroundJobs(handler types.NodeHandler) error {
 	if option.Config.EnableIPSec {
-		if err := StartKeyfileWatcher(kc.jobs, option.Config.IPSecKeyFile, handler); err != nil {
+		if err := StartKeyfileWatcher(kc.log, kc.jobs, option.Config.IPSecKeyFile, handler); err != nil {
 			return fmt.Errorf("failed to start IPsec keyfile watcher: %w", err)
 		}
 
-		kc.jobs.Add(job.Timer("stale-key-reclaimer", staleKeyReclaimer, time.Minute))
+		kc.jobs.Add(job.Timer("stale-key-reclaimer", staleKeyReclaimer{kc.log}.onTimer, time.Minute))
 	}
 
 	return nil
 }
 
-func (kc *keyCustodian) Stop(hive.HookContext) error {
+func (kc *keyCustodian) Stop(cell.HookContext) error {
 	return nil
 }
 
@@ -104,6 +96,7 @@ func (kc *keyCustodian) SPI() uint8 {
 }
 
 type keyCustodian struct {
+	log       *slog.Logger
 	localNode *node.LocalNodeStore
 	jobs      job.Group
 

@@ -7,26 +7,23 @@ import (
 	"sync"
 	"testing"
 
-	. "github.com/cilium/checkmate"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/cilium/cilium/pkg/clustermesh/types"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 )
 
-func (s *IdentityTestSuite) TestLocalIdentity(c *C) {
+func TestLocalIdentity(t *testing.T) {
 	localID := NumericIdentity(IdentityScopeLocal | 1)
-	c.Assert(localID.HasLocalScope(), Equals, true)
+	require.True(t, localID.HasLocalScope())
 
-	maxClusterID := NumericIdentity(types.ClusterIDMax | 1)
-	c.Assert(maxClusterID.HasLocalScope(), Equals, false)
+	maxClusterID := NumericIdentity(cmtypes.ClusterIDMax | 1)
+	require.False(t, maxClusterID.HasLocalScope())
 
-	c.Assert(ReservedIdentityWorld.HasLocalScope(), Equals, false)
+	require.False(t, ReservedIdentityWorld.HasLocalScope())
 }
 
-func (s *IdentityTestSuite) TestClusterID(c *C) {
+func TestClusterID(t *testing.T) {
 	tbl := []struct {
 		identity  uint32
 		clusterID uint32
@@ -48,17 +45,17 @@ func (s *IdentityTestSuite) TestClusterID(c *C) {
 			clusterID: 255,
 		},
 		{ // make sure we support min/max configuration values
-			identity:  types.ClusterIDMin << 16,
-			clusterID: types.ClusterIDMin,
+			identity:  cmtypes.ClusterIDMin << 16,
+			clusterID: cmtypes.ClusterIDMin,
 		},
 		{
-			identity:  types.ClusterIDMax << 16,
-			clusterID: types.ClusterIDMax,
+			identity:  cmtypes.ClusterIDMax << 16,
+			clusterID: cmtypes.ClusterIDMax,
 		},
 	}
 
 	for _, item := range tbl {
-		c.Assert(NumericIdentity(item.identity).ClusterID(), Equals, item.clusterID)
+		require.Equal(t, item.clusterID, NumericIdentity(item.identity).ClusterID())
 	}
 }
 

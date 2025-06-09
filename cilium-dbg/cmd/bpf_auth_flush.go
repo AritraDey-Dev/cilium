@@ -13,6 +13,7 @@ import (
 
 	"github.com/cilium/cilium/pkg/command"
 	"github.com/cilium/cilium/pkg/common"
+	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/maps/authmap"
 )
 
@@ -20,11 +21,11 @@ var bpfAuthFlushCmd = &cobra.Command{
 	Use:     "flush",
 	Short:   "Deletes all entries for authenticated connections between identities",
 	Long:    "Deletes all entries for authenticated connections between identities",
-	Aliases: []string{"ls"},
+	Aliases: []string{},
 	Run: func(cmd *cobra.Command, args []string) {
 		common.RequireRootPrivilege("cilium bpf auth flush")
 
-		authMap, err := authmap.LoadAuthMap()
+		authMap, err := authmap.LoadAuthMap(logging.DefaultSlogLogger)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				fmt.Fprintln(os.Stderr, "Cannot find auth bpf map")

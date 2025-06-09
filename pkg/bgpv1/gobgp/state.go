@@ -7,12 +7,12 @@ import (
 	"context"
 	"fmt"
 
+	gobgp "github.com/osrg/gobgp/v3/api"
+
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
-	v2alpha1api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
+	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/time"
-
-	gobgp "github.com/osrg/gobgp/v3/api"
 )
 
 // GetBgp returns bgp global configuration from gobgp server
@@ -64,6 +64,10 @@ func (g *GoBGPServer) GetPeerState(ctx context.Context) (types.GetPeerStateRespo
 		}
 
 		if peer.State != nil {
+			if peer.Conf.PeerAsn == 0 { // if peerAsn is not set, use peer state peerAsn
+				peerState.PeerAsn = int64(peer.State.PeerAsn)
+			}
+
 			peerState.SessionState = toAgentSessionState(peer.State.SessionState).String()
 
 			// Uptime is time since session got established.
@@ -83,7 +87,7 @@ func (g *GoBGPServer) GetPeerState(ctx context.Context) (types.GetPeerStateRespo
 		if peer.EbgpMultihop != nil && peer.EbgpMultihop.Enabled {
 			peerState.EbgpMultihopTTL = int64(peer.EbgpMultihop.MultihopTtl)
 		} else {
-			peerState.EbgpMultihopTTL = int64(v2alpha1api.DefaultBGPEBGPMultihopTTL) // defaults to 1 if not enabled
+			peerState.EbgpMultihopTTL = int64(v2.DefaultBGPEBGPMultihopTTL) // defaults to 1 if not enabled
 		}
 
 		if peer.Timers != nil {
@@ -139,100 +143,6 @@ func toAgentAfiSafiState(state *gobgp.AfiSafiState) *models.BgpPeerFamilies {
 	res.Advertised = int64(state.Advertised)
 
 	return res
-}
-
-// toAgentSessionState translates gobgp session state to cilium bgp session state.
-func toAgentSessionState(s gobgp.PeerState_SessionState) types.SessionState {
-	switch s {
-	case gobgp.PeerState_UNKNOWN:
-		return types.SessionUnknown
-	case gobgp.PeerState_IDLE:
-		return types.SessionIdle
-	case gobgp.PeerState_CONNECT:
-		return types.SessionConnect
-	case gobgp.PeerState_ACTIVE:
-		return types.SessionActive
-	case gobgp.PeerState_OPENSENT:
-		return types.SessionOpenSent
-	case gobgp.PeerState_OPENCONFIRM:
-		return types.SessionOpenConfirm
-	case gobgp.PeerState_ESTABLISHED:
-		return types.SessionEstablished
-	default:
-		return types.SessionUnknown
-	}
-}
-
-// toAgentAfi translates gobgp AFI to cilium bgp AFI.
-func toAgentAfi(a gobgp.Family_Afi) types.Afi {
-	switch a {
-	case gobgp.Family_AFI_UNKNOWN:
-		return types.AfiUnknown
-	case gobgp.Family_AFI_IP:
-		return types.AfiIPv4
-	case gobgp.Family_AFI_IP6:
-		return types.AfiIPv6
-	case gobgp.Family_AFI_L2VPN:
-		return types.AfiL2VPN
-	case gobgp.Family_AFI_LS:
-		return types.AfiLS
-	case gobgp.Family_AFI_OPAQUE:
-		return types.AfiOpaque
-	default:
-		return types.AfiUnknown
-	}
-}
-
-func toAgentSafi(s gobgp.Family_Safi) types.Safi {
-	switch s {
-	case gobgp.Family_SAFI_UNKNOWN:
-		return types.SafiUnknown
-	case gobgp.Family_SAFI_UNICAST:
-		return types.SafiUnicast
-	case gobgp.Family_SAFI_MULTICAST:
-		return types.SafiMulticast
-	case gobgp.Family_SAFI_MPLS_LABEL:
-		return types.SafiMplsLabel
-	case gobgp.Family_SAFI_ENCAPSULATION:
-		return types.SafiEncapsulation
-	case gobgp.Family_SAFI_VPLS:
-		return types.SafiVpls
-	case gobgp.Family_SAFI_EVPN:
-		return types.SafiEvpn
-	case gobgp.Family_SAFI_LS:
-		return types.SafiLs
-	case gobgp.Family_SAFI_SR_POLICY:
-		return types.SafiSrPolicy
-	case gobgp.Family_SAFI_MUP:
-		return types.SafiMup
-	case gobgp.Family_SAFI_MPLS_VPN:
-		return types.SafiMplsVpn
-	case gobgp.Family_SAFI_MPLS_VPN_MULTICAST:
-		return types.SafiMplsVpnMulticast
-	case gobgp.Family_SAFI_ROUTE_TARGET_CONSTRAINTS:
-		return types.SafiRouteTargetConstraints
-	case gobgp.Family_SAFI_FLOW_SPEC_UNICAST:
-		return types.SafiFlowSpecUnicast
-	case gobgp.Family_SAFI_FLOW_SPEC_VPN:
-		return types.SafiFlowSpecVpn
-	case gobgp.Family_SAFI_KEY_VALUE:
-		return types.SafiKeyValue
-	default:
-		return types.SafiUnknown
-	}
-}
-
-func toGoBGPTableType(t types.TableType) (gobgp.TableType, error) {
-	switch t {
-	case types.TableTypeLocRIB:
-		return gobgp.TableType_LOCAL, nil
-	case types.TableTypeAdjRIBIn:
-		return gobgp.TableType_ADJ_IN, nil
-	case types.TableTypeAdjRIBOut:
-		return gobgp.TableType_ADJ_OUT, nil
-	default:
-		return gobgp.TableType_LOCAL, fmt.Errorf("unknown table type %d", t)
-	}
 }
 
 // GetRoutes retrieves routes from the RIB of underlying router

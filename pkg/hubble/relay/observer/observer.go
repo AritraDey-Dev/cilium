@@ -5,9 +5,10 @@ package observer
 
 import (
 	"context"
+	"errors"
 	"io"
+	"log/slog"
 
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
@@ -18,8 +19,8 @@ import (
 	relaypb "github.com/cilium/cilium/api/v1/relay"
 	poolTypes "github.com/cilium/cilium/pkg/hubble/relay/pool/types"
 	"github.com/cilium/cilium/pkg/hubble/relay/queue"
-	"github.com/cilium/cilium/pkg/inctimer"
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/time"
 )
@@ -45,19 +46,19 @@ func retrieveFlowsFromPeer(
 	}
 	for {
 		flow, err := c.Recv()
-		switch err {
-		case io.EOF, context.Canceled:
-			return nil
-		case nil:
-			select {
-			case flows <- flow:
-			case <-ctx.Done():
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
 				return nil
 			}
-		default:
-			if status.Code(err) != codes.Canceled {
-				return err
+			if status.Code(err) == codes.Canceled {
+				return nil
 			}
+			return err
+		}
+
+		select {
+		case flows <- flow:
+		case <-ctx.Done():
 			return nil
 		}
 	}
@@ -74,8 +75,6 @@ func sortFlows(
 
 	go func() {
 		defer close(sortedFlows)
-		bufferTimer, bufferTimerDone := inctimer.New()
-		defer bufferTimerDone()
 	flowsLoop:
 		for {
 			select {
@@ -92,7 +91,7 @@ func sortFlows(
 					}
 				}
 				pq.Push(flow)
-			case t := <-bufferTimer.After(bufferDrainTimeout):
+			case t := <-time.After(bufferDrainTimeout):
 				// Make sure to drain old flows from the queue when no new
 				// flows are received. The bufferDrainTimeout duration is used
 				// as a sorting window.
@@ -204,7 +203,7 @@ func aggregateErrors(
 				}
 
 				pendingResponse = response
-				flushPending = inctimer.After(errorAggregationWindow)
+				flushPending = time.After(errorAggregationWindow)
 			case <-flushPending:
 				select {
 				case aggregated <- pendingResponse:
@@ -251,7 +250,7 @@ func newFlowCollector(req *observerpb.GetFlowsRequest, opts options) *flowCollec
 }
 
 type flowCollector struct {
-	log logrus.FieldLogger
+	log *slog.Logger
 	ocb observerClientBuilder
 
 	req *observerpb.GetFlowsRequest
@@ -270,25 +269,27 @@ func (fc *flowCollector) collect(ctx context.Context, g *errgroup.Group, peers [
 			continue
 		}
 		if !isAvailable(p.Conn) {
-			fc.log.WithField("address", p.Address).Infof(
-				"No connection to peer %s, skipping", p.Name,
+			fc.log.Info(
+				"No connection to peer, skipping",
+				logfields.Address, p.Address,
+				logfields.Peer, p.Name,
 			)
 			unavailable = append(unavailable, p.Name)
 			continue
 		}
 		connected = append(connected, p.Name)
 		fc.connectedNodes[p.Name] = struct{}{}
-		p := p
 		g.Go(func() error {
 			// retrieveFlowsFromPeer returns blocks until the peer finishes
 			// the request by closing the connection, an error occurs,
 			// or ctx expires.
 			err := retrieveFlowsFromPeer(ctx, fc.ocb.observerClient(&p), fc.req, flows)
 			if err != nil {
-				fc.log.WithFields(logrus.Fields{
-					"error": err,
-					"peer":  p,
-				}).Warning("Failed to retrieve flows from peer")
+				fc.log.Warn(
+					"Failed to retrieve flows from peer",
+					logfields.Error, err,
+					logfields.Peer, p,
+				)
 				fc.mu.Lock()
 				delete(fc.connectedNodes, p.Name)
 				fc.mu.Unlock()

@@ -1,34 +1,24 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
 
+#include <bpf/ctx/skb.h>
 #include "common.h"
 
 /* Enable debug output */
 #define DEBUG
 
-/* Set NODE_MAC equal to mac_two */
-#define NODE_MAC { .addr = {0x13, 0x37, 0x13, 0x37, 0x13, 0x37} }
-
-#define SECCTX_FROM_IPCACHE 1
-
-/* Set the LXC source address to be the address of pod one */
-#define LXC_IPV4 (__be32)v4_pod_one
-#include "config_replacement.h"
-
 /* Enable CT debug output */
 #undef QUIET_CT
 
-#include <bpf/ctx/skb.h>
 #include "pktgen.h"
-
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
 
 /* Enable code paths under test */
 #define ENABLE_IPV4
 #define ENABLE_L2_ANNOUNCEMENTS
 
 #include <bpf_host.c>
+
+ASSIGN_CONFIG(union macaddr, interface_mac, {.addr = mac_two_addr})
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
@@ -101,7 +91,7 @@ SETUP("tc", "0_no_entry")
 int l2_announcement_arp_no_entry_setup(struct __ctx_buff *ctx)
 {
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, 0);
+	tail_call_static(ctx, entry_call_map, 0);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
 }
@@ -137,13 +127,13 @@ int l2_announcement_arp_no_entry_check(__maybe_unused const struct __ctx_buff *c
 	if ((void *)l3 + sizeof(struct arphdreth) > data_end)
 		test_fatal("l3 out of bounds");
 
-	assert(memcmp(l2->h_source, (__u8 *)mac_one, ETH_HLEN) != 0);
-	assert(memcmp(l2->h_dest, (__u8 *)mac_bcast, ETH_HLEN) != 0);
+	assert(memcmp(l2->h_source, (__u8 *)mac_one, ETH_ALEN) == 0);
+	assert(memcmp(l2->h_dest, (__u8 *)mac_bcast, ETH_ALEN) == 0);
 	assert(l3->ar_op == bpf_htons(ARPOP_REQUEST));
 	assert(l3->ar_sip == v4_ext_one);
 	assert(l3->ar_tip == v4_svc_one);
-	assert(memcmp(l3->ar_sha, (__u8 *)mac_one, ETH_HLEN) != 0);
-	assert(memcmp(l3->ar_tha, (__u8 *)mac_bcast, ETH_HLEN) != 0);
+	assert(memcmp(l3->ar_sha, (__u8 *)mac_one, ETH_ALEN) == 0);
+	assert(memcmp(l3->ar_tha, (__u8 *)mac_bcast, ETH_ALEN) == 0);
 
 	test_finish();
 }
@@ -154,27 +144,23 @@ int l2_announcement_arp_happy_path_pktgen(struct __ctx_buff *ctx)
 	return build_packet(ctx);
 }
 
-/* Test that sending a ARP broadcast request matching an entry in the
- * L2_RESPONDER_MAP4 results in a valid ARP reply.
+/* Test that sending a ARP broadcast request matching an entry in
+ * cilium_l2_responder_v4 results in a valid ARP reply.
  */
 SETUP("tc", "1_happy_path")
 int l2_announcement_arp_happy_path_setup(struct __ctx_buff *ctx)
 {
 	struct l2_responder_v4_key key;
 	struct l2_responder_v4_stats value = {0};
-	__u32 index;
-	__u64 time;
 
 	key.ifindex = 0;
 	key.ip4 = v4_svc_one;
-	map_update_elem(&L2_RESPONDER_MAP4, &key, &value, BPF_ANY);
+	map_update_elem(&cilium_l2_responder_v4, &key, &value, BPF_ANY);
 
-	index = RUNTIME_CONFIG_AGENT_LIVENESS;
-	time = ktime_get_ns();
-	map_update_elem(&CONFIG_MAP, &index, &time, BPF_ANY);
+	config_set(RUNTIME_CONFIG_AGENT_LIVENESS, ktime_get_ns());
 
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, 0);
+	tail_call_static(ctx, entry_call_map, 0);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
 }
@@ -209,13 +195,13 @@ int l2_announcement_arp_happy_path_check(__maybe_unused const struct __ctx_buff 
 	if ((void *)l3 + sizeof(struct arphdreth) > data_end)
 		test_fatal("l3 out of bounds");
 
-	assert(memcmp(l2->h_source, (__u8 *)mac_two, ETH_HLEN) != 0);
-	assert(memcmp(l2->h_dest, (__u8 *)mac_one, ETH_HLEN) != 0);
+	assert(memcmp(l2->h_source, (__u8 *)mac_two, ETH_ALEN) == 0);
+	assert(memcmp(l2->h_dest, (__u8 *)mac_one, ETH_ALEN) == 0);
 	assert(l3->ar_op == bpf_htons(ARPOP_REPLY));
 	assert(l3->ar_sip == v4_svc_one);
 	assert(l3->ar_tip == v4_ext_one);
-	assert(memcmp(l3->ar_sha, (__u8 *)mac_two, ETH_HLEN) != 0);
-	assert(memcmp(l3->ar_tha, (__u8 *)mac_one, ETH_HLEN) != 0);
+	assert(memcmp(l3->ar_sha, (__u8 *)mac_two, ETH_ALEN) == 0);
+	assert(memcmp(l3->ar_tha, (__u8 *)mac_one, ETH_ALEN) == 0);
 
 	test_finish();
 }

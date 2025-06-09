@@ -5,9 +5,13 @@ package kvstore
 
 import (
 	"context"
+	"log/slog"
 
 	"google.golang.org/grpc"
 
+	"github.com/cilium/cilium/api/v1/models"
+	"github.com/cilium/cilium/pkg/logging"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/time"
 )
 
@@ -40,6 +44,15 @@ type ExtraOptions struct {
 
 	// ClusterName is the name of each etcd cluster
 	ClusterName string
+
+	// BootstrapComplete is an optional channel that can be provided to signal
+	// to the client that bootstrap is complete. If provided, the client will
+	// have an initial rate limit equal to etcd.bootstrapQps and be updated to
+	// etcd.qps after this channel is closed.
+	BootstrapComplete <-chan struct{}
+
+	// NoEndpointStatusChecks disables the status checks for the endpoints
+	NoEndpointStatusChecks bool
 }
 
 // StatusCheckInterval returns the interval of status checks depending on the
@@ -75,7 +88,7 @@ type backendModule interface {
 
 	// setConfig must configure the backend with the specified options.
 	// This function is called once before newClient().
-	setConfig(opts map[string]string) error
+	setConfig(logger *slog.Logger, opts map[string]string) error
 
 	// setExtraConfig sets more options in the kvstore that are not able to
 	// be set by strings.
@@ -90,7 +103,7 @@ type backendModule interface {
 
 	// newClient must initializes the backend and create a new kvstore
 	// client which implements the BackendOperations interface
-	newClient(ctx context.Context, opts *ExtraOptions) (BackendOperations, chan error)
+	newClient(ctx context.Context, logger *slog.Logger, opts *ExtraOptions) (BackendOperations, chan error)
 
 	// createInstance creates a new instance of the module
 	createInstance() backendModule
@@ -105,7 +118,7 @@ var (
 // registerBackend must be called by kvstore backends to register themselves
 func registerBackend(name string, module backendModule) {
 	if _, ok := registeredBackends[name]; ok {
-		log.Panicf("backend with name '%s' already registered", name)
+		logging.Panic(logging.DefaultSlogLogger, "backend already registered", logfields.Name, name)
 	}
 
 	registeredBackends[name] = module
@@ -128,13 +141,8 @@ type BackendOperations interface {
 	// is connected to the kvstore server.
 	Connected(ctx context.Context) <-chan error
 
-	// Disconnected returns a channel which is closed whenever the kvstore
-	// client is not connected to the kvstore server. (Only implemented for etcd)
-	Disconnected() <-chan struct{}
-
-	// Status returns the status of the kvstore client including an
-	// eventual error
-	Status() (string, error)
+	// Status returns the status of the kvstore client
+	Status() *models.Status
 
 	// StatusCheckErrors returns a channel which receives status check
 	// errors
@@ -148,15 +156,6 @@ type BackendOperations interface {
 
 	// GetIfLocked returns value of key if the client is still holding the given lock.
 	GetIfLocked(ctx context.Context, key string, lock KVLocker) ([]byte, error)
-
-	// GetPrefix returns the first key which matches the prefix and its value
-	GetPrefix(ctx context.Context, prefix string) (string, []byte, error)
-
-	// GetPrefixIfLocked returns the first key which matches the prefix and its value if the client is still holding the given lock.
-	GetPrefixIfLocked(ctx context.Context, prefix string, lock KVLocker) (string, []byte, error)
-
-	// Set sets value of key
-	Set(ctx context.Context, key string, value []byte) error
 
 	// Delete deletes a key. It does not return an error if the key does not exist.
 	Delete(ctx context.Context, key string) error
@@ -184,39 +183,21 @@ type BackendOperations interface {
 	// CreateOnlyIfLocked atomically creates a key if the client is still holding the given lock or fails if it already exists
 	CreateOnlyIfLocked(ctx context.Context, key string, value []byte, lease bool, lock KVLocker) (bool, error)
 
-	// CreateIfExists creates a key with the value only if key condKey exists
-	CreateIfExists(ctx context.Context, condKey, key string, value []byte, lease bool) error
-
 	// ListPrefix returns a list of keys matching the prefix
 	ListPrefix(ctx context.Context, prefix string) (KeyValuePairs, error)
 
 	// ListPrefixIfLocked returns a list of keys matching the prefix only if the client is still holding the given lock.
 	ListPrefixIfLocked(ctx context.Context, prefix string, lock KVLocker) (KeyValuePairs, error)
 
-	// Watch starts watching for changes in a prefix. If list is true, the
-	// current keys matching the prefix will be listed and reported as new
-	// keys first.
-	Watch(ctx context.Context, w *Watcher)
-
 	// Close closes the kvstore client
-	Close(ctx context.Context)
-
-	// GetCapabilities returns the capabilities of the backend
-	GetCapabilities() Capabilities
-
-	// Encodes a binary slice into a character set that the backend
-	// supports
-	Encode(in []byte) string
-
-	// Decodes a key previously encoded back into the original binary slice
-	Decode(in string) ([]byte, error)
+	Close()
 
 	// ListAndWatch creates a new watcher which will watch the specified
 	// prefix for changes. Before doing this, it will list the current keys
 	// matching the prefix and report them as new keys. The Events channel is
-	// created with the specified sizes. Upon every change observed, a
-	// KeyValueEvent will be sent to the Events channel
-	ListAndWatch(ctx context.Context, prefix string, chanSize int) *Watcher
+	// unbuffered. Upon every change observed, a KeyValueEvent will be sent
+	// to the Events channel
+	ListAndWatch(ctx context.Context, prefix string) EventChan
 
 	// RegisterLeaseExpiredObserver registers a function which is executed when
 	// the lease associated with a key having the given prefix is detected as expired.

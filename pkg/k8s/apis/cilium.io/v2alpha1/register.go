@@ -77,14 +77,15 @@ const (
 	LBIPPoolName = PoolPluralName + "." + CustomResourceDefinitionGroup
 
 	// CiliumNodeConfig (CNC)
-	CNCPluralName     = "ciliumnodeconfigs"
-	CNCKindDefinition = "CiliumNodeConfig"
-	CNCName           = CNCPluralName + "." + CustomResourceDefinitionGroup
 
-	// CiliumCIDRGroup (CCG)
-	CCGPluralName     = "ciliumcidrgroups"
-	CCGKindDefinition = "CiliumCIDRGroup"
-	CCGName           = CCGPluralName + "." + CustomResourceDefinitionGroup
+	// CNCPluralName is the plural name of Cilium Node Config
+	CNCPluralName = "ciliumnodeconfigs"
+
+	// CNCKindDefinition is the kind name of Cilium Node Config
+	CNCKindDefinition = "CiliumNodeConfig"
+
+	// CNCName is the full name of Cilium Node Config
+	CNCName = CNCPluralName + "." + CustomResourceDefinitionGroup
 
 	// Cilium L2 Announcement policy
 
@@ -104,6 +105,12 @@ const (
 	CPIPPluralName     = "ciliumpodippools"
 	CPIPKindDefinition = "CiliumPodIPPool"
 	CPIPName           = CPIPPluralName + "." + CustomResourceDefinitionGroup
+
+	// CiliumGatewayClassConfig (CGCC)
+	CGCCPluralName     = "ciliumgatewayclassconfigs"
+	CGCCListName       = "ciliumgatewayclassconfiglists"
+	CGCCKindDefinition = "CiliumGatewayClassConfig"
+	CGCCName           = CGCCPluralName + "." + CustomResourceDefinitionGroup
 )
 
 // SchemeGroupVersion is group version used to register these objects
@@ -153,14 +160,12 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&CiliumBGPPeeringPolicyList{},
 		&CiliumLoadBalancerIPPool{},
 		&CiliumLoadBalancerIPPoolList{},
-		&CiliumNodeConfig{},
-		&CiliumNodeConfigList{},
-		&CiliumCIDRGroup{},
-		&CiliumCIDRGroupList{},
 		&CiliumL2AnnouncementPolicy{},
 		&CiliumL2AnnouncementPolicyList{},
 		&CiliumPodIPPool{},
 		&CiliumPodIPPoolList{},
+		&CiliumNodeConfig{},
+		&CiliumNodeConfigList{},
 
 		// new BGP types
 		&CiliumBGPClusterConfig{},
@@ -173,6 +178,10 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&CiliumBGPNodeConfigList{},
 		&CiliumBGPNodeConfigOverride{},
 		&CiliumBGPNodeConfigOverrideList{},
+
+		// new Gateway API types
+		&CiliumGatewayClassConfig{},
+		&CiliumGatewayClassConfigList{},
 	)
 
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)

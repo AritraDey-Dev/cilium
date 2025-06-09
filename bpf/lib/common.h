@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_COMMON_H_
-#define __LIB_COMMON_H_
+#pragma once
 
 #include <bpf/ctx/ctx.h>
 #include <bpf/api.h>
@@ -12,11 +11,15 @@
 #include <linux/in.h>
 #include <linux/socket.h>
 
-#include "eth.h"
 #include "endian.h"
+#include "eth.h"
 #include "mono.h"
 #include "config.h"
 #include "tunnel.h"
+#include "notify.h"
+#include "drop_reasons.h"
+
+#include "source_info.h"
 
 #ifndef AF_INET
 #define AF_INET 2
@@ -34,17 +37,16 @@
 #define EVENT_SOURCE 0
 #endif
 
-#ifndef THIS_MTU
-/* If not available, fall back to generically detected MTU instead of more
- * fine-grained per-device MTU.
- */
-# define THIS_MTU MTU
-#endif
-
 #ifdef PREALLOCATE_MAPS
 #define CONDITIONAL_PREALLOC 0
 #else
 #define CONDITIONAL_PREALLOC BPF_F_NO_PREALLOC
+#endif
+
+#ifdef NO_COMMON_MEM_MAPS
+#define LRU_MEM_FLAVOR BPF_F_NO_COMMON_LRU
+#else
+#define LRU_MEM_FLAVOR 0
 #endif
 
 #if defined(ENABLE_EGRESS_GATEWAY)
@@ -53,7 +55,7 @@
 
 #if defined(ENCAP_IFINDEX) || defined(ENABLE_EGRESS_GATEWAY_COMMON) || \
     (defined(ENABLE_DSR) && DSR_ENCAP_MODE == DSR_ENCAP_GENEVE)
-#define HAVE_ENCAP
+#define HAVE_ENCAP	1
 
 /* NOT_VTEP_DST is passed to an encapsulation function when the
  * destination of the tunnel is not a VTEP.
@@ -76,68 +78,12 @@ enum {
 /* FIB errors from BPF neighbor map. */
 #define BPF_FIB_MAP_NO_NEIGH	100
 
-#define CILIUM_CALL_DROP_NOTIFY			1
-#define CILIUM_CALL_ERROR_NOTIFY		2
-/*
- * A gap in the macro numbering sequence was created by #24921.
- * It can be reused for a new macro in the future, but caution is needed when
- * backporting changes as it may conflict with older versions of the code.
- */
-#define CILIUM_CALL_HANDLE_ICMP6_NS		4
-#define CILIUM_CALL_SEND_ICMP6_TIME_EXCEEDED	5
-#define CILIUM_CALL_ARP				6
-#define CILIUM_CALL_IPV4_FROM_LXC		7
-#define CILIUM_CALL_IPV4_FROM_NETDEV		CILIUM_CALL_IPV4_FROM_LXC
-#define CILIUM_CALL_IPV4_FROM_OVERLAY		CILIUM_CALL_IPV4_FROM_LXC
-#define CILIUM_CALL_IPV46_RFC8215		8
-#define CILIUM_CALL_IPV64_RFC8215		9
-#define CILIUM_CALL_IPV6_FROM_LXC		10
-#define CILIUM_CALL_IPV6_FROM_NETDEV		CILIUM_CALL_IPV6_FROM_LXC
-#define CILIUM_CALL_IPV6_FROM_OVERLAY		CILIUM_CALL_IPV6_FROM_LXC
-#define CILIUM_CALL_IPV4_TO_LXC_POLICY_ONLY	11
-#define CILIUM_CALL_IPV4_TO_HOST_POLICY_ONLY	CILIUM_CALL_IPV4_TO_LXC_POLICY_ONLY
-#define CILIUM_CALL_IPV6_TO_LXC_POLICY_ONLY	12
-#define CILIUM_CALL_IPV6_TO_HOST_POLICY_ONLY	CILIUM_CALL_IPV6_TO_LXC_POLICY_ONLY
-#define CILIUM_CALL_IPV4_TO_ENDPOINT		13
-#define CILIUM_CALL_IPV6_TO_ENDPOINT		14
-#define CILIUM_CALL_IPV4_NODEPORT_NAT_EGRESS	15
-#define CILIUM_CALL_IPV6_NODEPORT_NAT_EGRESS	16
-#define CILIUM_CALL_IPV4_NODEPORT_REVNAT	17
-#define CILIUM_CALL_IPV6_NODEPORT_REVNAT	18
-#define CILIUM_CALL_IPV4_NODEPORT_NAT_FWD	19
-#define CILIUM_CALL_IPV4_NODEPORT_DSR		20
-#define CILIUM_CALL_IPV6_NODEPORT_DSR		21
-#define CILIUM_CALL_IPV4_FROM_HOST		22
-#define CILIUM_CALL_IPV6_FROM_HOST		23
-#define CILIUM_CALL_IPV6_NODEPORT_NAT_FWD	24
-#define CILIUM_CALL_IPV4_FROM_LXC_CONT		25
-#define CILIUM_CALL_IPV6_FROM_LXC_CONT		26
-#define CILIUM_CALL_IPV4_CT_INGRESS		27
-#define CILIUM_CALL_IPV4_CT_INGRESS_POLICY_ONLY	28
-#define CILIUM_CALL_IPV4_CT_EGRESS		29
-#define CILIUM_CALL_IPV6_CT_INGRESS		30
-#define CILIUM_CALL_IPV6_CT_INGRESS_POLICY_ONLY	31
-#define CILIUM_CALL_IPV6_CT_EGRESS		32
-#define CILIUM_CALL_SRV6_ENCAP			33
-#define CILIUM_CALL_SRV6_DECAP			34
-#define CILIUM_CALL_SRV6_REPLY			35
-#define CILIUM_CALL_IPV4_NODEPORT_NAT_INGRESS	36
-#define CILIUM_CALL_IPV6_NODEPORT_NAT_INGRESS	37
-#define CILIUM_CALL_IPV4_NODEPORT_SNAT_FWD	38
-#define CILIUM_CALL_IPV6_NODEPORT_SNAT_FWD	39
-/* Unused CILIUM_CALL_IPV4_NODEPORT_DSR_INGRESS	40
- * Unused CILIUM_CALL_IPV6_NODEPORT_DSR_INGRESS	41
- */
-#define CILIUM_CALL_IPV4_INTER_CLUSTER_REVSNAT	42
-#define CILIUM_CALL_IPV4_CONT_FROM_HOST		43
-#define CILIUM_CALL_IPV4_CONT_FROM_NETDEV	44
-#define CILIUM_CALL_IPV6_CONT_FROM_HOST		45
-#define CILIUM_CALL_IPV6_CONT_FROM_NETDEV	46
-#define CILIUM_CALL_IPV4_NO_SERVICE		47
-#define CILIUM_CALL_IPV6_NO_SERVICE		48
-#define CILIUM_CALL_SIZE			49
-
 typedef __u64 mac_t;
+
+union v4addr {
+	__be32 be32;
+	__u8 addr[4];
+};
 
 union v6addr {
 	struct {
@@ -175,10 +121,8 @@ static __always_inline bool validate_ethertype_l2_off(struct __ctx_buff *ctx,
 	eth = data + l2_off;
 
 	*proto = eth->h_proto;
-	if (bpf_ntohs(*proto) < ETH_P_802_3_MIN)
-		return false; /* non-Ethernet II unsupported */
 
-	return true;
+	return eth_is_supported_ethertype(*proto);
 }
 
 static __always_inline bool validate_ethertype(struct __ctx_buff *ctx,
@@ -198,7 +142,7 @@ ____revalidate_data_pull(struct __ctx_buff *ctx, void **data_, void **data_end_,
 
 	/* Verifier workaround, do this unconditionally: invalid size of register spill. */
 	if (pull)
-		ctx_pull_data(ctx, tot_len);
+		ctx_pull_data(ctx, (__u32)tot_len);
 	data_end = ctx_data_end(ctx);
 	data = ctx_data(ctx);
 	if (data + tot_len > data_end)
@@ -265,15 +209,6 @@ static __always_inline __u32 get_id_from_tunnel_id(__u32 tunnel_id, __u16 proto 
 #define revalidate_data(ctx, data, data_end, ip)			\
 	revalidate_data_l3_off(ctx, data, data_end, ip, ETH_HLEN)
 
-/* Macros for working with L3 cilium defined IPV6 addresses */
-#define BPF_V6(dst, ...)	BPF_V6_1(dst, fetch_ipv6(__VA_ARGS__))
-#define BPF_V6_1(dst, ...)	BPF_V6_2(dst, __VA_ARGS__)
-#define BPF_V6_2(dst, a1, a2)		\
-	({					\
-		dst.d1 = a1;			\
-		dst.d2 = a2;			\
-	})
-
 #define ENDPOINT_KEY_IPV4 1
 #define ENDPOINT_KEY_IPV6 2
 
@@ -295,37 +230,9 @@ struct endpoint_key {
 	__u16 cluster_id;
 } __packed;
 
-struct tunnel_key {
-	union {
-		struct {
-			__u32		ip4;
-			__u32		pad1;
-			__u32		pad2;
-			__u32		pad3;
-		};
-		union v6addr	ip6;
-	};
-	__u8 family;
-	__u8 pad;
-	__u16 cluster_id;
-} __packed;
-
-struct tunnel_value {
-	union {
-		struct {
-			__u32		ip4;
-			__u32		pad1;
-			__u32		pad2;
-			__u32		pad3;
-		};
-		union v6addr	ip6;
-	};
-	__u8 family;
-	__u8 key;
-	__u16 pad;
-} __packed;
-
-#define ENDPOINT_F_HOST		1 /* Special endpoint representing local host */
+#define ENDPOINT_F_HOST			1 /* Special endpoint representing local host */
+#define ENDPOINT_F_ATHOSTNS		2 /* Endpoint located at the host networking namespace */
+#define ENDPOINT_MASK_HOST_DELIVERY	(ENDPOINT_F_HOST | ENDPOINT_F_ATHOSTNS)
 
 /* Value of endpoint map */
 struct endpoint_info {
@@ -336,25 +243,48 @@ struct endpoint_info {
 	mac_t		mac;
 	mac_t		node_mac;
 	__u32		sec_id;
-	__u32		pad[3];
+	__u32		parent_ifindex;
+	__u32		pad[2];
 };
 
+#define DIRECTION_EGRESS 0
+#define DIRECTION_INGRESS 1
+
 struct edt_id {
-	__u64		id;
+	__u32		id;
+	__u8		direction;
+	__u8		pad[3];
 };
 
 struct edt_info {
 	__u64		bps;
 	__u64		t_last;
-	__u64		t_horizon_drop;
-	__u64		pad[4];
+	union {
+		__u64	t_horizon_drop;
+		__u64	tokens;
+	};
+	__u32		prio;
+	__u32		pad_32;
+	__u64		pad[3];
 };
 
 struct remote_endpoint_info {
 	__u32		sec_identity;
-	__u32		tunnel_endpoint;
+	union {
+		struct {
+			__u32	ip4;
+			__u32	pad1;
+			__u32	pad2;
+			__u32	pad3;
+		};
+		union v6addr	ip6;
+	} tunnel_endpoint;
 	__u16		pad;
 	__u8		key;
+	__u8		flag_skip_tunnel:1,
+			flag_has_tunnel_ep:1,
+			flag_ipv6_tunnel_ep:1,
+			pad2:5;
 };
 
 /*
@@ -382,7 +312,7 @@ struct policy_key {
 	__u8		egress:1,
 			pad:7;
 	__u8		protocol; /* can be wildcarded if 'dport' is fully wildcarded */
-	__u16		dport; /* can be wildcarded with CIDR-like prefix */
+	__be16		dport; /* can be wildcarded with CIDR-like prefix */
 };
 
 /* POLICY_FULL_PREFIX gets full prefix length of policy_key */
@@ -392,12 +322,37 @@ struct policy_key {
 struct policy_entry {
 	__be16		proxy_port;
 	__u8		deny:1,
-			wildcard_protocol:1, /* protocol is fully wildcarded */
-			wildcard_dport:1, /* dport is fully wildcarded */
-			pad:5;
-	__u8		auth_type;
-	__u16		pad1;
-	__u16		pad2;
+			reserved:2, /* bits used in Cilium 1.16, keep unused for Cilium 1.17 */
+			lpm_prefix_length:5; /* map key protocol and dport prefix length */
+	__u8		auth_type:7,
+			has_explicit_auth_type:1;
+	__u8		proxy_port_priority;
+	__u8		pad1;
+	__u16	        pad2;
+};
+
+/*
+ * LPM_FULL_PREFIX_BITS is the maximum length in 'lpm_prefix_length' when none of the protocol or
+ * dport bits in the key are wildcarded.
+ */
+#define LPM_PROTO_PREFIX_BITS 8                             /* protocol specified */
+#define LPM_FULL_PREFIX_BITS (LPM_PROTO_PREFIX_BITS + 16)   /* protocol and dport specified */
+
+/*
+ * policy_stats_key has the same layout as policy_key, apart from the first four bytes.
+ */
+struct policy_stats_key {
+	__u16		endpoint_id;
+	__u8		pad1;
+	__u8		prefix_len;
+	__u32		sec_label;
+	__u8		egress:1,
+			pad:7;
+	__u8		protocol; /* can be wildcarded if 'dport' is fully wildcarded */
+	__be16		dport; /* can be wildcarded with CIDR-like prefix */
+};
+
+struct policy_stats_value {
 	__u64		packets;
 	__u64		bytes;
 };
@@ -415,22 +370,13 @@ struct auth_info {
 	__u64       expiration;
 };
 
-/*
- * Runtime configuration items for the datapath.
- */
-enum {
-	RUNTIME_CONFIG_UTIME_OFFSET = 0, /* Index to Unix time offset in 512 ns units */
-	/* Last monotonic time, periodically set by the agent to
-	 * tell the datapath its still updating maps
-	 */
-	RUNTIME_CONFIG_AGENT_LIVENESS = 1,
-};
-
 struct metrics_key {
 	__u8      reason;	/* 0: forwarded, >0 dropped */
 	__u8      dir:2,	/* 1: ingress 2: egress */
 		  pad:6;
-	__u16     reserved[3];	/* reserved for future extension */
+	__u16	  line;		/* __MAGIC_LINE__ */
+	__u8	  file;		/* __MAGIC_FILE__, needs to fit __id_for_file */
+	__u8	  reserved[3];	/* reserved for future extension */
 };
 
 
@@ -448,6 +394,20 @@ struct egress_gw_policy_key {
 struct egress_gw_policy_entry {
 	__u32 egress_ip;
 	__u32 gateway_ip;
+};
+
+struct egress_gw_policy_key6 {
+	struct bpf_lpm_trie_key lpm_key;
+	union v6addr saddr;
+	union v6addr daddr;
+};
+
+struct egress_gw_policy_entry6 {
+	union v6addr egress_ip;
+	__u32 gateway_ip;
+	__u32 reserved[3]; /* reserved for future extension, e.g. v6 gateway_ip */
+	__u32 egress_ifindex;
+	__u32 reserved2; /* for even more future extension */
 };
 
 struct srv6_vrf_key4 {
@@ -474,23 +434,25 @@ struct srv6_policy_key6 {
 	union v6addr dst_cidr;
 };
 
-struct srv6_ipv4_2tuple {
-	__u32 src;
-	__u32 dst;
+struct node_key {
+	__u16 pad1;
+	__u8 pad2;
+	__u8 family;
+	union {
+		struct {
+			__u32 ip4;
+			__u32 pad4;
+			__u32 pad5;
+			__u32 pad6;
+		};
+		union v6addr ip6;
+	};
 };
 
-struct srv6_ipv6_2tuple {
-	union v6addr src;
-	union v6addr dst;
-};
-
-struct vtep_key {
-	__u32 vtep_ip;
-};
-
-struct vtep_value {
-	__u64 vtep_mac;
-	__u32 tunnel_endpoint;
+struct node_value {
+	__u16 id;
+	__u8  spi;
+	__u8  pad;
 };
 
 enum {
@@ -513,43 +475,6 @@ enum {
 	CAPTURE_EGRESS = 2,
 };
 
-enum {
-	CILIUM_NOTIFY_UNSPEC,
-	CILIUM_NOTIFY_DROP,
-	CILIUM_NOTIFY_DBG_MSG,
-	CILIUM_NOTIFY_DBG_CAPTURE,
-	CILIUM_NOTIFY_TRACE,
-	CILIUM_NOTIFY_POLICY_VERDICT,
-	CILIUM_NOTIFY_CAPTURE,
-	CILIUM_NOTIFY_TRACE_SOCK,
-};
-
-#define NOTIFY_COMMON_HDR \
-	__u8		type;		\
-	__u8		subtype;	\
-	__u16		source;		\
-	__u32		hash;
-
-#define NOTIFY_CAPTURE_HDR \
-	NOTIFY_COMMON_HDR						\
-	__u32		len_orig;	/* Length of original packet */	\
-	__u16		len_cap;	/* Length of captured bytes */	\
-	__u16		version;	/* Capture header version */
-
-#define __notify_common_hdr(t, s)	\
-	.type		= (t),		\
-	.subtype	= (s),		\
-	.source		= EVENT_SOURCE,	\
-	.hash		= get_hash_recalc(ctx)
-
-#define __notify_pktcap_hdr(o, c)	\
-	.len_orig	= (o),		\
-	.len_cap	= (c),		\
-	.version	= NOTIFY_CAPTURE_VER
-
-/* Capture notifications version. Must be incremented when format changes. */
-#define NOTIFY_CAPTURE_VER 1
-
 #ifndef TRACE_PAYLOAD_LEN
 #define TRACE_PAYLOAD_LEN 128ULL
 #endif
@@ -563,84 +488,9 @@ enum {
 /* Return value to indicate that proxy redirection is required */
 #define POLICY_ACT_PROXY_REDIRECT (1 << 16)
 
-/* Cilium error codes, must NOT overlap with TC return codes.
- * These also serve as drop reasons for metrics,
- * where reason > 0 corresponds to -(DROP_*)
- *
- * These are shared with pkg/monitor/api/drop.go and api/v1/flow/flow.proto.
- * When modifying any of the below, those files should also be updated.
- */
-#define DROP_UNUSED1		-130 /* unused */
-#define DROP_UNUSED2		-131 /* unused */
-#define DROP_INVALID_SIP	-132
-#define DROP_POLICY		-133
-#define DROP_INVALID		-134
-#define DROP_CT_INVALID_HDR	-135
-#define DROP_FRAG_NEEDED	-136
-#define DROP_CT_UNKNOWN_PROTO	-137
-#define DROP_UNUSED4		-138 /* unused */
-#define DROP_UNKNOWN_L3		-139
-#define DROP_MISSED_TAIL_CALL	-140
-#define DROP_WRITE_ERROR	-141
-#define DROP_UNKNOWN_L4		-142
-#define DROP_UNKNOWN_ICMP_CODE	-143
-#define DROP_UNKNOWN_ICMP_TYPE	-144
-#define DROP_UNKNOWN_ICMP6_CODE	-145
-#define DROP_UNKNOWN_ICMP6_TYPE	-146
-#define DROP_NO_TUNNEL_KEY	-147
-#define DROP_UNUSED5		-148 /* unused */
-#define DROP_UNUSED6		-149 /* unused */
-#define DROP_UNKNOWN_TARGET	-150
-#define DROP_UNROUTABLE		-151
-#define DROP_UNUSED7		-152 /* unused */
-#define DROP_CSUM_L3		-153
-#define DROP_CSUM_L4		-154
-#define DROP_CT_CREATE_FAILED	-155
-#define DROP_INVALID_EXTHDR	-156
-#define DROP_FRAG_NOSUPPORT	-157
-#define DROP_NO_SERVICE		-158
-#define DROP_UNSUPP_SERVICE_PROTO	-159
-#define DROP_NO_TUNNEL_ENDPOINT -160
-#define DROP_NAT_46X64_DISABLED	-161
-#define DROP_EDT_HORIZON	-162
-#define DROP_UNKNOWN_CT		-163
-#define DROP_HOST_UNREACHABLE	-164
-#define DROP_NO_CONFIG		-165
-#define DROP_UNSUPPORTED_L2	-166
-#define DROP_NAT_NO_MAPPING	-167
-#define DROP_NAT_UNSUPP_PROTO	-168
-#define DROP_NO_FIB		-169
-#define DROP_ENCAP_PROHIBITED	-170
-#define DROP_INVALID_IDENTITY	-171
-#define DROP_UNKNOWN_SENDER	-172
-#define DROP_NAT_NOT_NEEDED	-173 /* Mapped as drop code, though drop not necessary. */
-#define DROP_IS_CLUSTER_IP	-174
-#define DROP_FRAG_NOT_FOUND	-175
-#define DROP_FORBIDDEN_ICMP6	-176
-#define DROP_NOT_IN_SRC_RANGE	-177
-#define DROP_PROXY_LOOKUP_FAILED	-178
-#define DROP_PROXY_SET_FAILED	-179
-#define DROP_PROXY_UNKNOWN_PROTO	-180
-#define DROP_POLICY_DENY	-181
-#define DROP_VLAN_FILTERED	-182
-#define DROP_INVALID_VNI	-183
-#define DROP_INVALID_TC_BUFFER  -184
-#define DROP_NO_SID		-185
-#define DROP_MISSING_SRV6_STATE	-186
-#define DROP_NAT46		-187
-#define DROP_NAT64		-188
-#define DROP_POLICY_AUTH_REQUIRED	-189
-#define DROP_CT_NO_MAP_FOUND	-190
-#define DROP_SNAT_NO_MAP_FOUND	-191
-#define DROP_INVALID_CLUSTER_ID	-192
-#define DROP_DSR_ENCAP_UNSUPP_PROTO	-193
-#define DROP_NO_EGRESS_GATEWAY	-194
-#define DROP_UNENCRYPTED_TRAFFIC	-195
-#define DROP_TTL_EXCEEDED	-196
-#define DROP_NO_NODE_ID		-197
-#define DROP_RATE_LIMITED	-198
-
 #define NAT_PUNT_TO_STACK	DROP_NAT_NOT_NEEDED
+#define LB_PUNT_TO_STACK	DROP_PUNT_PROXY
+
 #define NAT_NEEDED		CTX_ACT_OK
 #define NAT_46X64_RECIRC	100
 
@@ -661,6 +511,9 @@ enum {
 #define REASON_FRAG_PACKET		9
 #define REASON_FRAG_PACKET_UPDATE	10
 #define REASON_MISSED_CUSTOM_CALL	11
+#define REASON_DECRYPTING			12
+#define REASON_ENCRYPTING			13
+#define REASON_LB_REVNAT_DELETE		14
 
 /* Lookup scope for externalTrafficPolicy=Local */
 #define LB_LOOKUP_SCOPE_EXT	0
@@ -692,6 +545,7 @@ enum metric_dir {
  *    In the IPsec case this becomes the SPI on the wire.
  */
 #define MARK_MAGIC_HOST_MASK		0x0F00
+#define MARK_MAGIC_PROXY_TO_WORLD	0x0800
 #define MARK_MAGIC_PROXY_EGRESS_EPID	0x0900 /* mark carries source endpoint ID */
 #define MARK_MAGIC_PROXY_INGRESS	0x0A00
 #define MARK_MAGIC_PROXY_EGRESS		0x0B00
@@ -701,6 +555,15 @@ enum metric_dir {
 #define MARK_MAGIC_IDENTITY		0x0F00 /* mark carries identity */
 #define MARK_MAGIC_TO_PROXY		0x0200
 #define MARK_MAGIC_SNAT_DONE		0x0300
+#define MARK_MAGIC_OVERLAY		0x0400 /* mark carries identity */
+/* used to indicate encrypted traffic was tunnel encapsulated
+ * this is useful in the IPsec code paths where we need to know if overlay
+ * traffic is encrypted or not.
+ *
+ * the SPI bit can be reused since this magic mark is only used POST encryption.
+ */
+#define MARK_MAGIC_OVERLAY_ENCRYPTED	(MARK_MAGIC_OVERLAY | 0x1000)
+#define MARK_MAGIC_EGW_DONE		0x0500 /* mark carries identity */
 
 #define MARK_MAGIC_KEY_MASK		0xFF00
 
@@ -754,21 +617,10 @@ enum metric_dir {
 #define DSR_IPV6_OPT_LEN	(sizeof(struct dsr_opt_v6) - 4)
 #define DSR_IPV6_EXT_LEN	((sizeof(struct dsr_opt_v6) - 8) / 8)
 
-/* We cap key index at 4 bits because mark value is used to map ctx to key */
-#define MAX_KEY_INDEX 15
-
 /* encrypt_config is the current encryption context on the node */
 struct encrypt_config {
 	__u8 encrypt_key;
 } __packed;
-
-/**
- * or_encrypt_key - mask and shift key into encryption format
- */
-static __always_inline __u32 or_encrypt_key(__u8 key)
-{
-	return (((__u32)key & 0x0F) << 12) | MARK_MAGIC_ENCRYPT;
-}
 
 /*
  * ctx->tc_index uses
@@ -779,8 +631,10 @@ static __always_inline __u32 or_encrypt_key(__u8 key)
 #define TC_INDEX_F_FROM_INGRESS_PROXY	1
 #define TC_INDEX_F_FROM_EGRESS_PROXY	2
 #define TC_INDEX_F_SKIP_NODEPORT	4
-#define TC_INDEX_F_SKIP_RECIRCULATION	8
+#define TC_INDEX_F_UNUSED		8
 #define TC_INDEX_F_SKIP_HOST_FIREWALL	16
+
+#define CB_NAT_FLAGS_REVDNAT_ONLY	(1 << 0)
 
 /*
  * For use in ctx_{load,store}_meta(), which operates on sk_buff->cb or
@@ -800,20 +654,20 @@ enum {
 #define	CB_ENCRYPT_MAGIC	CB_SRC_LABEL	/* Alias, non-overlapping */
 #define	CB_DST_ENDPOINT_ID	CB_SRC_LABEL    /* Alias, non-overlapping */
 #define CB_SRV6_SID_1		CB_SRC_LABEL	/* Alias, non-overlapping */
-	CB_IFINDEX,
-#define	CB_NAT_46X64		CB_IFINDEX	/* Alias, non-overlapping */
-#define	CB_ADDR_V4		CB_IFINDEX	/* Alias, non-overlapping */
-#define	CB_ADDR_V6_1		CB_IFINDEX	/* Alias, non-overlapping */
-#define	CB_IPCACHE_SRC_LABEL	CB_IFINDEX	/* Alias, non-overlapping */
-#define CB_SRV6_SID_2		CB_IFINDEX	/* Alias, non-overlapping */
-#define CB_CLUSTER_ID_EGRESS	CB_IFINDEX	/* Alias, non-overlapping */
-#define CB_HSIPC_ADDR_V4	CB_IFINDEX	/* Alias, non-overlapping */
-	CB_POLICY,
-#define	CB_ADDR_V6_2		CB_POLICY	/* Alias, non-overlapping */
-#define CB_SRV6_SID_3		CB_POLICY	/* Alias, non-overlapping */
-#define	CB_CLUSTER_ID_INGRESS	CB_POLICY	/* Alias, non-overlapping */
-#define CB_HSIPC_PORT		CB_POLICY	/* Alias, non-overlapping */
-#define CB_DSR_SRC_LABEL	CB_POLICY	/* Alias, non-overlapping */
+	CB_1,
+#define	CB_DELIVERY_REDIRECT	CB_1		/* Alias, non-overlapping */
+#define	CB_NAT_46X64		CB_1		/* Alias, non-overlapping */
+#define	CB_ADDR_V4		CB_1		/* Alias, non-overlapping */
+#define	CB_ADDR_V6_1		CB_1		/* Alias, non-overlapping */
+#define	CB_IPCACHE_SRC_LABEL	CB_1		/* Alias, non-overlapping */
+#define	CB_SRV6_SID_2		CB_1		/* Alias, non-overlapping */
+#define	CB_CLUSTER_ID_EGRESS	CB_1		/* Alias, non-overlapping */
+#define	CB_TRACED		CB_1		/* Alias, non-overlapping */
+	CB_2,
+#define	CB_ADDR_V6_2		CB_2		/* Alias, non-overlapping */
+#define CB_SRV6_SID_3		CB_2		/* Alias, non-overlapping */
+#define	CB_CLUSTER_ID_INGRESS	CB_2		/* Alias, non-overlapping */
+#define CB_NAT_FLAGS		CB_2		/* Alias, non-overlapping */
 	CB_3,
 #define	CB_ADDR_V6_3		CB_3		/* Alias, non-overlapping */
 #define	CB_FROM_HOST		CB_3		/* Alias, non-overlapping */
@@ -823,10 +677,6 @@ enum {
 #define	CB_ADDR_V6_4		CB_CT_STATE	/* Alias, non-overlapping */
 #define	CB_ENCRYPT_IDENTITY	CB_CT_STATE	/* Alias, non-overlapping,
 						 * Not used by xfrm.
-						 */
-#define	CB_ENCRYPT_DST		CB_CT_STATE	/* Alias, non-overlapping,
-						 * Not used by xfrm.
-						 * Can be removed in v1.15.
 						 */
 #define	CB_CUSTOM_CALLS		CB_CT_STATE	/* Alias, non-overlapping */
 #define	CB_SRV6_VRF_ID		CB_CT_STATE	/* Alias, non-overlapping */
@@ -861,29 +711,32 @@ enum ct_status {
 	CT_ESTABLISHED,
 	CT_REPLY,
 	CT_RELATED,
-	CT_REOPENED,
 } __packed;
 
 /* Service flags (lb{4,6}_service->flags) */
 enum {
-	SVC_FLAG_EXTERNAL_IP  = (1 << 0),  /* External IPs */
-	SVC_FLAG_NODEPORT     = (1 << 1),  /* NodePort service */
-	SVC_FLAG_EXT_LOCAL_SCOPE = (1 << 2), /* externalTrafficPolicy=Local */
-	SVC_FLAG_HOSTPORT     = (1 << 3),  /* hostPort forwarding */
-	SVC_FLAG_AFFINITY     = (1 << 4),  /* sessionAffinity=clientIP */
-	SVC_FLAG_LOADBALANCER = (1 << 5),  /* LoadBalancer service */
-	SVC_FLAG_ROUTABLE     = (1 << 6),  /* Not a surrogate/ClusterIP entry */
-	SVC_FLAG_SOURCE_RANGE = (1 << 7),  /* Check LoadBalancer source range */
+	SVC_FLAG_EXTERNAL_IP     = (1 << 0),	/* External IPs */
+	SVC_FLAG_NODEPORT        = (1 << 1),	/* NodePort service */
+	SVC_FLAG_EXT_LOCAL_SCOPE = (1 << 2),	/* externalTrafficPolicy=Local */
+	SVC_FLAG_HOSTPORT        = (1 << 3),	/* hostPort forwarding */
+	SVC_FLAG_AFFINITY        = (1 << 4),	/* sessionAffinity=clientIP */
+	SVC_FLAG_LOADBALANCER    = (1 << 5),	/* LoadBalancer service */
+	SVC_FLAG_ROUTABLE        = (1 << 6),	/* Not a surrogate/ClusterIP entry */
+	SVC_FLAG_SOURCE_RANGE    = (1 << 7),	/* Check LoadBalancer source range */
 };
 
 /* Service flags (lb{4,6}_service->flags2) */
 enum {
-	SVC_FLAG_LOCALREDIRECT  = (1 << 0),  /* local redirect */
-	SVC_FLAG_NAT_46X64      = (1 << 1),  /* NAT-46/64 entry */
-	SVC_FLAG_L7LOADBALANCER = (1 << 2),  /* tproxy redirect to local l7 loadbalancer */
-	SVC_FLAG_LOOPBACK       = (1 << 3),  /* hostport with a loopback hostIP */
-	SVC_FLAG_INT_LOCAL_SCOPE = (1 << 4), /* internalTrafficPolicy=Local */
-	SVC_FLAG_TWO_SCOPES     = (1 << 5),  /* two sets of backends are used for external/internal connections */
+	SVC_FLAG_LOCALREDIRECT     = (1 << 0),	/* Local redirect service */
+	SVC_FLAG_NAT_46X64         = (1 << 1),	/* NAT-46/64 entry */
+	SVC_FLAG_L7_LOADBALANCER   = (1 << 2),	/* TPROXY redirect to local L7 load-balancer */
+	SVC_FLAG_LOOPBACK          = (1 << 3),	/* HostPort with a loopback hostIP */
+	SVC_FLAG_L7_DELEGATE       = (1 << 3),	/* If set then delegate unmodified to local L7 proxy */
+	SVC_FLAG_INT_LOCAL_SCOPE   = (1 << 4),	/* internalTrafficPolicy=Local */
+	SVC_FLAG_TWO_SCOPES        = (1 << 5),	/* Two sets of backends are used for external/internal connections */
+	SVC_FLAG_QUARANTINED       = (1 << 6),	/* Backend slot (key: backend_slot > 0) is quarantined */
+	SVC_FLAG_SOURCE_RANGE_DENY = (1 << 6),	/* Master slot: LoadBalancer source range check is inverted */
+	SVC_FLAG_FWD_MODE_DSR      = (1 << 7),	/* If bit is set, use DSR instead of SNAT in annotation mode */
 };
 
 /* Backend flags (lb{4,6}_backends->flags) */
@@ -925,36 +778,25 @@ struct ipv4_ct_tuple {
 } __packed;
 
 struct ct_entry {
-	__u64 rx_packets;
-	/* Previously, the rx_bytes field was not used for entries with
-	 * the dir=CT_SERVICE (see GH#7060). Therefore, we can safely abuse
-	 * this field to save the backend_id.
-	 */
-	union {
-		__u64 rx_bytes;
-		__u64 backend_id;
-	};
-	__u64 tx_packets;
-	__u64 tx_bytes;
+	__u64 reserved0;	/* unused since v1.16 */
+	__u64 backend_id;
+	__u64 packets;
+	__u64 bytes;
 	__u32 lifetime;
 	__u16 rx_closing:1,
 	      tx_closing:1,
-	      unused_nat46:1,	/* unused since v1.12 / 81dee05e82fb */
+	      reserved1:1,	/* unused since v1.12 */
 	      lb_loopback:1,
 	      seen_non_syn:1,
 	      node_port:1,
-	      proxy_redirect:1, /* Connection is redirected to a proxy */
-	      dsr:1,
-	      from_l7lb:1, /* Connection is originated from an L7 LB proxy */
-	      reserved1:1, /* Was auth_required, not used in production anywhere */
-	      from_tunnel:1, /* Connection is over tunnel */
-	      reserved:5;
+	      proxy_redirect:1,	/* Connection is redirected to a proxy */
+	      dsr_internal:1,	/* DSR is k8s service related, cluster internal */
+	      from_l7lb:1,	/* Connection is originated from an L7 LB proxy */
+	      reserved2:1,	/* unused since v1.14 */
+	      from_tunnel:1,	/* Connection is over tunnel */
+	      reserved3:5;
 	__u16 rev_nat_index;
-	/* In the kernel ifindex is u32, so we need to check in cilium-agent
-	 * that ifindex of a NodePort device is <= MAX(u16).
-	 * Unused when HAVE_FIB_INDEX is available.
-	 */
-	__u16 ifindex;
+	__u16 reserved4;	/* unused since v1.18 */
 
 	/* *x_flags_seen represents the OR of all TCP flags seen for the
 	 * transmit/receive direction of this entry.
@@ -971,27 +813,30 @@ struct ct_entry {
 	__u32 last_rx_report;
 };
 
+#define IPPROTO_ANY	0	/* For service lookup with ANY L4 protocol */
+
 struct lb6_key {
 	union v6addr address;	/* Service virtual IPv6 address */
 	__be16 dport;		/* L4 port filter, if unset, all ports apply */
 	__u16 backend_slot;	/* Backend iterator, 0 indicates the svc frontend */
-	__u8 proto;		/* L4 protocol, currently not used (set to 0) */
+	__u8 proto;		/* L4 protocol, or IPPROTO_ANY */
 	__u8 scope;		/* LB_LOOKUP_SCOPE_* for externalTrafficPolicy=Local */
 	__u8 pad[2];
 };
 
-/* See lb4_service comments */
+/* See lb4_service comments for all fields. */
 struct lb6_service {
 	union {
-		__u32 backend_id;	/* Backend ID in lb6_backends */
-		__u32 affinity_timeout;	/* In seconds, only for svc frontend */
-		__u32 l7_lb_proxy_port;	/* In host byte order, only when flags2 && SVC_FLAG_L7LOADBALANCER */
+		__u32 backend_id;
+		/* See lb4_service for storage internals. */
+		__u32 affinity_timeout;
+		__u32 l7_lb_proxy_port;
 	};
 	__u16 count;
 	__u16 rev_nat_index;
 	__u8 flags;
 	__u8 flags2;
-	__u8 pad[2];
+	__u16 qcount;
 };
 
 /* See lb4_backend comments */
@@ -1004,7 +849,8 @@ struct lb6_backend {
 				 * backends that have the same IP address,
 				 * but belong to the different cluster.
 				 */
-	__u8 pad[2];
+	__u8 zone;
+	__u8 pad;
 };
 
 struct lb6_health {
@@ -1033,16 +879,33 @@ struct lb4_key {
 	__be32 address;		/* Service virtual IPv4 address */
 	__be16 dport;		/* L4 port filter, if unset, all ports apply */
 	__u16 backend_slot;	/* Backend iterator, 0 indicates the svc frontend */
-	__u8 proto;		/* L4 protocol, currently not used (set to 0) */
+	__u8 proto;		/* L4 protocol, or IPPROTO_ANY */
 	__u8 scope;		/* LB_LOOKUP_SCOPE_* for externalTrafficPolicy=Local */
 	__u8 pad[2];
 };
 
+#define LB_ALGORITHM_SHIFT	24
+#define AFFINITY_TIMEOUT_MASK	((1 << LB_ALGORITHM_SHIFT) - 1)
+
 struct lb4_service {
 	union {
-		__u32 backend_id;	/* Backend ID in lb4_backends */
-		__u32 affinity_timeout;	/* In seconds, only for svc frontend */
-		__u32 l7_lb_proxy_port;	/* In host byte order, only when flags2 && SVC_FLAG_L7LOADBALANCER */
+		/* Non-master entry: backend ID in lb4_backends */
+		__u32 backend_id;
+		/* For master entry:
+		 * - Upper  8 bits: load balancer algorithm,
+		 *                  values:
+		 *                     1 - random
+		 *                     2 - maglev
+		 * - Lower 24 bits: timeout in seconds
+		 * Note: We don't use bitfield here given storage is
+		 * compiler implementation dependent and the map needs
+		 * to be populated from Go.
+		 */
+		__u32 affinity_timeout;
+		/* For master entry: proxy port in host byte order,
+		 * only when flags2 & SVC_FLAG_L7_LOADBALANCER is set.
+		 */
+		__u32 l7_lb_proxy_port;
 	};
 	/* For the service frontend, count denotes number of service backend
 	 * slots (otherwise zero).
@@ -1051,7 +914,10 @@ struct lb4_service {
 	__u16 rev_nat_index;	/* Reverse NAT ID in lb4_reverse_nat */
 	__u8 flags;
 	__u8 flags2;
-	__u8  pad[2];
+	/* For the service frontend, qcount denotes number of service backend
+	 * slots under quarantine (otherwise zero).
+	 */
+	__u16 qcount;
 };
 
 struct lb4_backend {
@@ -1063,7 +929,8 @@ struct lb4_backend {
 				 * backends that have the same IP address,
 				 * but belong to the different cluster.
 				 */
-	__u8 pad[2];
+	__u8 zone;
+	__u8 pad;
 };
 
 struct lb4_health {
@@ -1130,23 +997,21 @@ struct lb_affinity_match {
 
 struct ct_state {
 	__u16 rev_nat_index;
-#ifndef DISABLE_LOOPBACK_LB
+#ifdef USE_LOOPBACK_LB
 	__u16 loopback:1,
 #else
 	__u16 loopback_disabled:1,
 #endif
 	      node_port:1,
-	      dsr:1,
+	      dsr_internal:1,   /* DSR is k8s service related, cluster internal */
 	      syn:1,
 	      proxy_redirect:1,	/* Connection is redirected to a proxy */
 	      from_l7lb:1,	/* Connection is originated from an L7 LB proxy */
 	      reserved1:1,	/* Was auth_required, not used in production anywhere */
 	      from_tunnel:1,	/* Connection is from tunnel */
-	      reserved:8;
+		  closing:1,
+	      reserved:7;
 	__u32 src_sec_id;
-#ifndef HAVE_FIB_IFINDEX
-	__u16 ifindex;
-#endif
 	__u32 backend_id;	/* Backend ID in lb4_backends */
 };
 
@@ -1176,36 +1041,9 @@ struct lb6_src_range_key {
 	union v6addr addr;
 };
 
-static __always_inline int redirect_ep(struct __ctx_buff *ctx __maybe_unused,
-				       int ifindex __maybe_unused,
-				       bool needs_backlog __maybe_unused,
-				       bool from_tunnel)
-{
-	/* Going via CPU backlog queue (aka needs_backlog) is required
-	 * whenever we cannot do a fast ingress -> ingress switch but
-	 * instead need an ingress -> egress netns traversal or vice
-	 * versa.
-	 */
-	if (needs_backlog || !is_defined(ENABLE_HOST_ROUTING)) {
-		return ctx_redirect(ctx, ifindex, 0);
-	}
-
-	/* When coming from overlay, we need to set packet type
-	 * to HOST as otherwise we might get dropped in IP layer.
-	 */
-	if (from_tunnel)
-		ctx_change_type(ctx, PACKET_HOST);
-
-	return ctx_redirect_peer(ctx, ifindex, 0);
-}
-
 static __always_inline __u64 ctx_adjust_hroom_flags(void)
 {
-#ifdef HAVE_CSUM_LEVEL
 	return BPF_F_ADJ_ROOM_NO_CSUM_RESET;
-#else
-	return 0;
-#endif
 }
 
 struct lpm_v4_key {
@@ -1223,11 +1061,24 @@ struct lpm_val {
 	__u8 flags;
 };
 
+struct skip_lb4_key {
+	__u64 netns_cookie;     /* Source pod netns cookie */
+	__u32 address;          /* Destination service virtual IPv4 address */
+	__u16 port;             /* Destination service virtual layer4 port */
+	__u16 pad;
+};
+
+struct skip_lb6_key {
+	__u64 netns_cookie;     /* Source pod netns cookie */
+	union v6addr address;   /* Destination service virtual IPv6 address */
+	__u32 pad;
+	__u16 port;             /* Destination service virtual layer4 port */
+	__u16 pad2;
+};
+
 /* Older kernels don't support the larger tunnel key structure and we don't
  * need it since we only want to retrieve the tunnel ID anyway.
  */
 #define TUNNEL_KEY_WITHOUT_SRC_IP offsetof(struct bpf_tunnel_key, local_ipv4)
 
 #include "overloadable.h"
-
-#endif /* __LIB_COMMON_H_ */

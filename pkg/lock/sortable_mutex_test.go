@@ -4,7 +4,7 @@
 package lock
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"slices"
 	"sync"
 	"testing"
@@ -44,13 +44,13 @@ func TestSortableMutex_Chaos(t *testing.T) {
 
 	monkey := func() {
 		defer wg.Done()
-		for i := 0; i < iterations; i++ {
+		for range iterations {
 			// Take a random subset of the sortable mutexes.
 			subSmus := slices.Clone(smus)
 			rand.Shuffle(len(subSmus), func(i, j int) {
 				subSmus[i], subSmus[j] = subSmus[j], subSmus[i]
 			})
-			n := rand.Intn(len(subSmus))
+			n := rand.IntN(len(subSmus))
 			subSmus = subSmus[:n]
 
 			time.Sleep(time.Microsecond)
@@ -61,7 +61,7 @@ func TestSortableMutex_Chaos(t *testing.T) {
 		}
 	}
 
-	for i := 0; i < nMonkeys; i++ {
+	for range nMonkeys {
 		go monkey()
 	}
 

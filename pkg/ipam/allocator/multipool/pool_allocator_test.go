@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"testing"
 
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -16,7 +17,7 @@ import (
 )
 
 func TestPoolAllocator(t *testing.T) {
-	p := NewPoolAllocator()
+	p := NewPoolAllocator(hivetest.Logger(t))
 	err := p.UpsertPool("default",
 		[]string{"10.100.0.0/16", "10.200.0.0/16"}, 24,
 		[]string{"fd00:100::/80", "fc00:100::/80"}, 96,
@@ -24,8 +25,8 @@ func TestPoolAllocator(t *testing.T) {
 	assert.NoError(t, err)
 	defaultPool, exists := p.pools["default"]
 	assert.True(t, exists)
-	assert.Equal(t, defaultPool.v4MaskSize, 24)
-	assert.Equal(t, defaultPool.v6MaskSize, 96)
+	assert.Equal(t, 24, defaultPool.v4MaskSize)
+	assert.Equal(t, 96, defaultPool.v6MaskSize)
 
 	// node1 is a node which has some previously allocated CIDRs
 	node1 := &v2.CiliumNode{
@@ -232,7 +233,7 @@ func TestPoolAllocator(t *testing.T) {
 }
 
 func TestPoolAllocator_PoolErrors(t *testing.T) {
-	p := NewPoolAllocator()
+	p := NewPoolAllocator(hivetest.Logger(t))
 	p.RestoreFinished()
 
 	node := &v2.CiliumNode{
@@ -350,7 +351,7 @@ func TestPoolAllocator_PoolErrors(t *testing.T) {
 }
 
 func TestPoolAllocator_AddUpsertDelete(t *testing.T) {
-	p := NewPoolAllocator()
+	p := NewPoolAllocator(hivetest.Logger(t))
 
 	_, exists := p.pools["jupiter"]
 	assert.False(t, exists)
@@ -364,8 +365,8 @@ func TestPoolAllocator_AddUpsertDelete(t *testing.T) {
 
 	jupiter, exists := p.pools["jupiter"]
 	assert.True(t, exists)
-	assert.Equal(t, jupiter.v4MaskSize, 24)
-	assert.Equal(t, jupiter.v6MaskSize, 96)
+	assert.Equal(t, 24, jupiter.v4MaskSize)
+	assert.Equal(t, 96, jupiter.v6MaskSize)
 	assert.True(t, jupiter.hasCIDR(netip.MustParsePrefix("10.100.0.0/16")))
 	assert.True(t, jupiter.hasCIDR(netip.MustParsePrefix("10.200.0.0/16")))
 	assert.True(t, jupiter.hasCIDR(netip.MustParsePrefix("fd00:100::/80")))
@@ -381,8 +382,8 @@ func TestPoolAllocator_AddUpsertDelete(t *testing.T) {
 	assert.NoError(t, err)
 	mars, exists := p.pools["mars"]
 	assert.True(t, exists)
-	assert.Equal(t, mars.v4MaskSize, 24)
-	assert.Equal(t, mars.v6MaskSize, 96)
+	assert.Equal(t, 24, mars.v4MaskSize)
+	assert.Equal(t, 96, mars.v6MaskSize)
 	assert.True(t, mars.hasCIDR(netip.MustParsePrefix("10.10.0.0/16")))
 	assert.True(t, mars.hasCIDR(netip.MustParsePrefix("10.20.0.0/16")))
 	assert.True(t, mars.hasCIDR(netip.MustParsePrefix("fb00:200::/80")))
@@ -396,8 +397,8 @@ func TestPoolAllocator_AddUpsertDelete(t *testing.T) {
 	assert.ErrorContains(t, err, `cannot change IPv4 mask size in existing pool "mars"`)
 	mars, exists = p.pools["mars"]
 	assert.True(t, exists)
-	assert.Equal(t, mars.v4MaskSize, 24)
-	assert.Equal(t, mars.v6MaskSize, 96)
+	assert.Equal(t, 24, mars.v4MaskSize)
+	assert.Equal(t, 96, mars.v6MaskSize)
 	assert.True(t, mars.hasCIDR(netip.MustParsePrefix("10.10.0.0/16")))
 	assert.True(t, mars.hasCIDR(netip.MustParsePrefix("10.20.0.0/16")))
 	assert.True(t, mars.hasCIDR(netip.MustParsePrefix("fe00:100::/80")))
@@ -411,8 +412,8 @@ func TestPoolAllocator_AddUpsertDelete(t *testing.T) {
 	assert.ErrorContains(t, err, `cannot change IPv6 mask size in existing pool "mars"`)
 	mars, exists = p.pools["mars"]
 	assert.True(t, exists)
-	assert.Equal(t, mars.v4MaskSize, 24)
-	assert.Equal(t, mars.v6MaskSize, 96)
+	assert.Equal(t, 24, mars.v4MaskSize)
+	assert.Equal(t, 96, mars.v6MaskSize)
 	assert.True(t, mars.hasCIDR(netip.MustParsePrefix("10.10.0.0/16")))
 	assert.True(t, mars.hasCIDR(netip.MustParsePrefix("10.20.0.0/16")))
 	assert.True(t, mars.hasCIDR(netip.MustParsePrefix("fe00:100::/80")))
@@ -426,8 +427,8 @@ func TestPoolAllocator_AddUpsertDelete(t *testing.T) {
 	assert.NoError(t, err)
 	mars, exists = p.pools["mars"]
 	assert.True(t, exists)
-	assert.Equal(t, mars.v4MaskSize, 24)
-	assert.Equal(t, mars.v6MaskSize, 96)
+	assert.Equal(t, 24, mars.v4MaskSize)
+	assert.Equal(t, 96, mars.v6MaskSize)
 	assert.True(t, mars.hasCIDR(netip.MustParsePrefix("10.1.0.0/16")))
 	assert.True(t, mars.hasCIDR(netip.MustParsePrefix("10.3.0.0/16")))
 	assert.True(t, mars.hasCIDR(netip.MustParsePrefix("10.10.0.0/16")))
@@ -476,19 +477,19 @@ func Test_addrsInPrefix(t *testing.T) {
 			want: big.NewInt(0),
 		},
 		{
-			name: "two",
-			args: netip.MustParsePrefix("10.0.0.0/30"),
+			name: "/32",
+			args: netip.MustParsePrefix("10.0.0.0/32"),
+			want: big.NewInt(1),
+		},
+		{
+			name: "/31",
+			args: netip.MustParsePrefix("10.0.0.0/31"),
 			want: big.NewInt(2),
 		},
 		{
-			name: "underflow /31",
-			args: netip.MustParsePrefix("10.0.0.0/31"),
-			want: big.NewInt(0),
-		},
-		{
-			name: "underflow /32",
-			args: netip.MustParsePrefix("10.0.0.0/32"),
-			want: big.NewInt(0),
+			name: "/30",
+			args: netip.MustParsePrefix("10.0.0.0/30"),
+			want: big.NewInt(2),
 		},
 	}
 	for _, tt := range tests {

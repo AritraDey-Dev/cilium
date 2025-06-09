@@ -1,24 +1,14 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
 
-#include "common.h"
-
 #include <bpf/ctx/skb.h>
+#include "common.h"
 #include "pktgen.h"
-
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
 
 /* Enable code paths under test */
 #define ENABLE_IPV4
 #define ENABLE_NODEPORT
 #define ENABLE_HOST_ROUTING
-
-#define DISABLE_LOOPBACK_LB
-
-/* Skip ingress policy checks, not needed to validate hairpin flow */
-#define USE_BPF_PROG_FOR_INGRESS_POLICY
-#undef FORCE_LOCAL_POLICY_EVAL_AT_SOURCE
 
 #define CLIENT_IP		v4_ext_one
 #define CLIENT_PORT		__bpf_htons(111)
@@ -32,16 +22,41 @@
 #define BACKEND_IP		v4_pod_one
 #define BACKEND_PORT		__bpf_htons(8080)
 
-#define SECCTX_FROM_IPCACHE 1
+#define BACKEND_EP_ID		127
+
+static volatile const __u8 *node_mac = mac_three;
+static volatile const __u8 *backend_mac = mac_four;
+
+__section_entry
+int mock_handle_policy(struct __ctx_buff *ctx __maybe_unused)
+{
+	return TC_ACT_REDIRECT;
+}
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(max_entries, 256);
+	__array(values, int());
+} mock_policy_call_map __section(".maps") = {
+	.values = {
+		[BACKEND_EP_ID] = &mock_handle_policy,
+	},
+};
+
+#define tail_call_dynamic mock_tail_call_dynamic
+static __always_inline __maybe_unused void
+mock_tail_call_dynamic(struct __ctx_buff *ctx __maybe_unused,
+		       const void *map __maybe_unused, __u32 slot __maybe_unused)
+{
+	tail_call(ctx, &mock_policy_call_map, slot);
+}
 
 #include "bpf_host.c"
 
 #include "lib/endpoint.h"
 #include "lib/ipcache.h"
 #include "lib/lb.h"
-
-static volatile const __u8 *node_mac = mac_three;
-static volatile const __u8 *backend_mac = mac_four;
 
 #define FROM_NETDEV	0
 #define TO_NETDEV	1
@@ -94,17 +109,17 @@ int nodeport_nat_backend_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "tc_nodeport_nat_backend")
 int nodeport_nat_backend_setup(struct __ctx_buff *ctx)
 {
-	lb_v4_add_service(FRONTEND_IP, FRONTEND_PORT, 1, 1);
+	lb_v4_add_service(FRONTEND_IP, FRONTEND_PORT, IPPROTO_TCP, 1, 1);
 	lb_v4_add_backend(FRONTEND_IP, FRONTEND_PORT, 1, 124,
 			  BACKEND_IP, BACKEND_PORT, IPPROTO_TCP, 0);
 
-	endpoint_v4_add_entry(BACKEND_IP, 0, 0, 0,
+	endpoint_v4_add_entry(BACKEND_IP, 0, BACKEND_EP_ID, 0, 0, 0,
 			      (__u8 *)backend_mac, (__u8 *)node_mac);
 
 	ipcache_v4_add_entry(BACKEND_IP, 0, 112233, 0, 0);
 
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, FROM_NETDEV);
+	tail_call_static(ctx, entry_call_map, FROM_NETDEV);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
 }
@@ -153,11 +168,17 @@ int nodeport_nat_backend_check(const struct __ctx_buff *ctx)
 	if (l3->daddr != BACKEND_IP)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0xa712))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != LB_PORT)
 		test_fatal("src port has changed");
 
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
+
+	if (l4->check != bpf_htons(0x3c62))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	test_finish();
 }

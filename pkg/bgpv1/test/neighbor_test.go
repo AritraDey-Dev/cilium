@@ -10,14 +10,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
 	cilium_api_v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/testutils"
-
-	"github.com/stretchr/testify/require"
-	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
 )
 
 var (
@@ -54,15 +54,15 @@ func Test_NeighborAddDel(t *testing.T) {
 				{
 					PeerAddress:          dummies[instance1Link].ipv4.String(),
 					PeerASN:              int64(gobgpASN),
-					HoldTimeSeconds:      pointer.Int32(9), // must be lower than default (90s) to be applied on the peer
-					KeepAliveTimeSeconds: pointer.Int32(1), // must be lower than HoldTime
-					AuthSecretRef:        pointer.String("a-secret"),
+					HoldTimeSeconds:      ptr.To[int32](9), // must be lower than default (90s) to be applied on the peer
+					KeepAliveTimeSeconds: ptr.To[int32](1), // must be lower than HoldTime
+					AuthSecretRef:        ptr.To[string]("a-secret"),
 				},
 				{
 					PeerAddress:          dummies[instance2Link].ipv4.String(),
 					PeerASN:              int64(gobgpASN2),
-					HoldTimeSeconds:      pointer.Int32(6), // must be lower than default (90s) to be applied on the peer
-					KeepAliveTimeSeconds: pointer.Int32(1), // must be lower than HoldTime
+					HoldTimeSeconds:      ptr.To[int32](6), // must be lower than default (90s) to be applied on the peer
+					KeepAliveTimeSeconds: ptr.To[int32](1), // must be lower than HoldTime
 				},
 			},
 			waitState: []string{"ESTABLISHED"},
@@ -87,15 +87,15 @@ func Test_NeighborAddDel(t *testing.T) {
 				{
 					PeerAddress:          dummies[instance1Link].ipv4.String(),
 					PeerASN:              int64(gobgpASN),
-					HoldTimeSeconds:      pointer.Int32(6), // updated, must be lower than the previous value to be applied on the peer
-					KeepAliveTimeSeconds: pointer.Int32(1), // must be lower than HoldTime
-					AuthSecretRef:        pointer.String("a-secret"),
+					HoldTimeSeconds:      ptr.To[int32](6), // updated, must be lower than the previous value to be applied on the peer
+					KeepAliveTimeSeconds: ptr.To[int32](1), // must be lower than HoldTime
+					AuthSecretRef:        ptr.To[string]("a-secret"),
 				},
 				{
 					PeerAddress:          dummies[instance2Link].ipv4.String(),
 					PeerASN:              int64(gobgpASN2),
-					HoldTimeSeconds:      pointer.Int32(3), // updated, must be lower than the previous value to be applied on the peer
-					KeepAliveTimeSeconds: pointer.Int32(1), // must be lower than HoldTime
+					HoldTimeSeconds:      ptr.To[int32](3), // updated, must be lower than the previous value to be applied on the peer
+					KeepAliveTimeSeconds: ptr.To[int32](1), // must be lower than HoldTime
 				},
 			},
 			waitState: []string{"ESTABLISHED"},
@@ -126,10 +126,12 @@ func Test_NeighborAddDel(t *testing.T) {
 	defer testDone()
 
 	// test setup, we configure two gobgp instances here.
-	gobgpInstances, fixture, cleanup, err := setup(testCtx, []gobgpConfig{gobgpConfPassword, gobgpConf2}, newFixtureConf())
+	gobgpInstances, fixture, ready, cleanup, err := setup(testCtx, t, []gobgpConfig{gobgpConfPassword, gobgpConf2}, newFixtureConf())
 	require.NoError(t, err)
 	require.Len(t, gobgpInstances, 2)
 	defer cleanup()
+
+	ready()
 
 	for _, step := range steps {
 		t.Run(step.description, func(t *testing.T) {
@@ -139,7 +141,7 @@ func Test_NeighborAddDel(t *testing.T) {
 				virtualRouters: []cilium_api_v2alpha1.CiliumBGPVirtualRouter{
 					{
 						LocalASN:      int64(ciliumASN),
-						ExportPodCIDR: pointer.Bool(true),
+						ExportPodCIDR: ptr.To[bool](true),
 						Neighbors:     step.neighbors,
 					},
 				},
@@ -232,7 +234,7 @@ func Test_NeighborGracefulRestart(t *testing.T) {
 				PeerASN:     int64(gobgpASN),
 				GracefulRestart: &cilium_api_v2alpha1.CiliumBGPNeighborGracefulRestart{
 					Enabled:            true,
-					RestartTimeSeconds: pointer.Int32(20),
+					RestartTimeSeconds: ptr.To[int32](20),
 				},
 			},
 			waitState: []string{"ESTABLISHED"},
@@ -264,15 +266,16 @@ func Test_NeighborGracefulRestart(t *testing.T) {
 	}
 
 	// This test run can take upto a minute
-	testCtx, testDone := context.WithTimeout(context.Background(), maxGracefulRestartTestDuration)
+	testCtx, testDone := context.WithTimeout(context.Background(), maxTestDuration)
 	defer testDone()
 
 	// test setup, we configure single gobgp instance here.
-	gobgpInstances, fixture, cleanup, err := setup(testCtx, []gobgpConfig{gobgpConf}, newFixtureConf())
+	gobgpInstances, fixture, ready, cleanup, err := setup(testCtx, t, []gobgpConfig{gobgpConf}, newFixtureConf())
 	require.NoError(t, err)
 	require.Len(t, gobgpInstances, 1)
 	defer cleanup()
 
+	ready()
 	for _, step := range steps {
 		t.Run(step.description, func(t *testing.T) {
 			// update bgp policy with neighbors defined in test step
@@ -281,7 +284,7 @@ func Test_NeighborGracefulRestart(t *testing.T) {
 				virtualRouters: []cilium_api_v2alpha1.CiliumBGPVirtualRouter{
 					{
 						LocalASN:      int64(ciliumASN),
-						ExportPodCIDR: pointer.Bool(true),
+						ExportPodCIDR: ptr.To[bool](true),
 						Neighbors:     []cilium_api_v2alpha1.CiliumBGPNeighbor{step.neighbor},
 					},
 				},

@@ -9,13 +9,11 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cilium/hive/cell"
+	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/stretchr/testify/assert"
-
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/node"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
@@ -57,7 +55,7 @@ type errorer struct {
 	err error
 }
 
-func (e *errorer) Errorf(format string, args ...interface{}) {
+func (e *errorer) Errorf(format string, args ...any) {
 	e.err = errors.Join(e.err, fmt.Errorf(format, args...))
 }
 
@@ -148,9 +146,9 @@ func init() {
 				})
 
 			validateLNSInit = cell.Invoke(
-				func(lc hive.Lifecycle, lns *node.LocalNodeStore) {
-					lc.Append(hive.Hook{
-						OnStart: func(hive.HookContext) error {
+				func(lc cell.Lifecycle, lns *node.LocalNodeStore) {
+					lc.Append(cell.Hook{
+						OnStart: func(cell.HookContext) error {
 							return validateLocalNodeInit(lns)
 						},
 					})

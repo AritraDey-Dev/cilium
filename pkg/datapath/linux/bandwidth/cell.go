@@ -9,12 +9,17 @@
 package bandwidth
 
 import (
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/pflag"
+	"log/slog"
+
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/statedb"
+	"github.com/cilium/statedb/reconciler"
 
 	"github.com/cilium/cilium/pkg/datapath/linux/config/defines"
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
+	"github.com/cilium/cilium/pkg/datapath/tables"
+	"github.com/cilium/cilium/pkg/datapath/types"
+	"github.com/cilium/cilium/pkg/maps/bwmap"
 	"github.com/cilium/cilium/pkg/option"
 )
 
@@ -22,24 +27,50 @@ var Cell = cell.Module(
 	"bandwidth-manager",
 	"Linux Bandwidth Manager for EDT-based pacing",
 
-	cell.Config(Config{false, false}),
+	cell.Config(types.DefaultBandwidthConfig),
 	cell.Provide(newBandwidthManager),
+
+	cell.ProvidePrivate(
+		tables.NewBandwidthQDiscTable, // RWTable[*BandwidthQDisc]
+	),
+	cell.Invoke(registerReconciler),
 )
 
-type Config struct {
-	// EnableBandwidthManager enables EDT-based pacing
-	EnableBandwidthManager bool
+type registerParams struct {
+	cell.In
 
-	// EnableBBR enables BBR TCP congestion control for the node including Pods
-	EnableBBR bool
+	Log              *slog.Logger
+	Table            statedb.RWTable[*tables.BandwidthQDisc]
+	BWM              types.BandwidthManager
+	Config           types.BandwidthConfig
+	DeriveParams     statedb.DeriveParams[*tables.Device, *tables.BandwidthQDisc]
+	ReconcilerParams reconciler.Params
 }
 
-func (def Config) Flags(flags *pflag.FlagSet) {
-	flags.Bool("enable-bandwidth-manager", def.EnableBandwidthManager, "Enable BPF bandwidth manager")
-	flags.Bool(EnableBBR, def.EnableBBR, "Enable BBR for the bandwidth manager")
+func registerReconciler(p registerParams) error {
+	if !p.Config.EnableBandwidthManager {
+		return nil
+	}
+
+	// Start deriving Table[*BandwidthQDisc] from Table[*Device]
+	statedb.Derive("derive-desired-qdiscs", deviceToBandwidthQDisc)(
+		p.DeriveParams,
+	)
+
+	_, err := reconciler.Register(
+		p.ReconcilerParams,
+		p.Table,
+
+		(*tables.BandwidthQDisc).Clone,
+		(*tables.BandwidthQDisc).SetStatus,
+		(*tables.BandwidthQDisc).GetStatus,
+		newOps(p.Log, p.BWM),
+		nil,
+	)
+	return err
 }
 
-func newBandwidthManager(lc hive.Lifecycle, p bandwidthManagerParams) (Manager, defines.NodeFnOut) {
+func newBandwidthManager(lc cell.Lifecycle, p bandwidthManagerParams) (types.BandwidthManager, defines.NodeFnOut) {
 	m := &manager{params: p}
 
 	if !option.Config.DryMode {
@@ -49,7 +80,7 @@ func newBandwidthManager(lc hive.Lifecycle, p bandwidthManagerParams) (Manager, 
 	return m, defines.NewNodeFnOut(m.defines)
 }
 
-func (m *manager) Start(hive.HookContext) error {
+func (m *manager) Start(cell.HookContext) error {
 	err := m.probe()
 	if err != nil {
 		return err
@@ -60,14 +91,33 @@ func (m *manager) Start(hive.HookContext) error {
 	return m.init()
 }
 
-func (*manager) Stop(hive.HookContext) error {
+func (*manager) Stop(cell.HookContext) error {
 	return nil
 }
 
 type bandwidthManagerParams struct {
 	cell.In
 
-	Log          logrus.FieldLogger
-	Config       Config
+	Log          *slog.Logger
+	Config       types.BandwidthConfig
 	DaemonConfig *option.DaemonConfig
+	Sysctl       sysctl.Sysctl
+	DB           *statedb.DB
+	EdtTable     statedb.RWTable[bwmap.Edt]
+}
+
+func deviceToBandwidthQDisc(device *tables.Device, deleted bool) (*tables.BandwidthQDisc, statedb.DeriveResult) {
+	if deleted || !device.Selected {
+		return &tables.BandwidthQDisc{
+			LinkIndex: device.Index,
+			LinkName:  device.Name,
+		}, statedb.DeriveDelete
+	}
+	return &tables.BandwidthQDisc{
+		LinkIndex: device.Index,
+		LinkName:  device.Name,
+		FqHorizon: FqDefaultHorizon,
+		FqBuckets: FqDefaultBuckets,
+		Status:    reconciler.StatusPending(),
+	}, statedb.DeriveInsert
 }

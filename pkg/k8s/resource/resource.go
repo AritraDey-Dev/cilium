@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/stream"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	k8sRuntime "k8s.io/apimachinery/pkg/runtime"
@@ -20,13 +22,12 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 
-	"github.com/cilium/cilium/pkg/hive"
 	k8smetrics "github.com/cilium/cilium/pkg/k8s/metrics"
+	"github.com/cilium/cilium/pkg/k8s/synced"
 	"github.com/cilium/cilium/pkg/k8s/watchers/resources"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/promise"
-	"github.com/cilium/cilium/pkg/stream"
 )
 
 // Resource provides access to a Kubernetes resource through either
@@ -101,7 +102,7 @@ type Resource[T k8sRuntime.Object] interface {
 //		"example",
 //	 	cell.Provide(
 //		 	// Provide `Resource[*slim_corev1.Pod]` to the hive:
-//		 	func(lc hive.Lifecycle, c k8sClient.Clientset) resource.Resource[*slim_corev1.Pod] {
+//		 	func(lc cell.Lifecycle, c k8sClient.Clientset) resource.Resource[*slim_corev1.Pod] {
 //				lw := utils.ListerWatcherFromTyped[*slim_corev1.PodList](
 //					c.Slim().CoreV1().Pods(""),
 //				)
@@ -135,7 +136,7 @@ type Resource[T k8sRuntime.Object] interface {
 //	}
 //
 // See also pkg/k8s/resource/example/main.go for a runnable example.
-func New[T k8sRuntime.Object](lc hive.Lifecycle, lw cache.ListerWatcher, opts ...ResourceOption) Resource[T] {
+func New[T k8sRuntime.Object](lc cell.Lifecycle, lw cache.ListerWatcher, opts ...ResourceOption) Resource[T] {
 	r := &resource[T]{
 		subscribers: make(map[uint64]*subscriber[T]),
 		needed:      make(chan struct{}, 1),
@@ -155,11 +156,12 @@ func New[T k8sRuntime.Object](lc hive.Lifecycle, lw cache.ListerWatcher, opts ..
 }
 
 type options struct {
-	transform   cache.TransformFunc      // if non-nil, the object is transformed with this function before storing
-	sourceObj   func() k8sRuntime.Object // prototype for the object before it is transformed
-	indexers    cache.Indexers           // map of the optional custom indexers to be added to the underlying resource informer
-	metricScope string                   // the scope label used when recording metrics for the resource
-	name        string                   // the name label used for the workqueue metrics
+	transform      cache.TransformFunc             // if non-nil, the object is transformed with this function before storing
+	sourceObj      func() k8sRuntime.Object        // prototype for the object before it is transformed
+	indexers       cache.Indexers                  // map of the optional custom indexers to be added to the underlying resource informer
+	metricScope    string                          // the scope label used when recording metrics for the resource
+	name           string                          // the name label used for the workqueue metrics
+	crdSyncPromise promise.Promise[synced.CRDSync] // optional promise to wait for
 }
 
 type ResourceOption func(o *options)
@@ -210,6 +212,12 @@ func WithIndexers(indexers cache.Indexers) ResourceOption {
 func WithName(name string) ResourceOption {
 	return func(o *options) {
 		o.name = name
+	}
+}
+
+func WithCRDSync(crdSyncPromise promise.Promise[synced.CRDSync]) ResourceOption {
+	return func(o *options) {
+		o.crdSyncPromise = crdSyncPromise
 	}
 }
 
@@ -287,7 +295,7 @@ func (r *resource[T]) metricEventReceived(action string, valid, equal bool) {
 	metrics.KubernetesEventReceived.WithLabelValues(r.opts.metricScope, action, validStr, equalStr).Inc()
 }
 
-func (r *resource[T]) Start(hive.HookContext) error {
+func (r *resource[T]) Start(cell.HookContext) error {
 	r.wg.Add(1)
 	go r.startWhenNeeded()
 	return nil
@@ -301,24 +309,22 @@ func (r *resource[T]) markNeeded() {
 }
 
 func (r *resource[T]) startWhenNeeded() {
-	defer r.wg.Done()
-
 	// Wait until we're needed before starting the informer.
 	select {
 	case <-r.ctx.Done():
+		r.wg.Done()
 		return
 	case <-r.needed:
 	}
 
-	// Short-circuit if we're being stopped.
-	if r.ctx.Err() != nil {
-		return
+	// Wait for CRDs to have synced before trying to access (Cilium) k8s resources
+	if r.opts.crdSyncPromise != nil {
+		r.opts.crdSyncPromise.Await(r.ctx)
 	}
 
 	store, informer := r.newInformer()
 	r.storeResolver.Resolve(&typedStore[T]{store})
 
-	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
 		informer.Run(r.ctx.Done())
@@ -338,21 +344,21 @@ func (r *resource[T]) startWhenNeeded() {
 	}
 }
 
-func (r *resource[T]) Stop(stopCtx hive.HookContext) error {
+func (r *resource[T]) Stop(stopCtx cell.HookContext) error {
 	r.cancel()
 	r.wg.Wait()
 	return nil
 }
 
 type eventsOpts struct {
-	rateLimiter  workqueue.RateLimiter
+	rateLimiter  workqueue.TypedRateLimiter[WorkItem]
 	errorHandler ErrorHandler
 }
 
 type EventsOpt func(*eventsOpts)
 
 // WithRateLimiter sets the rate limiting algorithm to be used when requeueing failed events.
-func WithRateLimiter(r workqueue.RateLimiter) EventsOpt {
+func WithRateLimiter(r workqueue.TypedRateLimiter[WorkItem]) EventsOpt {
 	return func(o *eventsOpts) {
 		o.rateLimiter = r
 	}
@@ -391,7 +397,7 @@ func (r *resource[T]) Events(ctx context.Context, opts ...EventsOpt) <-chan Even
 
 	options := eventsOpts{
 		errorHandler: AlwaysRetry, // Default error handling is to always retry.
-		rateLimiter:  workqueue.DefaultControllerRateLimiter(),
+		rateLimiter:  workqueue.DefaultTypedControllerRateLimiter[WorkItem](),
 	}
 	for _, apply := range opts {
 		apply(&options)
@@ -407,8 +413,8 @@ func (r *resource[T]) Events(ctx context.Context, opts ...EventsOpt) <-chan Even
 		r:         r,
 		options:   options,
 		debugInfo: debugInfo,
-		wq: workqueue.NewRateLimitingQueueWithConfig(options.rateLimiter,
-			workqueue.RateLimitingQueueConfig{Name: r.resourceName()}),
+		wq: workqueue.NewTypedRateLimitingQueueWithConfig[WorkItem](options.rateLimiter,
+			workqueue.TypedRateLimitingQueueConfig[WorkItem]{Name: r.resourceName()}),
 	}
 
 	// Fork a goroutine to process the queued keys and pass them to the subscriber.
@@ -491,7 +497,7 @@ func (r *resource[T]) resourceName() string {
 type subscriber[T k8sRuntime.Object] struct {
 	r         *resource[T]
 	debugInfo string
-	wq        workqueue.RateLimitingInterface
+	wq        workqueue.TypedRateLimitingInterface[WorkItem]
 	options   eventsOpts
 }
 
@@ -597,13 +603,12 @@ loop:
 	}
 }
 
-func (s *subscriber[T]) getWorkItem() (e workItem, shutdown bool) {
-	var raw any
-	raw, shutdown = s.wq.Get()
+func (s *subscriber[T]) getWorkItem() (e WorkItem, shutdown bool) {
+	raw, shutdown := s.wq.Get()
 	if shutdown {
 		return
 	}
-	return raw.(workItem), false
+	return raw, false
 }
 
 func (s *subscriber[T]) enqueueSync() {
@@ -614,7 +619,7 @@ func (s *subscriber[T]) enqueueKey(key Key) {
 	s.wq.Add(keyWorkItem{key})
 }
 
-func (s *subscriber[T]) eventDone(entry workItem, err error) {
+func (s *subscriber[T]) eventDone(entry WorkItem, err error) {
 	// This is based on the example found in k8s.io/client-go/examples/worsueue/main.go.
 
 	// Mark the object as done being processed. If it was marked dirty
@@ -691,13 +696,13 @@ func (l *lastKnownObjects[T]) DeleteByUID(key Key, objToDelete T) {
 	}
 }
 
-// workItem restricts the set of types we use when type-switching over the
+// WorkItem restricts the set of types we use when type-switching over the
 // queue entries, so that we'll get a compiler error on impossible types.
 //
 // The queue entries must be kept comparable and not be pointers as we want
 // to be able to coalesce multiple keyEntry's into a single element in the
 // queue.
-type workItem interface {
+type WorkItem interface {
 	isWorkItem()
 }
 
@@ -727,7 +732,7 @@ func (p *wrapperController) Run(stopCh <-chan struct{}) {
 
 func (r *resource[T]) newInformer() (cache.Indexer, cache.Controller) {
 	clientState := cache.NewIndexer(cache.DeletionHandlingMetaNamespaceKeyFunc, r.opts.indexers)
-	opts := cache.DeltaFIFOOptions{KeyFunction: cache.MetaNamespaceKeyFunc, KnownObjects: clientState}
+	opts := cache.DeltaFIFOOptions{KeyFunction: cache.MetaNamespaceKeyFunc, KnownObjects: clientState, EmitDeltaTypeReplaced: true}
 	fifo := cache.NewDeltaFIFOWithOptions(opts)
 	transformer := r.opts.transform
 	cacheMutationDetector := cache.NewCacheMutationDetector(fmt.Sprintf("%T", r))
@@ -736,8 +741,7 @@ func (r *resource[T]) newInformer() (cache.Indexer, cache.Controller) {
 		ListerWatcher:    r.lw,
 		ObjectType:       r.opts.sourceObj(),
 		FullResyncPeriod: 0,
-		RetryOnError:     false,
-		Process: func(obj interface{}, isInInitialList bool) error {
+		Process: func(obj any, isInInitialList bool) error {
 			// Processing of the deltas is done under the resource mutex. This
 			// avoids emitting double events for new subscribers that list the
 			// keys in the store.
@@ -745,7 +749,7 @@ func (r *resource[T]) newInformer() (cache.Indexer, cache.Controller) {
 			defer r.mu.RUnlock()
 
 			for _, d := range obj.(cache.Deltas) {
-				var obj interface{}
+				var obj any
 				if transformer != nil {
 					var err error
 					if obj, err = transformer(d.Object); err != nil {
@@ -755,6 +759,9 @@ func (r *resource[T]) newInformer() (cache.Indexer, cache.Controller) {
 					obj = d.Object
 				}
 
+				// Deduplicate the strings in the object metadata to reduce memory consumption.
+				resources.DedupMetadata(obj)
+
 				// In CI we detect if the objects were modified and panic
 				// (e.g. when KUBE_CACHE_MUTATION_DETECTOR is set)
 				// this is a no-op in production environments.
@@ -763,7 +770,7 @@ func (r *resource[T]) newInformer() (cache.Indexer, cache.Controller) {
 				key := NewKey(obj)
 
 				switch d.Type {
-				case cache.Sync, cache.Added, cache.Updated:
+				case cache.Sync, cache.Added, cache.Updated, cache.Replaced:
 					metric := resources.MetricCreate
 					if d.Type != cache.Added {
 						metric = resources.MetricUpdate

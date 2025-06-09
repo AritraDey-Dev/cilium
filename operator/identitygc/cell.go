@@ -7,10 +7,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
 
 	"github.com/cilium/cilium/pkg/defaults"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/metrics"
 )
 
 const (
@@ -44,7 +45,7 @@ var Cell = cell.Module(
 	// Invoke forces the instantiation of the identity gc
 	cell.Invoke(registerGC),
 
-	cell.Metric(NewMetrics),
+	metrics.Metric(NewMetrics),
 )
 
 // Config contains the configuration for the identity-gc.
@@ -80,8 +81,4 @@ func (def Config) Flags(flags *pflag.FlagSet) {
 type SharedConfig struct {
 	// IdentityAllocationMode specifies what mode to use for identity allocation
 	IdentityAllocationMode string
-
-	// K8sNamespace is the name of the namespace in which Cilium is
-	// deployed in when running in Kubernetes mode
-	K8sNamespace string
 }

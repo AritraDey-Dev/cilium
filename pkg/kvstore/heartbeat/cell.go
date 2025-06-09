@@ -5,13 +5,18 @@ package heartbeat
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/hive/cell"
+
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/promise"
 )
+
+type Config struct {
+	EnableHeartBeat bool
+}
 
 // Cell creates a cell responsible for periodically updating the heartbeat key
 // in the kvstore.
@@ -19,12 +24,16 @@ var Cell = cell.Module(
 	"kvstore-heartbeat-updater",
 	"KVStore Heartbeat Updater",
 
-	cell.Invoke(func(lc hive.Lifecycle, backendPromise promise.Promise[kvstore.BackendOperations]) {
+	cell.Invoke(func(config Config, logger *slog.Logger, lc cell.Lifecycle, backendPromise promise.Promise[kvstore.BackendOperations]) {
+		if !config.EnableHeartBeat {
+			return
+		}
+
 		ctx, cancel := context.WithCancel(context.Background())
 		var wg sync.WaitGroup
 
-		lc.Append(hive.Hook{
-			OnStart: func(hive.HookContext) error {
+		lc.Append(cell.Hook{
+			OnStart: func(cell.HookContext) error {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
@@ -36,12 +45,12 @@ var Cell = cell.Module(
 						return
 					}
 
-					Heartbeat(ctx, backend)
+					Heartbeat(ctx, logger, backend)
 				}()
 				return nil
 			},
 
-			OnStop: func(ctx hive.HookContext) error {
+			OnStop: func(ctx cell.HookContext) error {
 				cancel()
 				wg.Wait()
 				return nil

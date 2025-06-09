@@ -24,18 +24,19 @@ import (
 	"sigs.k8s.io/gateway-api/conformance/utils/http"
 	"sigs.k8s.io/gateway-api/conformance/utils/kubernetes"
 	"sigs.k8s.io/gateway-api/conformance/utils/suite"
+	"sigs.k8s.io/gateway-api/pkg/features"
 )
 
 func init() {
-	ConformanceTests = append(ConformanceTests, HTTPExactPathMatching)
+	ConformanceTests = append(ConformanceTests, HTTPRouteExactPathMatching)
 }
 
-var HTTPExactPathMatching = suite.ConformanceTest{
-	ShortName:   "HTTPExactPathMatching",
+var HTTPRouteExactPathMatching = suite.ConformanceTest{
+	ShortName:   "HTTPRouteExactPathMatching",
 	Description: "A single HTTPRoute with exact path matching for different backends",
-	Features: []suite.SupportedFeature{
-		suite.SupportGateway,
-		suite.SupportHTTPRoute,
+	Features: []features.FeatureName{
+		features.SupportGateway,
+		features.SupportHTTPRoute,
 	},
 	Manifests: []string{"tests/httproute-exact-path-matching.yaml"},
 	Test: func(t *testing.T, suite *suite.ConformanceTestSuite) {

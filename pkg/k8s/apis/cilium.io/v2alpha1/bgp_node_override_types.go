@@ -12,10 +12,12 @@ import (
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:resource:categories={cilium,ciliumbgp},singular="ciliumbgpnodeconfigoverride",path="ciliumbgpnodeconfigoverrides",scope="Cluster",shortName={cbgpnodeoverride}
 // +kubebuilder:printcolumn:JSONPath=".metadata.creationTimestamp",name="Age",type=date
-// +kubebuilder:storageversion
+// +kubebuilder:deprecatedversion
 
-// CiliumBGPNodeConfigOverride is used to overrides some of the BGP configurations which are node local.
-// Users can user this resource to override auto-generated BGP settings for the node.
+// CiliumBGPNodeConfigOverride specifies configuration overrides for a CiliumBGPNodeConfig.
+// It allows fine-tuning of BGP behavior on a per-node basis. For the override to be effective,
+// the names in CiliumBGPNodeConfigOverride and CiliumBGPNodeConfig must match exactly. This
+// matching ensures that specific node configurations are applied correctly and only where intended.
 type CiliumBGPNodeConfigOverride struct {
 	// +deepequal-gen=false
 	metav1.TypeMeta `json:",inline"`
@@ -40,11 +42,6 @@ type CiliumBGPNodeConfigOverrideList struct {
 }
 
 type CiliumBGPNodeConfigOverrideSpec struct {
-	// NodeRef is the name of the node for which the BGP configuration is overridden.
-	//
-	// +kubebuilder:validation:Required
-	NodeRef string `json:"nodeRef"`
-
 	// BGPInstances is a list of BGP instances to override.
 	//
 	// +kubebuilder:validation:Required
@@ -80,6 +77,13 @@ type CiliumBGPNodeConfigInstanceOverride struct {
 	// +listType=map
 	// +listMapKey=name
 	Peers []CiliumBGPNodeConfigPeerOverride `json:"peers,omitempty"`
+
+	// LocalASN is the ASN to use for this BGP instance.
+	//
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=4294967295
+	LocalASN *int64 `json:"localASN,omitempty"`
 }
 
 // CiliumBGPNodeConfigPeerOverride defines configuration options which can be overridden for a specific peer.

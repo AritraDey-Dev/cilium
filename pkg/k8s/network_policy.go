@@ -5,8 +5,12 @@ package k8s
 
 import (
 	"fmt"
+	"log/slog"
+	"maps"
+	"slices"
 
 	"github.com/cilium/cilium/pkg/annotation"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	k8sConst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	k8sCiliumUtils "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/utils"
 	slim_networkingv1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/networking/v1"
@@ -32,9 +36,9 @@ var (
 // GetPolicyLabelsv1 extracts the name of np. It uses the name  from the Cilium
 // annotation if present. If the policy's annotations do not contain
 // the Cilium annotation, the policy's name field is used instead.
-func GetPolicyLabelsv1(np *slim_networkingv1.NetworkPolicy) labels.LabelArray {
+func GetPolicyLabelsv1(logger *slog.Logger, np *slim_networkingv1.NetworkPolicy) labels.LabelArray {
 	if np == nil {
-		log.Warningf("unable to extract policy labels because provided NetworkPolicy is nil")
+		logger.Warn("unable to extract policy labels because provided NetworkPolicy is nil")
 		return nil
 	}
 
@@ -53,12 +57,39 @@ func GetPolicyLabelsv1(np *slim_networkingv1.NetworkPolicy) labels.LabelArray {
 	return k8sCiliumUtils.GetPolicyLabels(ns, policyName, policyUID, resourceTypeNetworkPolicy)
 }
 
-func parseNetworkPolicyPeer(namespace string, peer *slim_networkingv1.NetworkPolicyPeer) *api.EndpointSelector {
+func isPodSelectorSelectingCluster(podSelector *slim_metav1.LabelSelector) bool {
+	if podSelector == nil {
+		return false
+	}
+	if podSelector.MatchLabels[k8sConst.PolicyLabelCluster] != "" {
+		return true
+	}
+	for _, expr := range podSelector.MatchExpressions {
+		if expr.Key == k8sConst.PolicyLabelCluster {
+			return true
+		}
+	}
+
+	return false
+}
+
+func parseNetworkPolicyPeer(clusterName, namespace string, peer *slim_networkingv1.NetworkPolicyPeer) *api.EndpointSelector {
 	if peer == nil {
 		return nil
 	}
 
 	var retSel *api.EndpointSelector
+	// The PodSelector should only reflect to the configured cluster unless the selector
+	// explicitly targets another cluster already.
+	if clusterName != cmtypes.PolicyAnyCluster && !isPodSelectorSelectingCluster(peer.PodSelector) {
+		if peer.PodSelector == nil {
+			peer.PodSelector = &slim_metav1.LabelSelector{}
+		}
+		if peer.PodSelector.MatchLabels == nil {
+			peer.PodSelector.MatchLabels = map[string]slim_metav1.MatchLabelsValue{}
+		}
+		peer.PodSelector.MatchLabels[k8sConst.PolicyLabelCluster] = clusterName
+	}
 
 	if peer.NamespaceSelector != nil {
 		namespaceSelector := &slim_metav1.LabelSelector{
@@ -103,19 +134,13 @@ func parseNetworkPolicyPeer(namespace string, peer *slim_networkingv1.NetworkPol
 }
 
 func hasV1PolicyType(pTypes []slim_networkingv1.PolicyType, typ slim_networkingv1.PolicyType) bool {
-	for _, pType := range pTypes {
-		if pType == typ {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(pTypes, typ)
 }
 
 // ParseNetworkPolicy parses a k8s NetworkPolicy. Returns a list of
 // Cilium policy rules that can be added, along with an error if there was an
 // error sanitizing the rules.
-func ParseNetworkPolicy(np *slim_networkingv1.NetworkPolicy) (api.Rules, error) {
-
+func ParseNetworkPolicy(logger *slog.Logger, clusterName string, np *slim_networkingv1.NetworkPolicy) (api.Rules, error) {
 	if np == nil {
 		return nil, fmt.Errorf("cannot parse NetworkPolicy because it is nil")
 	}
@@ -129,16 +154,16 @@ func ParseNetworkPolicy(np *slim_networkingv1.NetworkPolicy) (api.Rules, error) 
 
 	for _, iRule := range np.Spec.Ingress {
 		fromRules := []api.IngressRule{}
-		if iRule.From != nil && len(iRule.From) > 0 {
+		if len(iRule.From) > 0 {
 			for _, rule := range iRule.From {
 				ingress := api.IngressRule{}
-				endpointSelector := parseNetworkPolicyPeer(namespace, &rule)
+				endpointSelector := parseNetworkPolicyPeer(clusterName, namespace, &rule)
 
 				if endpointSelector != nil {
 					ingress.FromEndpoints = append(ingress.FromEndpoints, *endpointSelector)
 				} else {
 					// No label-based selectors were in NetworkPolicyPeer.
-					log.WithField(logfields.K8sNetworkPolicyName, np.Name).Debug("NetworkPolicyPeer does not have PodSelector or NamespaceSelector")
+					logger.Debug("NetworkPolicyPeer does not have PodSelector or NamespaceSelector", logfields.K8sNetworkPolicyName, np.Name)
 				}
 
 				// Parse CIDR-based parts of rule.
@@ -160,7 +185,7 @@ func ParseNetworkPolicy(np *slim_networkingv1.NetworkPolicy) (api.Rules, error) 
 		}
 
 		// We apply the ports to all rules generated from the From section
-		if iRule.Ports != nil && len(iRule.Ports) > 0 {
+		if len(iRule.Ports) > 0 {
 			toPorts := parsePorts(iRule.Ports)
 			for i := range fromRules {
 				fromRules[i].ToPorts = toPorts
@@ -173,16 +198,16 @@ func ParseNetworkPolicy(np *slim_networkingv1.NetworkPolicy) (api.Rules, error) 
 	for _, eRule := range np.Spec.Egress {
 		toRules := []api.EgressRule{}
 
-		if eRule.To != nil && len(eRule.To) > 0 {
+		if len(eRule.To) > 0 {
 			for _, rule := range eRule.To {
 				egress := api.EgressRule{}
 				if rule.NamespaceSelector != nil || rule.PodSelector != nil {
-					endpointSelector := parseNetworkPolicyPeer(namespace, &rule)
+					endpointSelector := parseNetworkPolicyPeer(clusterName, namespace, &rule)
 
 					if endpointSelector != nil {
 						egress.ToEndpoints = append(egress.ToEndpoints, *endpointSelector)
 					} else {
-						log.WithField(logfields.K8sNetworkPolicyName, np.Name).Debug("NetworkPolicyPeer does not have PodSelector or NamespaceSelector")
+						logger.Debug("NetworkPolicyPeer does not have PodSelector or NamespaceSelector", logfields.K8sNetworkPolicyName, np.Name)
 					}
 				}
 				if rule.IPBlock != nil {
@@ -203,7 +228,7 @@ func ParseNetworkPolicy(np *slim_networkingv1.NetworkPolicy) (api.Rules, error) 
 		}
 
 		// We apply the ports to all rules generated from the To section
-		if eRule.Ports != nil && len(eRule.Ports) > 0 {
+		if len(eRule.Ports) > 0 {
 			toPorts := parsePorts(eRule.Ports)
 			for i := range toRules {
 				toRules[i].ToPorts = toPorts
@@ -214,7 +239,7 @@ func ParseNetworkPolicy(np *slim_networkingv1.NetworkPolicy) (api.Rules, error) 
 	}
 
 	// Convert the k8s default-deny model to the Cilium default-deny model
-	//spec:
+	// spec:
 	//  podSelector: {}
 	//  policyTypes:
 	//	  - Ingress
@@ -227,7 +252,7 @@ func ParseNetworkPolicy(np *slim_networkingv1.NetworkPolicy) (api.Rules, error) 
 	}
 
 	// Convert the k8s default-deny model to the Cilium default-deny model
-	//spec:
+	// spec:
 	//  podSelector: {}
 	//  policyTypes:
 	//	  - Egress
@@ -240,7 +265,7 @@ func ParseNetworkPolicy(np *slim_networkingv1.NetworkPolicy) (api.Rules, error) 
 	// The next patch will pass the UID.
 	rule := api.NewRule().
 		WithEndpointSelector(api.NewESFromK8sLabelSelector(labels.LabelSourceK8sKeyPrefix, podSelector)).
-		WithLabels(GetPolicyLabelsv1(np)).
+		WithLabels(GetPolicyLabelsv1(logger, np)).
 		WithIngressRules(ingresses).
 		WithEgressRules(egresses)
 
@@ -251,33 +276,11 @@ func ParseNetworkPolicy(np *slim_networkingv1.NetworkPolicy) (api.Rules, error) 
 	return api.Rules{rule}, nil
 }
 
-// NetworkPolicyHasEndPort returns true if the network policy has an
-// EndPort.
-func NetworkPolicyHasEndPort(np *slim_networkingv1.NetworkPolicy) bool {
-	for _, iRule := range np.Spec.Ingress {
-		for _, port := range iRule.Ports {
-			if port.EndPort != nil && *port.EndPort > 0 {
-				return true
-			}
-		}
-	}
-	for _, eRule := range np.Spec.Egress {
-		for _, port := range eRule.Ports {
-			if port.EndPort != nil && *port.EndPort > 0 {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func parsePodSelector(podSelectorIn *slim_metav1.LabelSelector, namespace string) *slim_metav1.LabelSelector {
 	podSelector := &slim_metav1.LabelSelector{
 		MatchLabels: make(map[string]slim_metav1.MatchLabelsValue, len(podSelectorIn.MatchLabels)),
 	}
-	for k, v := range podSelectorIn.MatchLabels {
-		podSelector.MatchLabels[k] = v
-	}
+	maps.Copy(podSelector.MatchLabels, podSelectorIn.MatchLabels)
 	// The PodSelector should only reflect to the same namespace
 	// the policy is being stored, thus we add the namespace to
 	// the MatchLabels map.
@@ -317,13 +320,17 @@ func parsePorts(ports []slim_networkingv1.NetworkPolicyPort) []api.PortRule {
 		}
 
 		portStr := "0"
+		var endPort int32
 		if port.Port != nil {
 			portStr = port.Port.String()
+		}
+		if port.EndPort != nil {
+			endPort = *port.EndPort
 		}
 
 		portRule := api.PortRule{
 			Ports: []api.PortProtocol{
-				{Port: portStr, Protocol: protocol},
+				{Port: portStr, EndPort: endPort, Protocol: protocol},
 			},
 		}
 

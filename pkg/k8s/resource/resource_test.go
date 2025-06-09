@@ -7,7 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"runtime"
 	"strconv"
 	"sync"
@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
@@ -27,7 +29,6 @@ import (
 	"k8s.io/client-go/util/workqueue"
 
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	"github.com/cilium/cilium/pkg/k8s/utils"
@@ -94,8 +95,8 @@ func TestResource_WithFakeClient(t *testing.T) {
 		nodeName = "some-node"
 		node     = &corev1.Node{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:            nodeName,
-				ResourceVersion: "0",
+				Name:       nodeName,
+				Generation: 0,
 			},
 			Status: corev1.NodeStatus{
 				Phase: "init",
@@ -103,19 +104,19 @@ func TestResource_WithFakeClient(t *testing.T) {
 		}
 
 		nodes          resource.Resource[*corev1.Node]
-		fakeClient, cs = k8sClient.NewFakeClientset()
+		fakeClient, cs = k8sClient.NewFakeClientset(hivetest.Logger(t))
 
 		events <-chan resource.Event[*corev1.Node]
 	)
 
 	// Create the initial version of the node. Do this before anything
 	// starts watching the resources to avoid a race.
-	fakeClient.KubernetesFakeClientset.Tracker().Create(
-		corev1.SchemeGroupVersion.WithResource("nodes"),
-		node.DeepCopy(), "")
-
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
+
+	fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Create(
+		ctx,
+		node.DeepCopy(), metav1.CreateOptions{})
 
 	hive := hive.New(
 		cell.Provide(func() k8sClient.Clientset { return cs }),
@@ -129,7 +130,8 @@ func TestResource_WithFakeClient(t *testing.T) {
 			events = nodes.Events(ctx)
 		}))
 
-	if err := hive.Start(ctx); err != nil {
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, ctx); err != nil {
 		t.Fatalf("hive.Start failed: %s", err)
 	}
 
@@ -159,9 +161,10 @@ func TestResource_WithFakeClient(t *testing.T) {
 	// Update the node and check the update event
 	node.Status.Phase = "update1"
 	node.ObjectMeta.ResourceVersion = "1"
-	fakeClient.KubernetesFakeClientset.Tracker().Update(
-		corev1.SchemeGroupVersion.WithResource("nodes"),
-		node.DeepCopy(), "")
+
+	fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Update(
+		ctx,
+		node.DeepCopy(), metav1.UpdateOptions{})
 
 	ev, ok = <-events
 	require.True(t, ok, "events channel closed unexpectedly")
@@ -190,16 +193,16 @@ func TestResource_WithFakeClient(t *testing.T) {
 		ev2.Done(nil)
 
 		for i := 2; i <= 10; i++ {
-			version := fmt.Sprintf("%d", i)
 			node.Status.Phase = corev1.NodePhase(fmt.Sprintf("update%d", i))
-			node.ObjectMeta.ResourceVersion = version
-			fakeClient.KubernetesFakeClientset.Tracker().Update(
-				corev1.SchemeGroupVersion.WithResource("nodes"),
-				node.DeepCopy(), "")
+			node.ObjectMeta.Generation = int64(i)
+
+			fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Update(
+				ctx,
+				node.DeepCopy(), metav1.UpdateOptions{})
 			ev2, ok := <-events2
 			require.True(t, ok, "events channel closed unexpectedly")
 			require.Equal(t, resource.Upsert, ev2.Kind)
-			require.Equal(t, version, ev2.Object.ResourceVersion)
+			require.EqualValues(t, i, ev2.Object.Generation)
 			ev2.Done(nil)
 		}
 		cancel2()
@@ -214,25 +217,26 @@ func TestResource_WithFakeClient(t *testing.T) {
 	require.Equal(t, resource.Upsert, ev.Kind)
 	require.Equal(t, nodeName, ev.Key.Name)
 	ev.Done(nil)
-	if ev.Object.ResourceVersion != node.ObjectMeta.ResourceVersion {
+	if ev.Object.Generation != node.ObjectMeta.Generation {
 		ev, ok = <-events
 		require.True(t, ok, "events channel closed unexpectedly")
 		require.Equal(t, resource.Upsert, ev.Kind)
 		require.Equal(t, nodeName, ev.Key.Name)
-		require.Equal(t, node.ObjectMeta.ResourceVersion, ev.Object.ResourceVersion)
+		require.Equal(t, node.ObjectMeta.Generation, ev.Object.Generation)
 		ev.Done(nil)
 	}
 
 	// Finally delete the node
-	fakeClient.KubernetesFakeClientset.Tracker().Delete(
-		corev1.SchemeGroupVersion.WithResource("nodes"),
-		"", "some-node")
+	fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Delete(
+		ctx,
+		node.Name,
+		metav1.DeleteOptions{})
 
 	ev, ok = <-events
 	require.True(t, ok, "events channel closed unexpectedly")
 	require.Equal(t, resource.Delete, ev.Kind)
 	require.Equal(t, nodeName, ev.Key.Name)
-	require.Equal(t, node.ObjectMeta.ResourceVersion, ev.Object.ResourceVersion)
+	require.Equal(t, node.ObjectMeta.Generation, ev.Object.Generation)
 	ev.Done(nil)
 
 	// Cancel the subscriber context and verify that the stream gets completed.
@@ -246,7 +250,7 @@ func TestResource_WithFakeClient(t *testing.T) {
 
 	// Finally check that the hive stops correctly. Note that we're not doing this in a
 	// defer to avoid potentially deadlocking on the Fatal calls.
-	if err := hive.Stop(context.TODO()); err != nil {
+	if err := hive.Stop(tlog, context.TODO()); err != nil {
 		t.Fatalf("hive.Stop failed: %s", err)
 	}
 }
@@ -298,7 +302,7 @@ func TestResource_RepeatedDelete(t *testing.T) {
 
 	hive := hive.New(
 		cell.Provide(
-			func(lc hive.Lifecycle) resource.Resource[*corev1.Node] {
+			func(lc cell.Lifecycle) resource.Resource[*corev1.Node] {
 				return resource.New[*corev1.Node](lc, &lw)
 			}),
 
@@ -311,7 +315,8 @@ func TestResource_RepeatedDelete(t *testing.T) {
 			events = nodes.Events(ctx)
 		}))
 
-	if err := hive.Start(ctx); err != nil {
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, ctx); err != nil {
 		t.Fatalf("hive.Start failed: %s", err)
 	}
 
@@ -326,7 +331,7 @@ func TestResource_RepeatedDelete(t *testing.T) {
 	// Repeatedly create and delete the node in the background
 	// while "unreliably" processing some of the delete events.
 	go func() {
-		for i := 0; i < 1000; i++ {
+		for i := range 1000 {
 			node.ObjectMeta.ResourceVersion = fmt.Sprintf("%d", i)
 
 			lw.events <- watch.Event{
@@ -375,7 +380,7 @@ func TestResource_RepeatedDelete(t *testing.T) {
 			lastDeleteVersion = version
 
 			// Fail every 3rd deletion to test retrying.
-			if rand.Intn(3) == 0 {
+			if rand.IntN(3) == 0 {
 				ev.Done(errors.New("delete failed"))
 			} else {
 				exists = false
@@ -398,7 +403,7 @@ func TestResource_RepeatedDelete(t *testing.T) {
 
 	// Finally check that the hive stops correctly. Note that we're not doing this in a
 	// defer to avoid potentially deadlocking on the Fatal calls.
-	require.NoError(t, hive.Stop(context.TODO()))
+	require.NoError(t, hive.Stop(tlog, context.TODO()))
 }
 
 func TestResource_CompletionOnStop(t *testing.T) {
@@ -414,7 +419,8 @@ func TestResource_CompletionOnStop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	if err := hive.Start(ctx); err != nil {
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, ctx); err != nil {
 		t.Fatalf("hive.Start failed: %s", err)
 	}
 
@@ -435,7 +441,7 @@ func TestResource_CompletionOnStop(t *testing.T) {
 	}
 
 	// Stop the hive to stop the resource.
-	if err := hive.Stop(ctx); err != nil {
+	if err := hive.Stop(tlog, ctx); err != nil {
 		t.Fatalf("hive.Stop failed: %s", err)
 	}
 
@@ -449,7 +455,7 @@ func TestResource_CompletionOnStop(t *testing.T) {
 func TestResource_WithTransform(t *testing.T) {
 	type StrippedNode = metav1.PartialObjectMetadata
 	var strippedNodes resource.Resource[*StrippedNode]
-	var fakeClient, cs = k8sClient.NewFakeClientset()
+	var fakeClient, cs = k8sClient.NewFakeClientset(hivetest.Logger(t))
 
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
@@ -468,7 +474,7 @@ func TestResource_WithTransform(t *testing.T) {
 	hive := hive.New(
 		cell.Provide(
 			func() k8sClient.Clientset { return cs },
-			func(lc hive.Lifecycle, c k8sClient.Clientset) resource.Resource[*StrippedNode] {
+			func(lc cell.Lifecycle, c k8sClient.Clientset) resource.Resource[*StrippedNode] {
 				lw := utils.ListerWatcherFromTyped[*corev1.NodeList](c.CoreV1().Nodes())
 				return resource.New[*StrippedNode](lc, lw, resource.WithTransform(strip))
 			}),
@@ -480,13 +486,14 @@ func TestResource_WithTransform(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	if err := hive.Start(ctx); err != nil {
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, ctx); err != nil {
 		t.Fatalf("hive.Start failed: %s", err)
 	}
 
-	fakeClient.KubernetesFakeClientset.Tracker().Create(
-		corev1.SchemeGroupVersion.WithResource("nodes"),
-		node.DeepCopy(), "")
+	fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Create(
+		ctx,
+		node.DeepCopy(), metav1.CreateOptions{})
 
 	events := strippedNodes.Events(ctx)
 
@@ -499,7 +506,7 @@ func TestResource_WithTransform(t *testing.T) {
 	event.Done(nil)
 
 	// Stop the hive to stop the resource.
-	if err := hive.Stop(ctx); err != nil {
+	if err := hive.Stop(tlog, ctx); err != nil {
 		t.Fatalf("hive.Stop failed: %s", err)
 	}
 
@@ -520,17 +527,20 @@ func TestResource_WithoutIndexers(t *testing.T) {
 			},
 		}
 		nodeResource   resource.Resource[*corev1.Node]
-		fakeClient, cs = k8sClient.NewFakeClientset()
+		fakeClient, cs = k8sClient.NewFakeClientset(hivetest.Logger(t))
 	)
 
-	fakeClient.KubernetesFakeClientset.Tracker().Create(
-		corev1.SchemeGroupVersion.WithResource("nodes"),
-		node.DeepCopy(), "")
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Create(
+		ctx,
+		node.DeepCopy(), metav1.CreateOptions{})
 
 	hive := hive.New(
 		cell.Provide(func() k8sClient.Clientset { return cs }),
 		cell.Provide(
-			func(lc hive.Lifecycle, cs k8sClient.Clientset) resource.Resource[*corev1.Node] {
+			func(lc cell.Lifecycle, cs k8sClient.Clientset) resource.Resource[*corev1.Node] {
 				lw := utils.ListerWatcherFromTyped[*corev1.NodeList](cs.CoreV1().Nodes())
 				return resource.New[*corev1.Node](lc, lw)
 			},
@@ -541,10 +551,8 @@ func TestResource_WithoutIndexers(t *testing.T) {
 		}),
 	)
 
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-
-	if err := hive.Start(ctx); err != nil {
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, ctx); err != nil {
 		t.Fatalf("hive.Start failed: %s", err)
 	}
 
@@ -583,7 +591,7 @@ func TestResource_WithoutIndexers(t *testing.T) {
 	}
 
 	// Stop the hive to stop the resource.
-	if err := hive.Stop(ctx); err != nil {
+	if err := hive.Stop(tlog, ctx); err != nil {
 		t.Fatalf("hive.Stop failed: %s", err)
 	}
 
@@ -626,10 +634,10 @@ func TestResource_WithIndexers(t *testing.T) {
 			},
 		}
 		nodeResource   resource.Resource[*corev1.Node]
-		fakeClient, cs = k8sClient.NewFakeClientset()
+		fakeClient, cs = k8sClient.NewFakeClientset(hivetest.Logger(t))
 
 		indexName = "node-index-key"
-		indexFunc = func(obj interface{}) ([]string, error) {
+		indexFunc = func(obj any) ([]string, error) {
 			switch t := obj.(type) {
 			case *corev1.Node:
 				return []string{t.Name}, nil
@@ -638,16 +646,19 @@ func TestResource_WithIndexers(t *testing.T) {
 		}
 	)
 
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
 	for _, node := range nodes {
-		fakeClient.KubernetesFakeClientset.Tracker().Create(
-			corev1.SchemeGroupVersion.WithResource("nodes"),
-			node.DeepCopy(), "")
+		fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Create(
+			ctx,
+			node.DeepCopy(), metav1.CreateOptions{})
 	}
 
 	hive := hive.New(
 		cell.Provide(func() k8sClient.Clientset { return cs }),
 		cell.Provide(
-			func(lc hive.Lifecycle, cs k8sClient.Clientset) resource.Resource[*corev1.Node] {
+			func(lc cell.Lifecycle, cs k8sClient.Clientset) resource.Resource[*corev1.Node] {
 				lw := utils.ListerWatcherFromTyped[*corev1.NodeList](cs.CoreV1().Nodes())
 				return resource.New[*corev1.Node](
 					lc, lw,
@@ -661,17 +672,15 @@ func TestResource_WithIndexers(t *testing.T) {
 		}),
 	)
 
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-
-	if err := hive.Start(ctx); err != nil {
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, ctx); err != nil {
 		t.Fatalf("hive.Start failed: %s", err)
 	}
 
 	events := nodeResource.Events(ctx)
 
 	// wait for the upsert events
-	for i := 0; i < len(nodes); i++ {
+	for range len(nodes) {
 		ev, ok := <-events
 		require.True(t, ok)
 		require.Equal(t, resource.Upsert, ev.Kind)
@@ -700,7 +709,7 @@ func TestResource_WithIndexers(t *testing.T) {
 	require.Len(t, found, 1)
 	require.Equal(t, found[0].Name, indexValue)
 	require.Len(t, found[0].Labels, 1)
-	require.Equal(t, found[0].Labels["key"], "node-2")
+	require.Equal(t, "node-2", found[0].Labels["key"])
 
 	// retrieve the keys of the stored objects whose set of indexed values includes a specific value
 	keys, err := store.IndexKeys(indexName, indexValue)
@@ -711,7 +720,7 @@ func TestResource_WithIndexers(t *testing.T) {
 	require.Equal(t, []string{indexValue}, keys)
 
 	// Stop the hive to stop the resource.
-	if err := hive.Stop(ctx); err != nil {
+	if err := hive.Stop(tlog, ctx); err != nil {
 		t.Fatalf("hive.Stop failed: %s", err)
 	}
 
@@ -732,18 +741,18 @@ var RetryFiveTimes resource.ErrorHandler = func(key resource.Key, numRetries int
 func TestResource_Retries(t *testing.T) {
 	var (
 		nodes          resource.Resource[*corev1.Node]
-		fakeClient, cs = k8sClient.NewFakeClientset()
+		fakeClient, cs = k8sClient.NewFakeClientset(hivetest.Logger(t))
 	)
 
 	var rateLimiterUsed atomic.Int64
-	rateLimiter := func() workqueue.RateLimiter {
+	rateLimiter := func() workqueue.TypedRateLimiter[resource.WorkItem] {
 		rateLimiterUsed.Add(1)
-		return workqueue.DefaultControllerRateLimiter()
+		return workqueue.DefaultTypedControllerRateLimiter[resource.WorkItem]()
 	}
 
 	hive := hive.New(
 		cell.Provide(func() k8sClient.Clientset { return cs }),
-		cell.Provide(func(lc hive.Lifecycle, c k8sClient.Clientset) resource.Resource[*corev1.Node] {
+		cell.Provide(func(lc cell.Lifecycle, c k8sClient.Clientset) resource.Resource[*corev1.Node] {
 			nodesLW := utils.ListerWatcherFromTyped[*corev1.NodeList](c.CoreV1().Nodes())
 			return resource.New[*corev1.Node](lc, nodesLW)
 		}),
@@ -754,7 +763,8 @@ func TestResource_Retries(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	err := hive.Start(ctx)
+	tlog := hivetest.Logger(t)
+	err := hive.Start(tlog, ctx)
 	assert.NoError(t, err)
 
 	// Check that the WithRateLimiter option works.
@@ -803,9 +813,9 @@ func TestResource_Retries(t *testing.T) {
 	}
 
 	// Create the initial version of the node.
-	fakeClient.KubernetesFakeClientset.Tracker().Create(
-		corev1.SchemeGroupVersion.WithResource("nodes"),
-		node, "")
+	fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Create(
+		ctx,
+		node.DeepCopy(), metav1.CreateOptions{})
 
 	// Test that update events are retried
 	{
@@ -841,9 +851,9 @@ func TestResource_Retries(t *testing.T) {
 			case resource.Sync:
 				ev.Done(nil)
 			case resource.Upsert:
-				fakeClient.KubernetesFakeClientset.Tracker().Delete(
-					corev1.SchemeGroupVersion.WithResource("nodes"),
-					"", node.Name)
+				fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Delete(
+					ctx,
+					node.Name, metav1.DeleteOptions{})
 				ev.Done(nil)
 			case resource.Delete:
 				numRetries.Add(1)
@@ -854,7 +864,7 @@ func TestResource_Retries(t *testing.T) {
 		assert.Equal(t, int64(5), numRetries.Load(), "expected to see 5 retries for delete")
 	}
 
-	err = hive.Stop(ctx)
+	err = hive.Stop(tlog, ctx)
 	assert.NoError(t, err)
 }
 
@@ -870,15 +880,17 @@ func TestResource_Observe(t *testing.T) {
 				Phase: "init",
 			},
 		}
-		fakeClient, cs = k8sClient.NewFakeClientset()
+		fakeClient, cs = k8sClient.NewFakeClientset(hivetest.Logger(t))
 		nodes          resource.Resource[*corev1.Node]
 	)
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
 
 	// Create the initial version of the node. Do this before anything
 	// starts watching the resources to avoid a race.
-	fakeClient.KubernetesFakeClientset.Tracker().Create(
-		corev1.SchemeGroupVersion.WithResource("nodes"),
-		node.DeepCopy(), "")
+	fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Create(
+		ctx,
+		node.DeepCopy(), metav1.CreateOptions{})
 
 	hive := hive.New(
 		cell.Provide(func() k8sClient.Clientset { return cs }),
@@ -887,10 +899,8 @@ func TestResource_Observe(t *testing.T) {
 			nodes = r
 		}))
 
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-
-	if err := hive.Start(ctx); err != nil {
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, ctx); err != nil {
 		t.Fatalf("hive.Start failed: %s", err)
 	}
 
@@ -910,7 +920,7 @@ func TestResource_Observe(t *testing.T) {
 	eventWg.Wait()
 
 	// Stop the hive to stop the resource and trigger completion.
-	if err := hive.Stop(ctx); err != nil {
+	if err := hive.Stop(tlog, ctx); err != nil {
 		t.Fatalf("hive.Stop failed: %s", err)
 	}
 	completeWg.Wait()
@@ -945,14 +955,15 @@ func BenchmarkResource(b *testing.B) {
 	)
 
 	hive := hive.New(
-		cell.Provide(func(lc hive.Lifecycle) resource.Resource[*corev1.Node] {
+		cell.Provide(func(lc cell.Lifecycle) resource.Resource[*corev1.Node] {
 			return resource.New[*corev1.Node](lc, lw)
 		}),
 		cell.Invoke(func(r resource.Resource[*corev1.Node]) {
 			nodes = r
 		}))
 
-	err := hive.Start(context.TODO())
+	tlog := hivetest.Logger(b)
+	err := hive.Start(tlog, context.TODO())
 	assert.NoError(b, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -962,14 +973,12 @@ func BenchmarkResource(b *testing.B) {
 	assert.Equal(b, resource.Sync, ev.Kind)
 	ev.Done(nil)
 
-	b.ResetTimer()
-
 	var wg sync.WaitGroup
 
 	// Feed in b.N nodes as watcher events
 	wg.Add(1)
 	go func() {
-		for i := 0; i < b.N; i++ {
+		for i := 0; b.Loop(); i++ {
 			name := fmt.Sprintf("node-%d", i)
 			lw.events <- watch.Event{Type: watch.Added, Object: &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{
@@ -982,7 +991,7 @@ func BenchmarkResource(b *testing.B) {
 	}()
 
 	// Consume the events via the resource
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		ev, ok := <-events
 		assert.True(b, ok)
 		assert.Equal(b, resource.Upsert, ev.Kind)
@@ -994,7 +1003,7 @@ func BenchmarkResource(b *testing.B) {
 		ev.Done(nil)
 	}
 
-	err = hive.Stop(context.TODO())
+	err = hive.Stop(tlog, context.TODO())
 	assert.NoError(b, err)
 
 	wg.Wait()
@@ -1014,18 +1023,18 @@ func TestResource_SkippedDonePanics(t *testing.T) {
 			},
 		}
 		nodes          resource.Resource[*corev1.Node]
-		fakeClient, cs = k8sClient.NewFakeClientset()
+		fakeClient, cs = k8sClient.NewFakeClientset(hivetest.Logger(t))
 		events         <-chan resource.Event[*corev1.Node]
 	)
 
-	// Create the initial version of the node. Do this before anything
-	// starts watching the resources to avoid a race.
-	fakeClient.KubernetesFakeClientset.Tracker().Create(
-		corev1.SchemeGroupVersion.WithResource("nodes"),
-		node.DeepCopy(), "")
-
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
+
+	// Create the initial version of the node. Do this before anything
+	// starts watching the resources to avoid a race.
+	fakeClient.KubernetesFakeClientset.CoreV1().Nodes().Create(
+		ctx,
+		node.DeepCopy(), metav1.CreateOptions{})
 
 	hive := hive.New(
 		cell.Provide(func() k8sClient.Clientset { return cs }),
@@ -1039,7 +1048,8 @@ func TestResource_SkippedDonePanics(t *testing.T) {
 			events = nodes.Events(ctx)
 		}))
 
-	if err := hive.Start(ctx); err != nil {
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, ctx); err != nil {
 		t.Fatalf("hive.Start failed: %s", err)
 	}
 
@@ -1058,7 +1068,7 @@ func TestResource_SkippedDonePanics(t *testing.T) {
 //
 
 var nodesResource = cell.Provide(
-	func(lc hive.Lifecycle, c k8sClient.Clientset) resource.Resource[*corev1.Node] {
+	func(lc cell.Lifecycle, c k8sClient.Clientset) resource.Resource[*corev1.Node] {
 		lw := utils.ListerWatcherFromTyped[*corev1.NodeList](c.CoreV1().Nodes())
 		return resource.New[*corev1.Node](lc, lw)
 	},

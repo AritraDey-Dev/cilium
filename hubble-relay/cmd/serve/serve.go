@@ -4,6 +4,7 @@
 package serve
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -15,8 +16,11 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"golang.org/x/sys/unix"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/cilium/cilium/pkg/crypto/certloader"
+	"github.com/cilium/cilium/pkg/hubble/build"
 	"github.com/cilium/cilium/pkg/hubble/relay/defaults"
 	"github.com/cilium/cilium/pkg/hubble/relay/server"
 	"github.com/cilium/cilium/pkg/logging"
@@ -31,7 +35,6 @@ const (
 	keyPprofPort               = "pprof-port"
 	keyGops                    = "gops"
 	keyGopsPort                = "gops-port"
-	keyDialTimeout             = "dial-timeout"
 	keyRetryTimeout            = "retry-timeout"
 	keyListenAddress           = "listen-address"
 	keyHealthListenAddress     = "health-listen-address"
@@ -84,10 +87,6 @@ func New(vp *viper.Viper) *cobra.Command {
 		keyGopsPort,
 		defaults.GopsPort,
 		"Port for gops server to listen on")
-	flags.Duration(
-		keyDialTimeout,
-		defaults.DialTimeout,
-		"Dial timeout when connecting to hubble peers")
 	flags.Duration(
 		keyRetryTimeout,
 		defaults.RetryTimeout,
@@ -189,11 +188,10 @@ func runServe(vp *viper.Viper) error {
 	if vp.GetBool("debug") {
 		logging.SetLogLevelToDebug()
 	}
-	logger := logging.DefaultLogger.WithField(logfields.LogSubsys, "hubble-relay")
+	logger := logging.DefaultSlogLogger.With(logfields.LogSubsys, "hubble-relay")
 
 	opts := []server.Option{
 		server.WithLocalClusterName(vp.GetString(keyClusterName)),
-		server.WithDialTimeout(vp.GetDuration(keyDialTimeout)),
 		server.WithPeerTarget(vp.GetString(keyPeerService)),
 		server.WithListenAddress(vp.GetString(keyListenAddress)),
 		server.WithHealthListenAddress(vp.GetString(keyHealthListenAddress)),
@@ -201,6 +199,8 @@ func runServe(vp *viper.Viper) error {
 		server.WithSortBufferMaxLen(vp.GetInt(keySortBufferMaxLen)),
 		server.WithSortBufferDrainTimeout(vp.GetDuration(keySortBufferDrainTimeout)),
 		server.WithLogger(logger),
+		server.WithGRPCUnaryInterceptor(relayVersionUnaryInterceptor()),
+		server.WithGRPCStreamInterceptor(relayVersionStreamInterceptor()),
 	}
 
 	metricsListenAddress := vp.GetString(keyMetricsListenAddress)
@@ -221,7 +221,7 @@ func runServe(vp *viper.Viper) error {
 		opts = append(opts, server.WithInsecureClient())
 	} else {
 		tlsClientConfig, err := certloader.NewWatchedClientConfig(
-			logger.WithField("config", "tls-to-hubble"),
+			logger.With(logfields.Config, "tls-to-hubble"),
 			vp.GetStringSlice(keyTLSHubbleServerCAFiles),
 			hubbleClientCertFile(vp),
 			hubbleClientKeyFile(vp),
@@ -238,7 +238,7 @@ func runServe(vp *viper.Viper) error {
 		opts = append(opts, server.WithInsecureServer())
 	} else {
 		tlsServerConfig, err := certloader.NewWatchedServerConfig(
-			logger.WithField("config", "tls-server"),
+			logger.With(logfields.Config, "tls-server"),
 			vp.GetStringSlice(keyTLSRelayClientCAFiles),
 			relayServerCertFile(vp),
 			relayServerKeyFile(vp),
@@ -250,7 +250,7 @@ func runServe(vp *viper.Viper) error {
 	}
 
 	if vp.GetBool(keyPprof) {
-		pprof.Enable(vp.GetString(keyPprofAddress), vp.GetInt(keyPprofPort))
+		pprof.Enable(logger, vp.GetString(keyPprofAddress), vp.GetInt(keyPprofPort))
 	}
 	gopsEnabled := vp.GetBool(keyGops)
 	if gopsEnabled {
@@ -259,12 +259,12 @@ func runServe(vp *viper.Viper) error {
 			Addr:                   addr,
 			ReuseSocketAddrAndPort: true,
 		}); err != nil {
-			return fmt.Errorf("failed to start gops agent: %v", err)
+			return fmt.Errorf("failed to start gops agent: %w", err)
 		}
 	}
 	srv, err := server.New(opts...)
 	if err != nil {
-		return fmt.Errorf("cannot create hubble-relay server: %v", err)
+		return fmt.Errorf("cannot create hubble-relay server: %w", err)
 	}
 	go func() {
 		sigs := make(chan os.Signal, 1)
@@ -314,4 +314,21 @@ func hubbleClientCertFile(vp *viper.Viper) string {
 		return val
 	}
 	return vp.GetString(keyTLSClientCertFile)
+}
+
+var relayVersionHeader = metadata.Pairs(defaults.GRPCMetadataRelayVersionKey, build.RelayVersion.SemVer())
+
+func relayVersionUnaryInterceptor() grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		resp, err := handler(ctx, req)
+		grpc.SetHeader(ctx, relayVersionHeader)
+		return resp, err
+	}
+}
+
+func relayVersionStreamInterceptor() grpc.StreamServerInterceptor {
+	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		ss.SetHeader(relayVersionHeader)
+		return handler(srv, ss)
+	}
 }

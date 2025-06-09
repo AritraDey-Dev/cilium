@@ -4,11 +4,12 @@
 package identitygc
 
 import (
-	"context"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/hivetest"
 	"go.uber.org/goleak"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,9 +19,9 @@ import (
 	"github.com/cilium/cilium/operator/k8s"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
+	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
 )
 
@@ -37,7 +38,7 @@ func TestIdentitiesGC(t *testing.T) {
 
 	hive := hive.New(
 		cell.Config(cmtypes.DefaultClusterInfo),
-		cell.Metric(NewMetrics),
+		metrics.Metric(NewMetrics),
 
 		// provide a fake clientset
 		k8sClient.FakeClientCell,
@@ -59,7 +60,6 @@ func TestIdentitiesGC(t *testing.T) {
 		cell.Provide(func() SharedConfig {
 			return SharedConfig{
 				IdentityAllocationMode: option.IdentityAllocationModeCRD,
-				K8sNamespace:           "",
 			}
 		}),
 
@@ -67,16 +67,16 @@ func TestIdentitiesGC(t *testing.T) {
 		cell.Invoke(func(c k8sClient.Clientset, authClient authIdentity.Provider) error {
 			clientset = c
 			authIdentityClient = authClient
-			if err := setupK8sNodes(clientset); err != nil {
+			if err := setupK8sNodes(t, clientset); err != nil {
 				return err
 			}
-			if err := setupCiliumIdentities(clientset); err != nil {
+			if err := setupCiliumIdentities(t, clientset); err != nil {
 				return err
 			}
-			if err := setupCiliumEndpoint(clientset); err != nil {
+			if err := setupCiliumEndpoint(t, clientset); err != nil {
 				return err
 			}
-			if err := setupAuthIdentities(authIdentityClient); err != nil {
+			if err := setupAuthIdentities(t, authIdentityClient); err != nil {
 				return err
 			}
 
@@ -86,10 +86,10 @@ func TestIdentitiesGC(t *testing.T) {
 		cell.Invoke(registerGC),
 	)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
-	if err := hive.Start(ctx); err != nil {
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, ctx); err != nil {
 		t.Fatalf("failed to start: %s", err)
 	}
 
@@ -97,7 +97,7 @@ func TestIdentitiesGC(t *testing.T) {
 		identities *v2.CiliumIdentityList
 		err        error
 	)
-	for retry := 0; retry < 10; retry++ {
+	for range 10 {
 		identities, err = clientset.CiliumV2().CiliumIdentities().List(
 			ctx,
 			metav1.ListOptions{
@@ -138,12 +138,12 @@ func TestIdentitiesGC(t *testing.T) {
 		t.Fatalf("expected Cilium Auth identity \"99999\", got %q", authIdentities[0])
 	}
 
-	if err := hive.Stop(ctx); err != nil {
+	if err := hive.Stop(tlog, ctx); err != nil {
 		t.Fatalf("failed to stop: %s", err)
 	}
 }
 
-func setupK8sNodes(clientset k8sClient.Clientset) error {
+func setupK8sNodes(t *testing.T, clientset k8sClient.Clientset) error {
 	nodes := []*corev1.Node{
 		{
 			TypeMeta: metav1.TypeMeta{
@@ -168,14 +168,14 @@ func setupK8sNodes(clientset k8sClient.Clientset) error {
 	}
 	for _, node := range nodes {
 		if _, err := clientset.CoreV1().Nodes().
-			Create(context.Background(), node, metav1.CreateOptions{}); err != nil {
+			Create(t.Context(), node, metav1.CreateOptions{}); err != nil {
 			return fmt.Errorf("failed to create node %v: %w", node, err)
 		}
 	}
 	return nil
 }
 
-func setupCiliumIdentities(clientset k8sClient.Clientset) error {
+func setupCiliumIdentities(t *testing.T, clientset k8sClient.Clientset) error {
 	identities := []*v2.CiliumIdentity{
 		{
 			TypeMeta: metav1.TypeMeta{
@@ -204,24 +204,24 @@ func setupCiliumIdentities(clientset k8sClient.Clientset) error {
 	}
 	for _, identity := range identities {
 		if _, err := clientset.CiliumV2().CiliumIdentities().
-			Create(context.Background(), identity, metav1.CreateOptions{}); err != nil {
+			Create(t.Context(), identity, metav1.CreateOptions{}); err != nil {
 			return fmt.Errorf("failed to create identity %v: %w", identity, err)
 		}
 	}
 	return nil
 }
 
-func setupAuthIdentities(client authIdentity.Provider) error {
-	if err := client.Upsert(context.Background(), "88888"); err != nil {
+func setupAuthIdentities(t *testing.T, client authIdentity.Provider) error {
+	if err := client.Upsert(t.Context(), "88888"); err != nil {
 		return err
 	}
-	if err := client.Upsert(context.Background(), "99999"); err != nil {
+	if err := client.Upsert(t.Context(), "99999"); err != nil {
 		return err
 	}
 	return nil
 }
 
-func setupCiliumEndpoint(clientset k8sClient.Clientset) error {
+func setupCiliumEndpoint(t *testing.T, clientset k8sClient.Clientset) error {
 	endpoint := &v2.CiliumEndpoint{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-endpoint",
@@ -233,7 +233,7 @@ func setupCiliumEndpoint(clientset k8sClient.Clientset) error {
 		},
 	}
 	if _, err := clientset.CiliumV2().CiliumEndpoints("").
-		Create(context.Background(), endpoint, metav1.CreateOptions{}); err != nil {
+		Create(t.Context(), endpoint, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("failed to create endpoint %v: %w", endpoint, err)
 	}
 	return nil

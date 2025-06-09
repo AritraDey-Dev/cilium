@@ -239,13 +239,6 @@ identities are prefixed with the string ``reserved:``.
 |                             |            | connections from Ingress proxies.                 |
 +-----------------------------+------------+---------------------------------------------------+
 
-.. note::
-
-   Cilium used to include both the local and all remote hosts in the
-   ``reserved:host`` identity. This is still the default option unless a recent
-   default ConfigMap is used. The remote-node identity can be enabled via
-   the option ``enable-remote-node-identity``.
-
 Well-known Identities
 ---------------------
 
@@ -287,6 +280,8 @@ before*. This allows each cluster node to create the identity relevant subset
 of labels and then query the key-value store to derive the identity. Depending
 on whether the set of labels has been queried before, either a new identity
 will be created, or the identity of the initial query will be returned.
+
+.. _node:
 
 Node
 ====

@@ -7,14 +7,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
+	stdtime "time"
 
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/hive/cell"
 
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/inctimer"
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
+	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/time"
 )
 
@@ -66,7 +68,7 @@ type ControllerParams struct {
 	// resource identifier in order to limit metrics cardinality.
 	Group Group
 
-	HealthReporter cell.HealthReporter
+	Health cell.Health
 
 	// DoFunc is the function that will be run until it succeeds and/or
 	// using the interval RunInterval if not 0.
@@ -186,11 +188,11 @@ type controller struct {
 	group  Group
 	name   string
 	uuid   string
-	logger *logrus.Entry
+	logger *slog.Logger
 
 	// Channels written to and/or closed by the manager
 	stop    chan struct{}
-	update  chan ControllerParams
+	update  chan struct{}
 	trigger chan struct{}
 
 	// terminated is closed by the controller goroutine when it terminates
@@ -205,6 +207,66 @@ type controller struct {
 	lastError         error
 	lastErrorStamp    time.Time
 	lastDuration      time.Duration
+
+	// Manipulated by the Manager, read by the controller.
+	paramMutex   lock.Mutex
+	params       ControllerParams
+	cancelDoFunc context.CancelFunc
+}
+
+func (c *controller) Params() ControllerParams {
+	c.paramMutex.Lock()
+	defer c.paramMutex.Unlock()
+	return c.params
+}
+
+// updateParams sanitizes and sets the controller's parameters.
+//
+// If the RunInterval exceeds ControllerMaxInterval, it will be capped.
+//
+// Manager's mutex must be held; controller.mutex must not be held
+func (c *controller) SetParams(params ControllerParams) {
+	c.paramMutex.Lock()
+	defer c.paramMutex.Unlock()
+
+	// ensure the callbacks are valid
+	if params.DoFunc == nil {
+		params.DoFunc = func(ctx context.Context) error {
+			return undefinedDoFunc(c.name)
+		}
+	}
+	if params.StopFunc == nil {
+		params.StopFunc = NoopFunc
+	}
+
+	// Enforce max controller interval
+	maxInterval := time.Duration(option.Config.MaxControllerInterval) * time.Second
+	if maxInterval > 0 && params.RunInterval > maxInterval {
+		c.logger.Info("Limiting interval",
+			logfields.Interval, maxInterval,
+		)
+		params.RunInterval = maxInterval
+	}
+
+	// Save current context on update if not canceling
+	ctx := c.params.Context
+	// Check if the current context needs to be cancelled
+	if c.params.CancelDoFuncOnUpdate && c.cancelDoFunc != nil {
+		c.cancelDoFunc()
+		c.params.Context = nil
+	}
+
+	// (re)set the context as the previous might have been cancelled
+	if c.params.Context == nil {
+		if params.Context == nil {
+			ctx, c.cancelDoFunc = context.WithCancel(context.Background())
+		} else {
+			ctx, c.cancelDoFunc = context.WithCancel(params.Context)
+		}
+	}
+
+	c.params = params
+	c.params.Context = ctx
 }
 
 // GetSuccessCount returns the number of successful controller runs
@@ -239,15 +301,14 @@ func (c *controller) GetLastErrorTimestamp() time.Time {
 	return c.lastErrorStamp
 }
 
-func (c *controller) runController(params ControllerParams) {
+func (c *controller) runController() {
+	params := c.Params()
 	errorRetries := 1
-
-	runTimer, timerDone := inctimer.New()
-	defer timerDone()
 
 	for {
 		var err error
 
+		params = c.Params()
 		interval := params.RunInterval
 
 		start := time.Now()
@@ -256,7 +317,7 @@ func (c *controller) runController(params ControllerParams) {
 
 		c.mutex.Lock()
 		c.lastDuration = duration
-		c.getLogger().Debug("Controller func execution time: ", c.lastDuration)
+		c.logger.Debug("Controller func executed", logfields.Duration, c.lastDuration)
 
 		if err != nil {
 			if params.Context.Err() != nil {
@@ -265,22 +326,25 @@ func (c *controller) runController(params ControllerParams) {
 				err = NewExitReason("controller context canceled")
 			}
 
-			switch err := err.(type) {
-			case ExitReason:
+			var exitReason ExitReason
+			if errors.As(err, &exitReason) {
 				// This is actually not an error case, but it causes an exit
-				c.recordSuccess(params.HealthReporter)
-				c.lastError = err // This will be shown in the controller status
+				c.recordSuccess(params.Health)
+				c.lastError = exitReason // This will be shown in the controller status
 
 				// Don't exit the goroutine, since that only happens when the
 				// controller is explicitly stopped. Instead, just wait for
 				// the next update.
-				c.getLogger().Debug("Controller run succeeded; waiting for next controller update or stop")
+				c.logger.Debug("Controller run succeeded; waiting for next controller update or stop")
 				interval = time.Duration(math.MaxInt64)
 
-			default:
-				c.getLogger().WithField(fieldConsecutiveErrors, errorRetries).
-					WithError(err).Debug("Controller run failed")
-				c.recordError(err, params.HealthReporter)
+			} else {
+				c.logger.Debug(
+					"Controller run failed",
+					fieldConsecutiveErrors, errorRetries,
+					logfields.Error, err,
+				)
+				c.recordError(err, params.Health)
 
 				if !params.NoErrorRetry {
 					if params.ErrorRetryBaseDuration != time.Duration(0) {
@@ -290,10 +354,11 @@ func (c *controller) runController(params ControllerParams) {
 					}
 
 					if params.MaxRetryInterval > 0 && interval > params.MaxRetryInterval {
-						c.getLogger().WithFields(logrus.Fields{
-							"calculatedInterval": interval,
-							"maxAllowedInterval": params.MaxRetryInterval,
-						}).Debug("Cap retry interval to max allowed value")
+						c.logger.Debug(
+							"Cap retry interval to max allowed value",
+							logfields.CalculatedInterval, interval,
+							logfields.MaxAllowedInterval, params.MaxRetryInterval,
+						)
 						interval = params.MaxRetryInterval
 					}
 
@@ -301,7 +366,7 @@ func (c *controller) runController(params ControllerParams) {
 				}
 			}
 		} else {
-			c.recordSuccess(params.HealthReporter)
+			c.recordSuccess(params.Health)
 
 			// reset error retries after successful attempt
 			errorRetries = 1
@@ -312,7 +377,7 @@ func (c *controller) runController(params ControllerParams) {
 				// Don't exit the goroutine, since that only happens when the
 				// controller is explicitly stopped. Instead, just wait for
 				// the next update.
-				c.getLogger().Debug("Controller run succeeded; waiting for next controller update or stop")
+				c.logger.Debug("Controller run succeeded; waiting for next controller update or stop")
 				interval = time.Duration(math.MaxInt64)
 			}
 		}
@@ -323,9 +388,9 @@ func (c *controller) runController(params ControllerParams) {
 		case <-c.stop:
 			goto shutdown
 
-		case params = <-c.update:
+		case <-c.update:
 			// update channel is never closed
-		case <-runTimer.After(interval):
+		case <-stdtime.After(interval):
 			// timer channel is not yet closed
 		case <-c.trigger:
 			// trigger channel is never closed
@@ -342,36 +407,27 @@ func (c *controller) runController(params ControllerParams) {
 	}
 
 shutdown:
-	c.getLogger().Debug("Shutting down controller")
+	c.logger.Debug("Shutting down controller")
 
 	if err := params.StopFunc(context.TODO()); err != nil {
 		c.mutex.Lock()
-		c.recordError(err, params.HealthReporter)
+		c.recordError(err, params.Health)
 		c.mutex.Unlock()
-		c.getLogger().WithField(fieldConsecutiveErrors, errorRetries).
-			WithError(err).Warn("Error on Controller stop")
+		c.logger.Warn(
+			"Error on Controller stop",
+			fieldConsecutiveErrors, errorRetries,
+			logfields.Error, err,
+		)
 	}
 
 	close(c.terminated)
 }
 
-// logger returns a logrus object with controllerName and UUID fields.
-func (c *controller) getLogger() *logrus.Entry {
-	if c.logger == nil {
-		c.logger = log.WithFields(logrus.Fields{
-			fieldControllerName: c.name,
-			fieldUUID:           c.uuid,
-		})
-	}
-
-	return c.logger
-}
-
 // recordError updates all statistic collection variables on error
 // c.mutex must be held.
-func (c *controller) recordError(err error, hr cell.HealthReporter) {
-	if hr != nil {
-		hr.Degraded(c.name, err)
+func (c *controller) recordError(err error, h cell.Health) {
+	if h != nil {
+		h.Degraded(c.name, err)
 	}
 	c.lastError = err
 	c.lastErrorStamp = time.Now()
@@ -387,9 +443,9 @@ func (c *controller) recordError(err error, hr cell.HealthReporter) {
 
 // recordSuccess updates all statistic collection variables on success
 // c.mutex must be held.
-func (c *controller) recordSuccess(hr cell.HealthReporter) {
-	if hr != nil {
-		hr.OK(c.name)
+func (c *controller) recordSuccess(h cell.Health) {
+	if h != nil {
+		h.OK(c.name)
 	}
 
 	c.lastError = nil

@@ -6,14 +6,30 @@ package common
 import (
 	"crypto/sha256"
 	"errors"
+	"log/slog"
 	"os"
-	"path"
+	"path/filepath"
 	"slices"
 	"strings"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/sirupsen/logrus"
+	"github.com/spf13/pflag"
+
+	"github.com/cilium/cilium/pkg/logging/logfields"
 )
+
+type Config struct {
+	// ClusterMeshConfig is the path to the clustermesh configuration directory.
+	ClusterMeshConfig string
+}
+
+func (def Config) Flags(flags *pflag.FlagSet) {
+	flags.String("clustermesh-config", def.ClusterMeshConfig, "Path to the ClusterMesh configuration directory")
+}
+
+var DefaultConfig = Config{
+	ClusterMeshConfig: "",
+}
 
 // clusterLifecycle is the interface to implement in order to receive cluster
 // configuration lifecycle events. This is implemented by the ClusterMesh.
@@ -25,30 +41,50 @@ type clusterLifecycle interface {
 type fhash [sha256.Size]byte
 
 type configDirectoryWatcher struct {
-	watcher   *fsnotify.Watcher
-	lifecycle clusterLifecycle
-	path      string
-	tracked   map[string]fhash
-	stop      chan struct{}
+	logger *slog.Logger
+	// Use two separate watchers, one for the directory itself, and one for the
+	// individual config files. We need to explicitly watch the config files
+	// to receive a notification when the underlying file gets updated, if the
+	// path points to a symbolic link. Additionally, we need to use two separate
+	// watchers to ensure receiving the remove event when the symbolic link
+	// starts pointing to a different file (hence breaking the existing watcher),
+	// so that we can re-establish it. Indeed, the fsnotify library does no longer
+	// propagate that event when the parent directory is also watched, to prevent
+	// a duplicate event, which doesn't get emitted in this case though.
+	// Related: fsnotify/fsnotify#620
+	watcher    *fsnotify.Watcher
+	cfgWatcher *fsnotify.Watcher
+	lifecycle  clusterLifecycle
+	path       string
+	tracked    map[string]fhash
+	stop       chan struct{}
 }
 
-func createConfigDirectoryWatcher(path string, lifecycle clusterLifecycle) (*configDirectoryWatcher, error) {
+func createConfigDirectoryWatcher(logger *slog.Logger, path string, lifecycle clusterLifecycle) (*configDirectoryWatcher, error) {
 	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, err
+	}
+
+	cfgWatcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
 
 	if err := watcher.Add(path); err != nil {
 		watcher.Close()
+		cfgWatcher.Close()
 		return nil, err
 	}
 
 	return &configDirectoryWatcher{
-		watcher:   watcher,
-		path:      path,
-		tracked:   map[string]fhash{},
-		lifecycle: lifecycle,
-		stop:      make(chan struct{}),
+		logger:     logger,
+		watcher:    watcher,
+		cfgWatcher: cfgWatcher,
+		path:       path,
+		tracked:    map[string]fhash{},
+		lifecycle:  lifecycle,
+		stop:       make(chan struct{}),
 	}, nil
 }
 
@@ -73,20 +109,21 @@ func isEtcdConfigFile(path string) (bool, fhash) {
 }
 
 func (cdw *configDirectoryWatcher) handle(abspath string) {
-	filename := path.Base(abspath)
+	filename := filepath.Base(abspath)
 	isConfig, newHash := isEtcdConfigFile(abspath)
 
 	if !isConfig {
 		// If the corresponding cluster was tracked, then trigger the remove
 		// event, since the configuration file is no longer present/readable
 		if _, tracked := cdw.tracked[filename]; tracked {
-			log.WithFields(logrus.Fields{
-				fieldClusterName: filename,
-				fieldConfig:      abspath,
-			}).Debug("Removed cluster configuration")
+			cdw.logger.Debug(
+				"Removed cluster configuration",
+				fieldClusterName, filename,
+				fieldConfig, abspath,
+			)
 
 			// The remove operation returns an error if the file does no longer exists.
-			_ = cdw.watcher.Remove(abspath)
+			_ = cdw.cfgWatcher.Remove(abspath)
 			delete(cdw.tracked, filename)
 			cdw.lifecycle.remove(filename)
 		}
@@ -94,14 +131,17 @@ func (cdw *configDirectoryWatcher) handle(abspath string) {
 		return
 	}
 
-	if !slices.Contains(cdw.watcher.WatchList(), abspath) {
+	if !slices.Contains(cdw.cfgWatcher.WatchList(), abspath) {
 		// Start watching explicitly the file. This allows to receive a notification
 		// when the underlying file gets updated, if path points to a symbolic link.
 		// This is required to correctly detect file modifications when the folder
 		// is mounted from a Kubernetes ConfigMap/Secret.
-		if err := cdw.watcher.Add(abspath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			log.WithError(err).WithField(fieldConfig, abspath).
-				Warning("Failed adding explicit path watch for config")
+		if err := cdw.cfgWatcher.Add(abspath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			cdw.logger.Warn(
+				"Failed adding explicit path watch for config",
+				logfields.Error, err,
+				fieldConfig, abspath,
+			)
 		} else {
 			// There is a small chance that the file content changed in the time
 			// window from reading it at the beginning of the function to establishing
@@ -112,6 +152,7 @@ func (cdw *configDirectoryWatcher) handle(abspath string) {
 			// watcher (except for NotFound) to prevent an infinite loop if
 			// something wrong happened.
 			cdw.handle(abspath)
+			return
 		}
 	}
 
@@ -122,17 +163,21 @@ func (cdw *configDirectoryWatcher) handle(abspath string) {
 		return
 	}
 
-	log.WithFields(logrus.Fields{
-		fieldClusterName: filename,
-		fieldConfig:      abspath,
-	}).Debug("Added or updated cluster configuration")
+	cdw.logger.Debug(
+		"Added or updated cluster configuration",
+		fieldClusterName, filename,
+		fieldConfig, abspath,
+	)
 
 	cdw.tracked[filename] = newHash
 	cdw.lifecycle.add(filename, abspath)
 }
 
 func (cdw *configDirectoryWatcher) watch() error {
-	log.WithField(fieldConfigDir, cdw.path).Debug("Starting config directory watcher")
+	cdw.logger.Debug(
+		"Starting config directory watcher",
+		fieldConfigDir, cdw.path,
+	)
 
 	files, err := os.ReadDir(cdw.path)
 	if err != nil {
@@ -144,7 +189,7 @@ func (cdw *configDirectoryWatcher) watch() error {
 			continue
 		}
 
-		absolutePath := path.Join(cdw.path, f.Name())
+		absolutePath := filepath.Join(cdw.path, f.Name())
 		cdw.handle(absolutePath)
 	}
 
@@ -153,18 +198,36 @@ func (cdw *configDirectoryWatcher) watch() error {
 }
 
 func (cdw *configDirectoryWatcher) loop() {
+	handle := func(event fsnotify.Event) {
+		cdw.logger.Debug(
+			"Received fsnotify event",
+			fieldConfigDir, cdw.path,
+			fieldEvent, event,
+		)
+		cdw.handle(event.Name)
+	}
+
 	for {
 		select {
 		case event := <-cdw.watcher.Events:
-			log.WithFields(logrus.Fields{
-				fieldConfigDir: cdw.path,
-				fieldEvent:     event,
-			}).Debug("Received fsnotify event")
-			cdw.handle(event.Name)
+			handle(event)
+
+		case event := <-cdw.cfgWatcher.Events:
+			handle(event)
 
 		case err := <-cdw.watcher.Errors:
-			log.WithError(err).WithField(fieldConfigDir, cdw.path).
-				Warning("Error encountered while watching directory with fsnotify")
+			cdw.logger.Warn(
+				"Error encountered while watching directory with fsnotify",
+				logfields.Error, err,
+				fieldConfigDir, cdw.path,
+			)
+
+		case err := <-cdw.cfgWatcher.Errors:
+			cdw.logger.Warn(
+				"Error encountered while watching individual configuration with fsnotify",
+				logfields.Error, err,
+				fieldConfigDir, cdw.path,
+			)
 
 		case <-cdw.stop:
 			return
@@ -173,7 +236,30 @@ func (cdw *configDirectoryWatcher) loop() {
 }
 
 func (cdw *configDirectoryWatcher) close() {
-	log.WithField(fieldConfigDir, cdw.path).Debug("Stopping config directory watcher")
+	cdw.logger.Debug(
+		"Stopping config directory watcher",
+		fieldConfigDir, cdw.path,
+	)
 	close(cdw.stop)
 	cdw.watcher.Close()
+	cdw.cfgWatcher.Close()
+}
+
+// ConfigFiles returns the list of configuration files in the given path. It
+// shall be used by CLI tools only, as it doesn't handle subsequent updates.
+func ConfigFiles(cfgdir string) (configs map[string]string, err error) {
+	files, err := os.ReadDir(cfgdir)
+	if err != nil {
+		return nil, err
+	}
+
+	configs = make(map[string]string)
+	for _, f := range files {
+		cfgfile := filepath.Join(cfgdir, f.Name())
+		if ok, _ := isEtcdConfigFile(cfgfile); ok {
+			configs[f.Name()] = cfgfile
+		}
+	}
+
+	return configs, nil
 }

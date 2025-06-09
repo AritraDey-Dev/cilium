@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
 
-#include "common.h"
-
 #include <bpf/ctx/skb.h>
+#include "common.h"
 #include "pktgen.h"
-
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
 
 /* Enable code paths under test */
 #define ENABLE_IPV6
@@ -83,7 +79,7 @@ int lxc_no_backend_setup(struct __ctx_buff *ctx)
 
 	memcpy(frontend_ip.addr, (void *)FRONTEND_IP, 16);
 
-	lb_v6_add_service(&frontend_ip, FRONTEND_PORT, 1, revnat_id);
+	lb_v6_add_service(&frontend_ip, FRONTEND_PORT, IPPROTO_TCP, 1, revnat_id);
 
 	union v6addr backend_ip = {};
 
@@ -92,7 +88,7 @@ int lxc_no_backend_setup(struct __ctx_buff *ctx)
 	ipcache_v6_add_entry(&backend_ip, 0, 112233, 0, 0);
 
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, FROM_CONTAINER);
+	tail_call_static(ctx, entry_call_map, FROM_CONTAINER);
 
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
@@ -147,7 +143,7 @@ int lxc_no_backend_check(__maybe_unused const struct __ctx_buff *ctx)
 	 * context with the runner option and importing the packet into
 	 * wireshark
 	 */
-	assert(l4->icmp6_cksum == bpf_htons(0x7da8));
+	assert(l4->icmp6_cksum == bpf_htons(0x9e14));
 
 	test_finish();
 }

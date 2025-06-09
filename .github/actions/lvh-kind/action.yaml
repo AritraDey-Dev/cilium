@@ -4,42 +4,57 @@ description: Creates K8s cluster inside LVH VM, and then exposes K8s cluster to 
 inputs:
   kernel:
     required: true
-    type: string
+    description: 'Linux kernel version'
   kind-params:
     required: true
-    type: string
-  kind-image-vsn:
-    type: string
+    description: 'Kind parameters'
+  kind-image:
+    required: true
+    description: 'Kind image'
+  kind-config:
+    required: false
+    description: 'Optional Kind configuration'
+  port-forward:
+    required: false
+    description: 'Optional list of ports to forward'
+    default: '6443:6443'
   test-name:
     required: true
-    type: string
+    description: 'Test name'
 
 runs:
   using: composite
   steps:
     - name: Provision LVH VMs
-      uses: cilium/little-vm-helper@8410a93e544b7e180a2365e5fdab0724a39bc02a # v0.0.13
+      uses: cilium/little-vm-helper@e87948476ca97050b1f149ab2aec379d0de19b84 # v0.0.23
       with:
         test-name: ${{ inputs.test-name }}
         image-version: ${{ inputs.kernel }}
+        images-folder-parent: "/tmp"
         host-mount: ./
         cpu: 4
         mem: 12G
+        # renovate: datasource=github-tags depName=cilium/little-vm-helper
+        lvh-version: "v0.0.23"
         install-dependencies: 'true'
-        port-forward: '6443:6443'
+        port-forward: ${{ inputs.port-forward }}
+        ssh-connect-wait-retries: 600
         cmd: |
           git config --global --add safe.directory /host
 
     - name: Create K8s cluster
-      uses: cilium/little-vm-helper@8410a93e544b7e180a2365e5fdab0724a39bc02a # v0.0.13
+      uses: cilium/little-vm-helper@e87948476ca97050b1f149ab2aec379d0de19b84 # v0.0.23
       with:
         provision: 'false'
         cmd: |
           cd /host
-          if [ "${{ inputs.kind-image-vsn }}" != "" ]; then
-            export IMAGE=quay.io/cilium/kindest-node:${{ inputs.kind-image-vsn }}
+          export IMAGE=${{ inputs.kind-image }}
+
+          if [ "${{ inputs.kind-config }}" != "" ]; then
+            kind create cluster --config ${{ inputs.kind-config }}
+          else
+            ./contrib/scripts/kind.sh ${{ inputs.kind-params }} 0.0.0.0 6443
           fi
-          ./contrib/scripts/kind.sh ${{ inputs.kind-params }} 0.0.0.0 6443
 
     - name: Copy kubeconfig
       shell: bash

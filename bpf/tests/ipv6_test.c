@@ -1,35 +1,13 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
 
-#include "common.h"
-
 #include <bpf/ctx/xdp.h>
-
+#include "common.h"
 #include "pktgen.h"
-#include "node_config.h"
+#include <bpf/config/node.h>
 
 #include "lib/common.h"
 #include "lib/ipv6.h"
-#include "lib/maps.h"
-
-static __be32 *dummy_map;
-static __be32 match_dummy_prefix(__maybe_unused const void *map, __be32 addr,
-				 __u32 prefix)
-{
-	return (addr & GET_PREFIX(prefix)) == *dummy_map;
-}
-
-#define PREFIX32 32,
-#define PREFIX31 31,
-#define PREFIX22 22,
-#define PREFIX11 11,
-#define PREFIX0  0,
-
-LPM_LOOKUP_FN(lpm4_lookup32, __be32, PREFIX32, dummy_map, match_dummy_prefix)
-LPM_LOOKUP_FN(lpm4_lookup31, __be32, PREFIX31, dummy_map, match_dummy_prefix)
-LPM_LOOKUP_FN(lpm4_lookup22, __be32, PREFIX22, dummy_map, match_dummy_prefix)
-LPM_LOOKUP_FN(lpm4_lookup11, __be32, PREFIX11, dummy_map, match_dummy_prefix)
-LPM_LOOKUP_FN(lpm4_lookup0, __be32, PREFIX0, dummy_map, match_dummy_prefix)
 
 PKTGEN("xdp", "ipv6_without_extension_header")
 int ipv6_without_extension_header_pktgen(struct __ctx_buff *ctx)
@@ -251,32 +229,50 @@ int bpf_test(__maybe_unused struct xdp_md *ctx)
 		assert(bpf_ntohl(v6.p4) == 0x00000000);
 	});
 
-	TEST("test_lpm_lookup", {
-		__be32 addr;
+	test_finish();
+}
 
-		dummy_map = &addr;
+CHECK("tc", "test_ipv6_mc_helpers")
+int test_ipv6_mc_helpers(__maybe_unused struct __ctx_buff *ctx)
+{
+	union macaddr mac = {{0}};
+	union v6addr addr = {{0}};
 
-		addr = bpf_htonl(0xFFFFFFFF);
-		assert(__lpm4_lookup32(bpf_htonl(0xFFFFFFFF)));
-		assert(!__lpm4_lookup32(bpf_htonl(0xFFF00000)));
-		addr = bpf_htonl(0xFFFFFFFE);
-		assert(__lpm4_lookup31(bpf_htonl(0xFFFFFFFE)));
-		assert(__lpm4_lookup31(bpf_htonl(0xFFFFFFFF)));
-		assert(!__lpm4_lookup31(bpf_htonl(0xFFF00000)));
-		addr = bpf_htonl(0xFFFFFC00);
-		assert(__lpm4_lookup22(bpf_htonl(0xFFFFFC00)));
-		assert(__lpm4_lookup22(bpf_htonl(0xFFFFFFFF)));
-		assert(!__lpm4_lookup22(bpf_htonl(0xFFF00000)));
-		addr = bpf_htonl(0xFFE00000);
-		assert(__lpm4_lookup11(bpf_htonl(0xFFE00000)));
-		assert(__lpm4_lookup11(bpf_htonl(0xFFFFFFFF)));
-		assert(__lpm4_lookup11(bpf_htonl(0xFFF00000)));
-		addr = bpf_htonl(0xF0000000);
-		assert(__lpm4_lookup11(bpf_htonl(0xF0000000)));
-		addr = bpf_htonl(0x00000000);
-		assert(__lpm4_lookup0(addr));
-		assert(__lpm4_lookup0(bpf_htonl(0xFFFFFFFF)));
-	});
+	test_init();
+
+	/* IPv6 mcast mac addr is 33:33 followed by 32 LSBs from target IP */
+	ipv6_mc_mac_set((union v6addr *)&v6_pod_one, &mac);
+	assert(mac.addr[0] == 0x33);
+	assert(mac.addr[1] == 0x33);
+	assert(mac.addr[2] == v6_pod_one[12]);
+	assert(mac.addr[3] == v6_pod_one[13]);
+	assert(mac.addr[4] == v6_pod_one[14]);
+	assert(mac.addr[5] == v6_pod_one[15]);
+	assert(ipv6_is_mc_mac((union v6addr *)&v6_pod_one, &mac));
+	mac.addr[5] += 0x1;
+	assert(!ipv6_is_mc_mac((union v6addr *)&v6_pod_one, &mac));
+
+	/*
+	 * IPv6 mcast addr is ff02::1:ffXX:XXXX where XX:XXXX are 24 LSBs from
+	 * the target IP
+	 */
+	ipv6_mc_addr_set((union v6addr *)&v6_pod_one, &addr);
+	assert(addr.addr[0] == 0xFF);
+	assert(addr.addr[1] == 0x02);
+	assert(addr.addr[2] == 0x00);
+	assert(addr.addr[3] == 0x00);
+	assert(addr.addr[4] == 0x00);
+	assert(addr.addr[5] == 0x00);
+	assert(addr.addr[6] == 0x00);
+	assert(addr.addr[7] == 0x00);
+	assert(addr.addr[8] == 0x00);
+	assert(addr.addr[9] == 0x00);
+	assert(addr.addr[10] == 0x00);
+	assert(addr.addr[11] == 0x01);
+	assert(addr.addr[12] == 0xFF);
+	assert(addr.addr[13] == v6_pod_one[13]);
+	assert(addr.addr[14] == v6_pod_one[14]);
+	assert(addr.addr[15] == v6_pod_one[15]);
 
 	test_finish();
 }

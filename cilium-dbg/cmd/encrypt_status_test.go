@@ -4,21 +4,20 @@
 package cmd
 
 import (
-	. "github.com/cilium/checkmate"
+	"testing"
+
+	"github.com/stretchr/testify/require"
 )
-
-type EncryptStatusSuite struct{}
-
-var _ = Suite(&EncryptStatusSuite{})
 
 const procTestFixtures = "fixtures/proc"
 
-func (s *EncryptStatusSuite) TestGetXfrmStats(c *C) {
-	errCount, m := getXfrmStats(procTestFixtures)
-	currentCount := 0
+func TestGetXfrmStats(t *testing.T) {
+	errCount, m, err := getXfrmStats(procTestFixtures)
+	require.NoError(t, err)
+	currentCount := int64(0)
 	testCases := []struct {
 		name string
-		want int
+		want int64
 	}{
 		{name: "XfrmInError", want: 2},
 		{name: "XfrmInBufferError", want: 0},
@@ -51,13 +50,13 @@ func (s *EncryptStatusSuite) TestGetXfrmStats(c *C) {
 	}
 	for _, test := range testCases {
 		got := m[test.name]
-		c.Assert(test.want, Equals, got)
+		require.Equal(t, test.want, got)
 		currentCount += got
 	}
-	c.Assert(currentCount, Equals, errCount)
+	require.Equal(t, errCount, currentCount)
 }
 
-func (s *EncryptStatusSuite) TestExtractMaxSequenceNumber(c *C) {
+func TestExtractMaxSequenceNumber(t *testing.T) {
 	ipOutput := `src 10.84.1.32 dst 10.84.0.30
 	proto esp spi 0x00000003 reqid 1 mode tunnel
 	replay-window 0
@@ -80,12 +79,13 @@ src 10.84.1.32 dst 10.84.2.145
 	anti-replay context: seq 0x0, oseq 0x13e0, bitmap 0x00000000
 	sel src 0.0.0.0/0 dst 0.0.0.0/0`
 
-	maxSeqNumber := extractMaxSequenceNumber(ipOutput)
-	c.Assert(maxSeqNumber, Equals, int64(0x1410))
+	maxSeqNumber, err := extractMaxSequenceNumber(ipOutput)
+	require.NoError(t, err)
+	require.Equal(t, int64(0x1410), maxSeqNumber)
 }
 
 // Attempt to simulate a case where the output would be interrupted mid-sentence.
-func (s *EncryptStatusSuite) TestExtractMaxSequenceNumberError(c *C) {
+func TestExtractMaxSequenceNumberError(t *testing.T) {
 	ipOutput := `src 10.84.1.32 dst 10.84.0.30
 	proto esp spi 0x00000003 reqid 1 mode tunnel
 	replay-window 0
@@ -93,6 +93,7 @@ func (s *EncryptStatusSuite) TestExtractMaxSequenceNumberError(c *C) {
 	aead rfc4106(gcm(aes)) 0x64ad37a9d8a8f20fb2e74ef6000f9d580898719f 128
 	anti-replay context: seq 0x0, oseq 0x`
 
-	maxSeqNumber := extractMaxSequenceNumber(ipOutput)
-	c.Assert(maxSeqNumber, Equals, int64(0))
+	maxSeqNumber, err := extractMaxSequenceNumber(ipOutput)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), maxSeqNumber)
 }

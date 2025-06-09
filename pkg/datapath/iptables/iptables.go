@@ -7,36 +7,41 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/blang/semver/v4"
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
+	"github.com/cilium/statedb"
 	"github.com/mattn/go-shellwords"
-	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
+	"k8s.io/utils/clock"
 
-	"github.com/cilium/cilium/pkg/backoff"
+	"github.com/cilium/cilium/daemon/cmd/cni"
 	"github.com/cilium/cilium/pkg/byteorder"
 	"github.com/cilium/cilium/pkg/cidr"
 	"github.com/cilium/cilium/pkg/command/exec"
+	"github.com/cilium/cilium/pkg/datapath/iptables/ipset"
 	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
-	"github.com/cilium/cilium/pkg/datapath/linux/modules"
 	"github.com/cilium/cilium/pkg/datapath/linux/route"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
+	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
+	"github.com/cilium/cilium/pkg/datapath/tables"
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/fqdn/proxy/ipfamily"
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/ip"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	lb "github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/node"
-	"github.com/cilium/cilium/pkg/sysctl"
+	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/versioncheck"
 )
@@ -55,8 +60,6 @@ const (
 	ciliumForwardChain    = "CILIUM_FORWARD"
 	feederDescription     = "cilium-feeder:"
 	xfrmDescription       = "cilium-xfrm-notrack:"
-	ciliumNodeIpsetV4     = "cilium_node_set_v4"
-	ciliumNodeIpsetV6     = "cilium_node_set_v6"
 )
 
 // Minimum iptables versions supporting the -w and -w<seconds> flags
@@ -81,22 +84,31 @@ const (
 	waitString = "-w"
 )
 
-type iptablesInterface interface {
-	getProg() string
-	getIpset() string
-	getVersion() (semver.Version, error)
+type runnable interface {
 	runProgOutput(args []string) (string, error)
 	runProg(args []string) error
 }
 
+type iptablesInterface interface {
+	runnable
+
+	getProg() string
+	getIpset() string
+}
+
 type ipt struct {
+	logger   *slog.Logger
 	prog     string
 	ipset    string
 	waitArgs []string
 }
 
-func (ipt *ipt) initArgs(waitSeconds int) {
-	v, err := ipt.getVersion()
+func (ipt *ipt) initLogger(logger *slog.Logger) {
+	ipt.logger = logger
+}
+
+func (ipt *ipt) initArgs(ctx context.Context, waitSeconds int) {
+	v, err := ipt.getVersion(ctx)
 	if err == nil {
 		switch {
 		case isWaitSecondsMinVersion(v):
@@ -109,9 +121,8 @@ func (ipt *ipt) initArgs(waitSeconds int) {
 
 // package name is iptables so we use ip4tables internally for "iptables"
 var (
-	ip4tables = &ipt{prog: "iptables", ipset: ciliumNodeIpsetV4}
-	ip6tables = &ipt{prog: "ip6tables", ipset: ciliumNodeIpsetV6}
-	ipset     = &ipt{prog: "ipset"}
+	ip4tables = &ipt{prog: "iptables", ipset: ipset.CiliumNodeIPSetV4}
+	ip6tables = &ipt{prog: "ip6tables", ipset: ipset.CiliumNodeIPSetV6}
 )
 
 func (ipt *ipt) getProg() string {
@@ -122,8 +133,8 @@ func (ipt *ipt) getIpset() string {
 	return ipt.ipset
 }
 
-func (ipt *ipt) getVersion() (semver.Version, error) {
-	b, err := exec.WithTimeout(defaults.ExecTimeout, ipt.prog, "--version").CombinedOutput(log, false)
+func (ipt *ipt) getVersion(ctx context.Context) (semver.Version, error) {
+	b, err := exec.CommandContext(ctx, ipt.prog, "--version").CombinedOutput(ipt.logger, false)
 	if err != nil {
 		return semver.Version{}, err
 	}
@@ -138,13 +149,13 @@ func (ipt *ipt) getVersion() (semver.Version, error) {
 func (ipt *ipt) runProgOutput(args []string) (string, error) {
 	fullCommand := fmt.Sprintf("%s %s", ipt.getProg(), strings.Join(args, " "))
 
-	log.Debugf("Running '%s' command", fullCommand)
+	ipt.logger.Debug("Running command", logfields.Cmd, fullCommand)
 
 	// Add wait argument to deal with concurrent calls that would fail otherwise
 	iptArgs := make([]string, 0, len(ipt.waitArgs)+len(args))
 	iptArgs = append(iptArgs, ipt.waitArgs...)
 	iptArgs = append(iptArgs, args...)
-	out, err := exec.WithTimeout(defaults.ExecTimeout, ipt.prog, iptArgs...).Output(log, false)
+	out, err := exec.WithTimeout(defaults.ExecTimeout, ipt.prog, iptArgs...).Output(ipt.logger, false)
 
 	if err != nil {
 		return "", fmt.Errorf("unable to run '%s' iptables command: %w", fullCommand, err)
@@ -155,12 +166,6 @@ func (ipt *ipt) runProgOutput(args []string) (string, error) {
 func (ipt *ipt) runProg(args []string) error {
 	_, err := ipt.runProgOutput(args)
 	return err
-}
-
-// skipPodTrafficConntrack returns true if it's possible to install iptables
-// `-j CT --notrack` rules to skip tracking pod traffic.
-func skipPodTrafficConntrack(ipv6, installNoConntrackIptRules bool) bool {
-	return !ipv6 && installNoConntrackIptRules
 }
 
 func reverseRule(rule string) ([]string, error) {
@@ -199,7 +204,7 @@ func isDisabledChain(disableIptablesFeederRules []string, chain string) bool {
 	return false
 }
 
-func (m *Manager) removeCiliumRules(table string, prog iptablesInterface, match string) error {
+func (m *Manager) removeCiliumRules(table string, prog runnable, match string) error {
 	rules, err := prog.runProgOutput([]string{"-t", table, "-S"})
 	if err != nil {
 		return err
@@ -217,28 +222,24 @@ func (m *Manager) removeCiliumRules(table string, prog iptablesInterface, match 
 			continue
 		}
 
-		// Temporary fix while Iptables is upgraded to >= 1.8.5
-		// (See GH-20884).
-		//
-		// The version currently shipped with Cilium (1.8.4) does not
-		// support the deletion of NOTRACK rules, so we will just ignore
-		// them here and let the agent remove them when it deletes the
-		// entire chain.
-		if strings.Contains(rule, "-j NOTRACK") {
-			continue
-		}
-
 		// do not remove feeder for chains that are set to be disabled
 		// ie catch the beginning of the rule like -A POSTROUTING to match it against
 		// disabled chains
 		if skip, disabledChain := ruleReferencesDisabledChain(m.cfg.DisableIptablesFeederRules, rule); skip {
-			log.WithField(logfields.Chain, disabledChain).Info("Skipping the removal of feeder chain")
+			m.logger.Info(
+				"Skipping the removal of feeder chain",
+				logfields.Chain, disabledChain,
+			)
 			continue
 		}
 
 		reversedRule, err := reverseRule(rule)
 		if err != nil {
-			log.WithError(err).WithField(logfields.Object, rule).Warnf("Unable to parse %s rule into slice. Leaving rule behind.", prog)
+			m.logger.Warn(
+				"Unable to parse rule into slice. Leaving rule behind.",
+				logfields.Error, err,
+				logfields.Prog, prog,
+			)
 			continue
 		}
 
@@ -255,79 +256,167 @@ func (m *Manager) removeCiliumRules(table string, prog iptablesInterface, match 
 
 // Manager manages the iptables-related configuration for Cilium.
 type Manager struct {
-	logger     logrus.FieldLogger
-	modulesMgr *modules.Manager
-	cfg        Config
-	sharedCfg  SharedConfig
+	logger *slog.Logger
+	// This lock ensures there are no concurrent executions of the doInstallRules() and
+	// GetProxyPort() methods.
+	lock lock.Mutex
 
-	// This lock ensures there are no concurrent executions of the InstallRules() and
-	// InstallProxyRules() methods, as otherwise we may end up with errors (as rules may have
-	// been already removed or installed by a different execution of the method) or with an
-	// inconsistent ruleset
-	lock.Mutex
+	sysctl sysctl.Sysctl
+
+	cfg       Config
+	sharedCfg SharedConfig
+
+	argsInit  *lock.StoppableWaitGroup
+	startDone lock.DoneFunc
+
+	// anything that can trigger a reconciliation
+	reconcilerParams reconcilerParams
 
 	haveIp6tables        bool
 	haveSocketMatch      bool
 	haveBPFSocketAssign  bool
 	ipEarlyDemuxDisabled bool
-	CNIChainingMode      string
+	cniConfigManager     cni.CNIConfigManager
+}
+
+type reconcilerParams struct {
+	clock          clock.WithTicker
+	localNodeStore *node.LocalNodeStore
+	db             *statedb.DB
+	devices        statedb.Table[*tables.Device]
+	proxies        chan reconciliationRequest[proxyInfo]
+	addNoTrackPod  chan reconciliationRequest[noTrackPodInfo]
+	delNoTrackPod  chan reconciliationRequest[noTrackPodInfo]
 }
 
 type params struct {
 	cell.In
 
-	Logger    logrus.FieldLogger
-	Lifecycle hive.Lifecycle
+	Logger    *slog.Logger
+	Lifecycle cell.Lifecycle
 
-	ModulesMgr *modules.Manager
+	Sysctl           sysctl.Sysctl
+	CNIConfigManager cni.CNIConfigManager
+	LocalNodeStore   *node.LocalNodeStore
 
 	Cfg       Config
 	SharedCfg SharedConfig
+
+	JobGroup job.Group
+	DB       *statedb.DB
+	Devices  statedb.Table[*tables.Device]
 }
 
-func newIptablesManager(p params) *Manager {
+func newIptablesManager(p params) datapath.IptablesManager {
 	iptMgr := &Manager{
-		logger:        p.Logger,
-		modulesMgr:    p.ModulesMgr,
-		cfg:           p.Cfg,
-		sharedCfg:     p.SharedCfg,
-		haveIp6tables: true,
+		logger:    p.Logger,
+		sysctl:    p.Sysctl,
+		cfg:       p.Cfg,
+		sharedCfg: p.SharedCfg,
+		argsInit:  lock.NewStoppableWaitGroup(),
+		reconcilerParams: reconcilerParams{
+			clock:          clock.RealClock{},
+			localNodeStore: p.LocalNodeStore,
+			db:             p.DB,
+			devices:        p.Devices,
+			proxies:        make(chan reconciliationRequest[proxyInfo]),
+			addNoTrackPod:  make(chan reconciliationRequest[noTrackPodInfo]),
+			delNoTrackPod:  make(chan reconciliationRequest[noTrackPodInfo]),
+		},
+		haveIp6tables:    true,
+		cniConfigManager: p.CNIConfigManager,
 	}
 
+	// init iptables/ip6tables wait arguments before using them in the reconciler or in the manager (e.g: GetProxyPorts)
+	initDone := iptMgr.argsInit.Add()
+	p.Lifecycle.Append(cell.Hook{
+		OnStart: func(ctx cell.HookContext) error {
+			defer initDone()
+			ip4tables.initLogger(p.Logger)
+			ip6tables.initLogger(p.Logger)
+
+			ip4tables.initArgs(ctx, int(p.Cfg.IPTablesLockTimeout/time.Second))
+			if p.SharedCfg.EnableIPv6 {
+				ip6tables.initArgs(ctx, int(p.Cfg.IPTablesLockTimeout/time.Second))
+			}
+			return nil
+		},
+	})
+
+	// init haveIp6tables argument before using it in a reconciliation loop
+	iptMgr.startDone = iptMgr.argsInit.Add()
+
+	p.JobGroup.Add(
+		job.OneShot("iptables-reconciliation-loop", func(ctx context.Context, health cell.Health) error {
+			// each job runs in an independent goroutine, so we need to explicitly wait for both
+			// ip{4,6}tables and haveIp6tables initialization before starting the reconciler.
+			iptMgr.argsInit.Stop()
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-iptMgr.argsInit.WaitChannel():
+			}
+			return reconciliationLoop(
+				ctx, p.Logger, health,
+				iptMgr.sharedCfg.InstallIptRules, &iptMgr.reconcilerParams,
+				iptMgr.doInstallRules,
+				iptMgr.doInstallProxyRules,
+				iptMgr.installNoTrackRules,
+				iptMgr.removeNoTrackRules,
+			)
+		}),
+	)
+
+	// Add the manager after the reconciler, otherwise there is a deadlock on shutdown
+	// between closing and draining the channels.
 	p.Lifecycle.Append(iptMgr)
 
 	return iptMgr
 }
 
 // Start initializes the iptables manager and checks for iptables kernel modules availability.
-func (m *Manager) Start(ctx hive.HookContext) error {
+func (m *Manager) Start(ctx cell.HookContext) error {
+	defer m.startDone()
+
 	if os.Getenv("CILIUM_PREPEND_IPTABLES_CHAIN") != "" {
-		m.logger.Warning("CILIUM_PREPEND_IPTABLES_CHAIN env var has been deprecated. Please use 'CILIUM_PREPEND_IPTABLES_CHAINS' " +
+		m.logger.Warn("CILIUM_PREPEND_IPTABLES_CHAIN env var has been deprecated. Please use 'CILIUM_PREPEND_IPTABLES_CHAINS' " +
 			"env var or '--prepend-iptables-chains' command line flag instead")
 	}
 
-	if err := enableIPForwarding(m.sharedCfg.EnableIPv6); err != nil {
-		m.logger.WithError(err).Warning("enabling IP forwarding via sysctl failed")
+	if err := enableIPForwarding(m.sysctl, m.sharedCfg.EnableIPv6); err != nil {
+		m.logger.Warn("enabling IP forwarding via sysctl failed", logfields.Error, err)
 	}
 
-	if err := m.modulesMgr.FindOrLoadModules(
-		"ip_tables", "iptable_nat", "iptable_mangle", "iptable_raw", "iptable_filter",
-	); err != nil {
-		m.logger.WithError(err).Warning(
-			"iptables modules could not be initialized. It probably means that iptables is not available on this system")
+	if m.sharedCfg.EnableIPSec && m.sharedCfg.EnableL7Proxy {
+		m.disableIPEarlyDemux()
 	}
 
-	if err := m.modulesMgr.FindOrLoadModules(
-		"ip6_tables", "ip6table_mangle", "ip6table_raw", "ip6table_filter",
-	); err != nil {
-		if m.sharedCfg.EnableIPv6 {
-			return fmt.Errorf(
-				"IPv6 is enabled and ip6tables modules initialization failed: %w "+
-					"(try disabling IPv6 in Cilium or loading ip6_tables, ip6table_mangle, ip6table_raw and ip6table_filter kernel modules)", err)
+	for _, table := range []string{"nat", "mangle", "raw", "filter"} {
+		if err := ip4tables.runProg([]string{"-t", table, "-L", "-n"}); err != nil {
+			if m.sharedCfg.InstallIptRules {
+				m.logger.Warn("iptables table is not available on this system",
+					logfields.Error, err,
+					logfields.Table, table,
+				)
+			}
 		}
-		m.logger.WithError(err).Debug(
-			"ip6tables kernel modules could not be loaded, so IPv6 cannot be used")
-		m.haveIp6tables = false
+	}
+
+	for _, table := range []string{"mangle", "raw", "filter"} {
+		if err := ip6tables.runProg([]string{"-t", table, "-L", "-n"}); err != nil {
+			if m.sharedCfg.InstallIptRules {
+				m.logger.Debug("ip6tables table is not available on this system",
+					logfields.Error, err,
+					logfields.Table, table,
+				)
+			}
+			m.haveIp6tables = false
+		}
+	}
+	if !m.haveIp6tables {
+		if m.sharedCfg.EnableIPv6 {
+			return fmt.Errorf("IPv6 is enabled, but the needed ip6tables tables are unavailable (try disabling IPv6 in Cilium or installing ip6tables and kernel modules: ip6_tables, ip6table_mangle, ip6table_raw, ip6table_filter)")
+		}
 	} else {
 		ipv6Disabled, err := os.ReadFile("/sys/module/ipv6/parameters/disable")
 		if err != nil {
@@ -335,8 +424,10 @@ func (m *Manager) Start(ctx hive.HookContext) error {
 				return fmt.Errorf(
 					"IPv6 is enabled but IPv6 kernel support probing failed with: %w", err)
 			}
-			m.logger.WithError(err).Warning(
-				"Unable to read /sys/module/ipv6/parameters/disable, disabling IPv6 iptables support")
+			m.logger.Warn(
+				"Unable to read /sys/module/ipv6/parameters/disable, disabling IPv6 iptables support",
+				logfields.Error, err,
+			)
 			m.haveIp6tables = false
 		} else if strings.TrimSuffix(string(ipv6Disabled), "\n") == "1" {
 			m.logger.Debug(
@@ -345,7 +436,10 @@ func (m *Manager) Start(ctx hive.HookContext) error {
 		}
 	}
 
-	if err := m.modulesMgr.FindOrLoadModules("xt_socket"); err != nil {
+	if err := ip4tables.runProg([]string{"-t", "mangle", "-L", "-m", "socket", "-n"}); err != nil {
+		if m.sharedCfg.InstallIptRules {
+			m.logger.Warn("iptables match socket is not available (try installing xt_socket kernel module)", logfields.Error, err)
+		}
 		if !m.sharedCfg.TunnelingEnabled {
 			// xt_socket module is needed to circumvent an explicit drop in ip_forward()
 			// logic for packets for which a local socket is found by ip early
@@ -362,17 +456,8 @@ func (m *Manager) Start(ctx hive.HookContext) error {
 			// We would not need the xt_socket at all if the datapath universally would
 			// set the "to proxy" skb mark bits on before the packet hits policy routing
 			// stage. Currently this is not true for endpoint routing modes.
-			m.logger.WithError(err).Warning("xt_socket kernel module could not be loaded")
-
 			if m.sharedCfg.EnableXTSocketFallback {
-				disabled := sysctl.Disable("net.ipv4.ip_early_demux") == nil
-
-				if disabled {
-					m.ipEarlyDemuxDisabled = true
-					m.logger.Warning("Disabled ip_early_demux to allow proxy redirection with original source/destination address without xt_socket support also in non-tunneled datapath modes.")
-				} else {
-					m.logger.WithError(err).Warning("Could not disable ip_early_demux, traffic redirected due to an HTTP policy or visibility may be dropped unexpectedly")
-				}
+				m.disableIPEarlyDemux()
 			}
 		}
 	} else {
@@ -380,14 +465,28 @@ func (m *Manager) Start(ctx hive.HookContext) error {
 	}
 	m.haveBPFSocketAssign = m.sharedCfg.EnableBPFTProxy
 
-	ip4tables.initArgs(int(m.cfg.IPTablesLockTimeout / time.Second))
-	ip6tables.initArgs(int(m.cfg.IPTablesLockTimeout / time.Second))
-
 	return nil
 }
 
-func (m *Manager) Stop(ctx hive.HookContext) error {
+func (m *Manager) Stop(ctx cell.HookContext) error {
+	close(m.reconcilerParams.proxies)
+	close(m.reconcilerParams.addNoTrackPod)
+	close(m.reconcilerParams.delNoTrackPod)
 	return nil
+}
+
+func (m *Manager) disableIPEarlyDemux() {
+	if m.ipEarlyDemuxDisabled {
+		return
+	}
+
+	disabled := m.sysctl.Disable([]string{"net", "ipv4", "ip_early_demux"}) == nil
+	if disabled {
+		m.ipEarlyDemuxDisabled = true
+		m.logger.Info("Disabled ip_early_demux to allow proxy redirection with original source/destination address without xt_socket support also in non-tunneled datapath modes.")
+	} else {
+		m.logger.Warn("Could not disable ip_early_demux, traffic redirected due to an HTTP policy or visibility may be dropped unexpectedly")
+	}
 }
 
 // SupportsOriginalSourceAddr tells if an L7 proxy can use POD's original source address and port in
@@ -395,9 +494,8 @@ func (m *Manager) Stop(ctx hive.HookContext) error {
 // the source IP address.
 func (m *Manager) SupportsOriginalSourceAddr() bool {
 	// Original source address use works if xt_socket match is supported, or if ip early demux
-	// is disabled, but it is not needed when tunneling is used as the tunnel header carries
-	// the source security ID.
-	return (m.haveSocketMatch || m.ipEarlyDemuxDisabled) && !m.sharedCfg.TunnelingEnabled
+	// is disabled
+	return m.haveSocketMatch || m.ipEarlyDemuxDisabled
 }
 
 // removeRules removes iptables rules installed by Cilium.
@@ -437,20 +535,6 @@ func (m *Manager) renameChains(prefix string) error {
 	return nil
 }
 
-func (m *Manager) ingressProxyRule(l4Match, markMatch, mark, ip, port, name string) []string {
-	return []string{
-		"-t", "mangle",
-		"-A", ciliumPreMangleChain,
-		"-p", l4Match,
-		"-m", "mark", "--mark", markMatch,
-		"-m", "comment", "--comment", "cilium: TPROXY to host " + name + " proxy",
-		"-j", "TPROXY",
-		"--tproxy-mark", mark,
-		"--on-ip", ip,
-		"--on-port", port,
-	}
-}
-
 func (m *Manager) inboundProxyRedirectRule(cmd string) []string {
 	// Mark host proxy transparent connections to be routed to the local stack.
 	// This comes before the TPROXY rules in the chain, and setting the mark
@@ -461,61 +545,47 @@ func (m *Manager) inboundProxyRedirectRule(cmd string) []string {
 	// 1. route return traffic to the proxy
 	// 2. route original direction traffic that would otherwise be intercepted
 	//    by ip_early_demux
+	// Explicitly support chaining Envoy listeners via the loopback device by
+	// excluding traffic for the loopback device.
 	toProxyMark := fmt.Sprintf("%#08x", linux_defaults.MagicMarkIsToProxy)
+	matchFromIPSecEncrypt := fmt.Sprintf("%#08x/%#08x", linux_defaults.RouteMarkEncrypt, linux_defaults.RouteMarkMask)
+	matchProxyToWorld := fmt.Sprintf("%#08x/%#08x", linux_defaults.MarkProxyToWorld, linux_defaults.RouteMarkMask)
 	return []string{
 		"-t", "mangle",
 		cmd, ciliumPreMangleChain,
 		"-m", "socket", "--transparent",
+		"!", "-o", "lo",
+		"-m", "mark", "!", "--mark", matchFromIPSecEncrypt,
+		"-m", "mark", "!", "--mark", matchProxyToWorld,
 		"-m", "comment", "--comment", "cilium: any->pod redirect proxied traffic to host proxy",
 		"-j", "MARK",
 		"--set-mark", toProxyMark}
 }
 
-func (m *Manager) iptIngressProxyRule(rules string, prog iptablesInterface, l4proto, ip string, proxyPort uint16, name string) error {
+func (m *Manager) iptProxyRule(rules string, prog runnable, l4proto, ip string, proxyPort uint16, name string) error {
 	// Match
 	port := uint32(byteorder.HostToNetwork16(proxyPort)) << 16
-	ingressMarkMatch := fmt.Sprintf("%#x", linux_defaults.MagicMarkIsToProxy|port)
+	markMatch := fmt.Sprintf("%#x", linux_defaults.MagicMarkIsToProxy|port)
 	// TPROXY params
-	ingressProxyMark := fmt.Sprintf("%#x", linux_defaults.MagicMarkIsToProxy)
-	ingressProxyPort := fmt.Sprintf("%d", proxyPort)
+	tProxyMark := fmt.Sprintf("%#x", linux_defaults.MagicMarkIsToProxy)
+	tProxyPort := fmt.Sprintf("%d", proxyPort)
 
-	existingRuleRegex := regexp.MustCompile(fmt.Sprintf("CILIUM_PRE_mangle -p %s -m mark --mark %s.*--on-ip %s", l4proto, ingressMarkMatch, ip))
+	existingRuleRegex := regexp.MustCompile(fmt.Sprintf("-A CILIUM_PRE_mangle -p %s -m mark --mark %s.*--on-ip %s", l4proto, markMatch, ip))
 	if existingRuleRegex.MatchString(rules) {
 		return nil
 	}
 
-	rule := m.ingressProxyRule(l4proto, ingressMarkMatch, ingressProxyMark, ip, ingressProxyPort, name)
-	return prog.runProg(rule)
-}
-
-func (m *Manager) egressProxyRule(l4Match, markMatch, mark, ip, port, name string) []string {
-	return []string{
+	rule := []string{
 		"-t", "mangle",
 		"-A", ciliumPreMangleChain,
-		"-p", l4Match,
+		"-p", l4proto,
 		"-m", "mark", "--mark", markMatch,
 		"-m", "comment", "--comment", "cilium: TPROXY to host " + name + " proxy",
 		"-j", "TPROXY",
-		"--tproxy-mark", mark,
+		"--tproxy-mark", tProxyMark,
 		"--on-ip", ip,
-		"--on-port", port,
+		"--on-port", tProxyPort,
 	}
-}
-
-func (m *Manager) iptEgressProxyRule(rules string, prog iptablesInterface, l4proto, ip string, proxyPort uint16, name string) error {
-	// Match
-	port := uint32(byteorder.HostToNetwork16(proxyPort)) << 16
-	egressMarkMatch := fmt.Sprintf("%#x", linux_defaults.MagicMarkIsToProxy|port)
-	// TPROXY params
-	egressProxyMark := fmt.Sprintf("%#x", linux_defaults.MagicMarkIsToProxy)
-	egressProxyPort := fmt.Sprintf("%d", proxyPort)
-
-	existingRuleRegex := regexp.MustCompile(fmt.Sprintf("-A CILIUM_PRE_mangle -p %s -m mark --mark %s.*--on-ip %s", l4proto, egressMarkMatch, ip))
-	if existingRuleRegex.MatchString(rules) {
-		return nil
-	}
-
-	rule := m.egressProxyRule(l4proto, egressMarkMatch, egressProxyMark, ip, egressProxyPort, name)
 	return prog.runProg(rule)
 }
 
@@ -524,8 +594,12 @@ func (m *Manager) installStaticProxyRules() error {
 	matchToProxy := fmt.Sprintf("%#08x/%#08x", linux_defaults.MagicMarkIsToProxy, linux_defaults.MagicMarkHostMask)
 	// proxy return traffic has 0 ID in the mask
 	matchProxyReply := fmt.Sprintf("%#08x/%#08x", linux_defaults.MagicMarkIsProxy, linux_defaults.MagicMarkProxyNoIDMask)
+	// proxy forward traffic
+	matchProxyForward := fmt.Sprintf("%#08x/%#08x", linux_defaults.MagicMarkEgress, linux_defaults.MagicMarkHostMask)
 	// L7 proxy upstream return traffic has Endpoint ID in the mask
 	matchL7ProxyUpstream := fmt.Sprintf("%#08x/%#08x", linux_defaults.MagicMarkIsProxyEPID, linux_defaults.MagicMarkProxyMask)
+	// match traffic from a proxy (either in forward or in return direction)
+	matchFromProxy := fmt.Sprintf("%#08x/%#08x", linux_defaults.MagicMarkIsProxy, linux_defaults.MagicMarkProxyMask)
 
 	if m.sharedCfg.EnableIPv4 {
 		// No conntrack for traffic to proxy
@@ -571,6 +645,19 @@ func (m *Manager) installStaticProxyRules() error {
 			return err
 		}
 
+		// No conntrack for proxy forward traffic that is heading to cilium_host
+		if option.Config.EnableIPSec {
+			if err := ip4tables.runProg([]string{
+				"-t", "raw",
+				"-A", ciliumOutputRawChain,
+				"-o", defaults.HostDevice,
+				"-m", "mark", "--mark", matchProxyForward,
+				"-m", "comment", "--comment", "cilium: NOTRACK for proxy forward traffic",
+				"-j", "CT", "--notrack"}); err != nil {
+				return err
+			}
+		}
+
 		// No conntrack for proxy upstream traffic that is heading to lxc+
 		if err := ip4tables.runProg([]string{
 			"-t", "raw",
@@ -598,8 +685,8 @@ func (m *Manager) installStaticProxyRules() error {
 		if err := ip4tables.runProg([]string{
 			"-t", "filter",
 			"-A", ciliumOutputChain,
-			"-m", "mark", "--mark", matchProxyReply,
-			"-m", "comment", "--comment", "cilium: ACCEPT for proxy return traffic",
+			"-m", "mark", "--mark", matchFromProxy,
+			"-m", "comment", "--comment", "cilium: ACCEPT for proxy traffic",
 			"-j", "ACCEPT"}); err != nil {
 			return err
 		}
@@ -672,8 +759,8 @@ func (m *Manager) installStaticProxyRules() error {
 		if err := ip6tables.runProg([]string{
 			"-t", "filter",
 			"-A", ciliumOutputChain,
-			"-m", "mark", "--mark", matchProxyReply,
-			"-m", "comment", "--comment", "cilium: ACCEPT for proxy return traffic",
+			"-m", "mark", "--mark", matchFromProxy,
+			"-m", "comment", "--comment", "cilium: ACCEPT for proxy traffic",
 			"-j", "ACCEPT"}); err != nil {
 			return err
 		}
@@ -704,11 +791,13 @@ func (m *Manager) doCopyProxyRules(prog iptablesInterface, table string, re *reg
 
 		args, err := shellwords.Parse(strings.Replace(rule, oldChain, newChain, 1))
 		if err != nil {
-			log.WithFields(logrus.Fields{
-				"table":          table,
-				"prog":           prog.getProg(),
-				logfields.Object: rule,
-			}).WithError(err).Warn("Unable to parse TPROXY rule, disruption to traffic selected by L7 policy possible")
+			m.logger.Warn(
+				"Unable to parse TPROXY rule, disruption to traffic selected by L7 policy possible",
+				logfields.Error, err,
+				logfields.Object, rule,
+				logfields.Table, table,
+				logfields.Prog, prog.getProg(),
+			)
 			continue
 		}
 
@@ -741,22 +830,16 @@ func (m *Manager) copyProxyRules(oldChain string, match string) error {
 }
 
 // Redirect packets to the host proxy via TPROXY, as directed by the Cilium
-// datapath bpf programs via skb marks (egress) or DSCP (ingress).
-func (m *Manager) addProxyRules(prog iptablesInterface, ip string, proxyPort uint16, ingress bool, name string) error {
+// datapath bpf programs via skb marks.
+func (m *Manager) addProxyRules(prog runnable, ip string, proxyPort uint16, name string) error {
 	rules, err := prog.runProgOutput([]string{"-t", "mangle", "-S"})
 	if err != nil {
 		return err
 	}
 
 	for _, proto := range []string{"tcp", "udp"} {
-		if ingress {
-			if err := m.iptIngressProxyRule(rules, prog, proto, ip, proxyPort, name); err != nil {
-				return err
-			}
-		} else {
-			if err := m.iptEgressProxyRule(rules, prog, proto, ip, proxyPort, name); err != nil {
-				return err
-			}
+		if err := m.iptProxyRule(rules, prog, proto, ip, proxyPort, name); err != nil {
+			return err
 		}
 	}
 
@@ -772,7 +855,12 @@ func (m *Manager) addProxyRules(prog iptablesInterface, ip string, proxyPort uin
 
 		args, err := shellwords.Parse(strings.Replace(rule, "-A", "-D", 1))
 		if err != nil {
-			log.WithError(err).WithField(logfields.Object, rule).Warnf("Unable to parse %s TPROXY rule", prog)
+			m.logger.Warn(
+				"Unable to parse TPROXY rule",
+				logfields.Error, err,
+				logfields.Prog, prog,
+				logfields.Object, rule,
+			)
 			continue
 		}
 
@@ -785,30 +873,7 @@ func (m *Manager) addProxyRules(prog iptablesInterface, ip string, proxyPort uin
 	return nil
 }
 
-// install or remove rules for a single proxy port
-func (m *Manager) iptProxyRules(proxyPort uint16, ingress, localOnly bool, name string) error {
-	ipv4 := "0.0.0.0"
-	ipv6 := "::"
-
-	if localOnly {
-		ipv4 = "127.0.0.1"
-		ipv6 = "::1"
-	}
-	if m.sharedCfg.EnableIPv4 {
-		if err := m.addProxyRules(ip4tables, ipv4, proxyPort, ingress, name); err != nil {
-			return err
-		}
-	}
-	if m.sharedCfg.EnableIPv6 {
-		if err := m.addProxyRules(ip6tables, ipv6, proxyPort, ingress, name); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (m *Manager) endpointNoTrackRules(prog iptablesInterface, cmd string, IP string, port *lb.L4Addr) error {
+func (m *Manager) endpointNoTrackRules(prog runnable, cmd string, IP string, port *lb.L4Addr) error {
 	var err error
 
 	protocol := strings.ToLower(port.Protocol)
@@ -833,7 +898,7 @@ func (m *Manager) endpointNoTrackRules(prog iptablesInterface, cmd string, IP st
 		"--dport", p,
 		"-j", "CT",
 		"--notrack"}); err != nil {
-		log.WithError(err).Warning("Failed to enforce endpoint notrack")
+		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
 	}
 	if err = prog.runProg([]string{
 		"-t", "filter",
@@ -843,7 +908,7 @@ func (m *Manager) endpointNoTrackRules(prog iptablesInterface, cmd string, IP st
 		"--dport",
 		p, "-j",
 		"ACCEPT"}); err != nil {
-		log.WithError(err).Warning("Failed to enforce endpoint notrack")
+		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
 	}
 
 	// 2. The following 2 rules cover packets from node-local-dns to
@@ -856,7 +921,7 @@ func (m *Manager) endpointNoTrackRules(prog iptablesInterface, cmd string, IP st
 		"--sport", p,
 		"-j", "CT",
 		"--notrack"}); err != nil {
-		log.WithError(err).Warning("Failed to enforce endpoint notrack")
+		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
 	}
 	if err = prog.runProg([]string{
 		"-t", "filter",
@@ -866,7 +931,7 @@ func (m *Manager) endpointNoTrackRules(prog iptablesInterface, cmd string, IP st
 		"--sport",
 		p, "-j",
 		"ACCEPT"}); err != nil {
-		log.WithError(err).Warning("Failed to enforce endpoint notrack")
+		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
 	}
 
 	// 3. The following 2 rules cover packets from host namespaced pod to
@@ -879,7 +944,7 @@ func (m *Manager) endpointNoTrackRules(prog iptablesInterface, cmd string, IP st
 		"--dport", p,
 		"-j", "CT",
 		"--notrack"}); err != nil {
-		log.WithError(err).Warning("Failed to enforce endpoint notrack")
+		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
 	}
 	if err = prog.runProg([]string{
 		"-t", "filter",
@@ -888,7 +953,7 @@ func (m *Manager) endpointNoTrackRules(prog iptablesInterface, cmd string, IP st
 		"-d", IP,
 		"--dport", p,
 		"-j", "ACCEPT"}); err != nil {
-		log.WithError(err).Warning("Failed to enforce endpoint notrack")
+		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
 	}
 
 	// 4. The following rule (and the prerouting rule in case 2)
@@ -901,7 +966,7 @@ func (m *Manager) endpointNoTrackRules(prog iptablesInterface, cmd string, IP st
 		"--sport",
 		p, "-j",
 		"ACCEPT"}); err != nil {
-		log.WithError(err).Warning("Failed to enforce endpoint notrack")
+		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
 	}
 
 	// The following rules are kept for compatibility with host-namespaced
@@ -915,7 +980,7 @@ func (m *Manager) endpointNoTrackRules(prog iptablesInterface, cmd string, IP st
 		"--sport", p,
 		"-j", "CT",
 		"--notrack"}); err != nil {
-		log.WithError(err).Warning("Failed to enforce endpoint notrack")
+		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
 	}
 	if err = prog.runProg([]string{
 		"-t", "filter",
@@ -924,7 +989,7 @@ func (m *Manager) endpointNoTrackRules(prog iptablesInterface, cmd string, IP st
 		"-s", IP,
 		"--sport", p,
 		"-j", "ACCEPT"}); err != nil {
-		log.WithError(err).Warning("Failed to enforce endpoint notrack")
+		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
 	}
 	if err = prog.runProg([]string{
 		"-t", "filter",
@@ -934,7 +999,7 @@ func (m *Manager) endpointNoTrackRules(prog iptablesInterface, cmd string, IP st
 		"--dport",
 		p, "-j",
 		"ACCEPT"}); err != nil {
-		log.WithError(err).Warning("Failed to enforce endpoint notrack")
+		m.logger.Warn("Failed to enforce endpoint notrack", logfields.Error, err)
 	}
 	return err
 }
@@ -944,48 +1009,47 @@ func (m *Manager) endpointNoTrackRules(prog iptablesInterface, cmd string, IP st
 // installed upon agent bootstrap (via function addNoTrackPodTrafficRules) and this function will be skipped.
 // When InstallNoConntrackIptRules is not set, this function will be executed to install NOTRACK rules.
 // The rules installed by this function is very specific, for now, the only user is node-local-dns pods.
-func (m *Manager) InstallNoTrackRules(IP string, port uint16, ipv6 bool) error {
-	m.Lock()
-	defer m.Unlock()
-
-	// Do not install per endpoint NOTRACK rules if we are already skipping
-	// conntrack for all pod traffic.
-	if skipPodTrafficConntrack(ipv6, m.sharedCfg.InstallNoConntrackIptRules) {
-		return nil
+func (m *Manager) InstallNoTrackRules(ip netip.Addr, port uint16) {
+	if m.skipPodTrafficConntrack(ip) {
+		return
 	}
 
-	prog := ip4tables
-	if ipv6 {
-		prog = ip6tables
-	}
-
-	for _, p := range noTrackPorts(port) {
-		if err := m.endpointNoTrackRules(prog, "-A", IP, p); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	reconciled := make(chan struct{})
+	m.reconcilerParams.addNoTrackPod <- reconciliationRequest[noTrackPodInfo]{noTrackPodInfo{ip, port}, reconciled}
+	<-reconciled
 }
 
 // See comments for InstallNoTrackRules.
-func (m *Manager) RemoveNoTrackRules(IP string, port uint16, ipv6 bool) error {
-	m.Lock()
-	defer m.Unlock()
+func (m *Manager) RemoveNoTrackRules(ip netip.Addr, port uint16) {
+	if m.skipPodTrafficConntrack(ip) {
+		return
+	}
 
-	// Do not install per endpoint NOTRACK rules if we are already skipping
-	// conntrack for all pod traffic.
-	if skipPodTrafficConntrack(ipv6, m.sharedCfg.InstallNoConntrackIptRules) {
+	reconciled := make(chan struct{})
+	m.reconcilerParams.delNoTrackPod <- reconciliationRequest[noTrackPodInfo]{noTrackPodInfo{ip, port}, reconciled}
+	<-reconciled
+}
+
+func (m *Manager) InstallProxyRules(proxyPort uint16, name string) {
+	reconciled := make(chan struct{})
+	m.reconcilerParams.proxies <- reconciliationRequest[proxyInfo]{proxyInfo{name, proxyPort}, reconciled}
+	<-reconciled
+}
+
+func (m *Manager) doInstallProxyRules(proxyPort uint16, name string) error {
+	// We could fail if netfilter was compiled out from the kernel, so bail
+	// out without error in this case, too.
+	if m.haveBPFSocketAssign || !m.sharedCfg.InstallIptRules {
 		return nil
 	}
 
-	prog := ip4tables
-	if ipv6 {
-		prog = ip6tables
+	if m.sharedCfg.EnableIPv4 {
+		if err := m.addProxyRules(ip4tables, "127.0.0.1", proxyPort, name); err != nil {
+			return err
+		}
 	}
-
-	for _, p := range noTrackPorts(port) {
-		if err := m.endpointNoTrackRules(prog, "-D", IP, p); err != nil {
+	if m.sharedCfg.EnableIPv6 {
+		if err := m.addProxyRules(ip6tables, "::1", proxyPort, name); err != nil {
 			return err
 		}
 	}
@@ -993,89 +1057,52 @@ func (m *Manager) RemoveNoTrackRules(IP string, port uint16, ipv6 bool) error {
 	return nil
 }
 
-func (m *Manager) InstallProxyRules(ctx context.Context, proxyPort uint16, ingress, localOnly bool, name string) error {
-	backoff := backoff.Exponential{
-		Min:  20 * time.Second,
-		Max:  3 * time.Minute,
-		Name: "iptables-proxy-rules-installer",
-	}
-
-	maxAttempts := 3
-	attempt := 0
-
-	for {
-		attempt += 1
-		err := m.doInstallProxyRules(proxyPort, ingress, localOnly, name)
-		if err == nil {
-			log.Info("Iptables proxy rules installed")
-			return nil
-		}
-
-		if attempt == maxAttempts {
-			return fmt.Errorf("failed to install iptables proxy rules: %w", err)
-		}
-
-		log.WithError(err).Warning("Failed to install iptables proxy rules")
-		backoff.Wait(ctx)
-	}
-}
-
-func (m *Manager) doInstallProxyRules(proxyPort uint16, ingress, localOnly bool, name string) error {
-	m.Lock()
-	defer m.Unlock()
-
-	if m.haveBPFSocketAssign {
-		log.WithField("port", proxyPort).
-			Debug("Skipping proxy rule install due to BPF support")
-		return nil
-	}
-	return m.iptProxyRules(proxyPort, ingress, localOnly, name)
-}
-
-// GetProxyPort finds a proxy port used for redirect 'name' installed earlier with InstallProxyRules.
-// By convention "ingress" or "egress" is part of 'name' so it does not need to be specified explicitly.
-// Returns 0 a TPROXY entry with 'name' can not be found.
-func (m *Manager) GetProxyPort(name string) uint16 {
+// GetProxyPorts enumerates all existing TPROXY rules in the datapath installed earlier with
+// InstallProxyRules and returns all proxy ports found.
+func (m *Manager) GetProxyPorts() map[string]uint16 {
 	prog := ip4tables
 	if !m.sharedCfg.EnableIPv4 {
 		prog = ip6tables
 	}
 
-	return m.doGetProxyPort(prog, name)
+	return m.doGetProxyPorts(prog)
 }
 
-func (m *Manager) doGetProxyPort(prog iptablesInterface, name string) uint16 {
+func (m *Manager) doGetProxyPorts(prog iptablesInterface) map[string]uint16 {
+	portMap := make(map[string]uint16)
+
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
 	rules, err := prog.runProgOutput([]string{"-t", "mangle", "-n", "-L", ciliumPreMangleChain})
 	if err != nil {
-		return 0
+		return portMap
 	}
 
 	re := regexp.MustCompile(
-		name + ".*TPROXY redirect " +
+		"(cilium-[^ ]*) proxy.*TPROXY redirect " +
 			"(0.0.0.0|" + ipfamily.IPv4().Localhost +
 			"|::|" + ipfamily.IPv6().Localhost + ")" +
 			":([1-9][0-9]*) mark",
 	)
 	strs := re.FindAllString(rules, -1)
-	if len(strs) == 0 {
-		return 0
+	for _, str := range strs {
+		// Pick the name and port number from each match
+		name := re.ReplaceAllString(str, "$1")
+		portStr := re.ReplaceAllString(str, "$3")
+		portUInt64, err := strconv.ParseUint(portStr, 10, 16)
+		if err == nil {
+			portMap[name] = uint16(portUInt64)
+		}
 	}
-	// Pick the port number from the last match, as rules are appended to the end (-A)
-	portStr := re.ReplaceAllString(strs[len(strs)-1], "$2")
-	portUInt64, err := strconv.ParseUint(portStr, 10, 16)
-	if err != nil {
-		log.WithError(err).Debugf("Port number cannot be parsed: %s", portStr)
-		return 0
-	}
-
-	return uint16(portUInt64)
+	return portMap
 }
 
 func (m *Manager) getDeliveryInterface(ifName string) string {
 	switch {
 	case m.sharedCfg.EnableEndpointRoutes:
 		// aws-cni creates container interfaces with names like eni621c0fc8425.
-		if m.CNIChainingMode == "aws-cni" {
+		if m.cniConfigManager.GetChainingMode() == "aws-cni" {
 			return "eni+"
 		}
 		return "lxc+"
@@ -1102,7 +1129,7 @@ func (m *Manager) installForwardChainRules(ifName, localDeliveryInterface, forwa
 	return nil
 }
 
-func (m *Manager) installForwardChainRulesIpX(prog iptablesInterface, ifName, localDeliveryInterface, forwardChain string) error {
+func (m *Manager) installForwardChainRulesIpX(prog runnable, ifName, localDeliveryInterface, forwardChain string) error {
 	// While kube-proxy does change the policy of the iptables FORWARD chain
 	// it doesn't seem to handle all cases, e.g. host network pods that use
 	// the node IP which would still end up in default DENY. Similarly, for
@@ -1178,67 +1205,18 @@ func (m *Manager) installForwardChainRulesIpX(prog iptablesInterface, ifName, lo
 	return nil
 }
 
-// AddToNodeIpset adds an IP address to the ipset for cluster nodes. It creates
-// the ipset if it doesn't already exist and doesn't error if either the ipset
-// or the IP already exist.
-func (m *Manager) AddToNodeIpset(nodeIP net.IP) {
-	scopedLog := log.WithField(logfields.IPAddr, nodeIP.String())
-	ciliumNodeIpset := ciliumNodeIpsetV4
-	if ip.IsIPv6(nodeIP) {
-		ciliumNodeIpset = ciliumNodeIpsetV6
-	}
-	if err := createIpset(ciliumNodeIpset, ip.IsIPv6(nodeIP)); err != nil {
-		scopedLog.WithError(err).Errorf("Failed to create ipset %s", ciliumNodeIpset)
-		return
-	}
-	progArgs := []string{"add", ciliumNodeIpset, nodeIP.String(), "-exist"}
-	if err := ipset.runProg(progArgs); err != nil {
-		scopedLog.WithError(err).Errorf("Failed to add IP to ipset %s", ciliumNodeIpset)
-	}
-}
+func (m *Manager) installMasqueradeRules(
+	prog iptablesInterface, nativeDevices []string,
+	localDeliveryInterface, snatDstExclusionCIDR, allocRange, hostMasqueradeIP string,
+) error {
+	devices := nativeDevices
 
-// RemoveFromBodeIpset removes an IP address from the ipset for cluster nodes.
-func (m *Manager) RemoveFromNodeIpset(nodeIP net.IP) {
-	scopedLog := log.WithField(logfields.IPAddr, nodeIP.String())
-	ciliumNodeIpset := ciliumNodeIpsetV4
-	if ip.IsIPv6(nodeIP) {
-		ciliumNodeIpset = ciliumNodeIpsetV6
-	}
-	progArgs := []string{"del", ciliumNodeIpset, nodeIP.String(), "-exist"}
-	if err := ipset.runProg(progArgs); err != nil {
-		scopedLog.WithError(err).Errorf("Failed to remove IP from ipset %s", ciliumNodeIpset)
-	}
-}
-
-func (m *Manager) installMasqueradeRules(prog iptablesInterface, ifName, localDeliveryInterface,
-	snatDstExclusionCIDR, allocRange, hostMasqueradeIP string) error {
 	if m.sharedCfg.NodeIpsetNeeded {
-		// Exclude traffic to nodes from masquerade.
-		if err := createIpset(prog.getIpset(), prog == ip6tables); err != nil {
-			return err
-		}
-
-		progArgs := []string{
-			"-t", "nat",
-			"-A", ciliumPostNatChain,
-		}
-
-		// If MasqueradeInterfaces is set, we need to mirror base condition of the
-		// "cilium masquerade non-cluster" rule below, as the allocRange might not
-		// be valid in such setups (e.g. in ENI mode).
-		if len(m.sharedCfg.MasqueradeInterfaces) > 0 {
-			progArgs = append(progArgs, "-o", strings.Join(m.sharedCfg.MasqueradeInterfaces, ","))
-		} else {
-			progArgs = append(progArgs, "-s", allocRange)
-		}
-
-		progArgs = append(progArgs,
-			"-m", "set", "--match-set", prog.getIpset(), "dst",
-			"-m", "comment", "--comment", "exclude traffic to cluster nodes from masquerade",
-			"-j", "ACCEPT",
-		)
-		if err := prog.runProg(progArgs); err != nil {
-			return err
+		cmds := nodeIpsetNATCmds(allocRange, prog.getIpset(), m.sharedCfg.MasqueradeInterfaces)
+		for _, cmd := range cmds {
+			if err := prog.runProg(cmd); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1249,7 +1227,6 @@ func (m *Manager) installMasqueradeRules(prog iptablesInterface, ifName, localDe
 	if m.sharedCfg.EnableMasqueradeRouteSource {
 		var defaultRoutes []netlink.Route
 
-		devices := m.sharedCfg.Devices
 		if len(m.sharedCfg.MasqueradeInterfaces) > 0 {
 			devices = m.sharedCfg.MasqueradeInterfaces
 		}
@@ -1258,7 +1235,7 @@ func (m *Manager) installMasqueradeRules(prog iptablesInterface, ifName, localDe
 			family = netlink.FAMILY_V6
 		}
 		initialPass := true
-		if routes, err := netlink.RouteList(nil, family); err == nil {
+		if routes, err := safenetlink.RouteList(nil, family); err == nil {
 		nextPass:
 			for _, r := range routes {
 				var link netlink.Link
@@ -1276,7 +1253,8 @@ func (m *Manager) installMasqueradeRules(prog iptablesInterface, ifName, localDe
 						return fmt.Errorf("cannot correlate source route device for generating masquerading rules")
 					}
 					for _, device := range devices {
-						if device == link.Attrs().Name {
+						filter := tables.DeviceFilter{device}
+						if filter.Match(link.Attrs().Name) {
 							match = true
 							break
 						}
@@ -1353,30 +1331,12 @@ func (m *Manager) installMasqueradeRules(prog iptablesInterface, ifName, localDe
 		//     range
 		// * Non-tunnel mode:
 		//   * May not be targeted to an IP in the cluster range
-		progArgs := []string{
-			"-t", "nat",
-			"-A", ciliumPostNatChain,
-			"!", "-d", snatDstExclusionCIDR,
-		}
-		if len(m.sharedCfg.MasqueradeInterfaces) > 0 {
-			progArgs = append(
-				progArgs,
-				"-o", strings.Join(m.sharedCfg.MasqueradeInterfaces, ","))
-		} else {
-			progArgs = append(
-				progArgs,
-				"-s", allocRange,
-				"!", "-o", "cilium_+")
-		}
-		progArgs = append(
-			progArgs,
-			"-m", "comment", "--comment", "cilium masquerade non-cluster",
-			"-j", "MASQUERADE")
-		if m.cfg.IPTablesRandomFully {
-			progArgs = append(progArgs, "--random-fully")
-		}
-		if err := prog.runProg(progArgs); err != nil {
-			return err
+		cmds := allEgressMasqueradeCmds(allocRange, snatDstExclusionCIDR, m.sharedCfg.MasqueradeInterfaces,
+			m.cfg.IPTablesRandomFully)
+		for _, cmd := range cmds {
+			if err := prog.runProg(cmd); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1469,30 +1429,7 @@ func (m *Manager) installMasqueradeRules(prog iptablesInterface, ifName, localDe
 	return nil
 }
 
-func createIpset(name string, ipv6 bool) error {
-	ipsetFamily := "inet"
-	if ipv6 {
-		ipsetFamily = "inet6"
-	}
-	progArgs := []string{"create", name, "iphash", "family", ipsetFamily, "-exist"}
-	return ipset.runProg(progArgs)
-}
-
-func removeIpset(name string) error {
-	if !ipsetExists(name) {
-		return nil
-	}
-	progArgs := []string{"destroy", name}
-	return ipset.runProg(progArgs)
-}
-
-func ipsetExists(name string) bool {
-	progArgs := []string{"list", name}
-	err := ipset.runProg(progArgs)
-	return err == nil
-}
-
-func (m *Manager) installHostTrafficMarkRule(prog iptablesInterface) error {
+func (m *Manager) installHostTrafficMarkRule(prog runnable) error {
 	// Mark all packets sourced from processes running on the host with a
 	// special marker so that we can differentiate traffic sourced locally
 	// vs. traffic from the outside world that was masqueraded to appear
@@ -1511,6 +1448,7 @@ func (m *Manager) installHostTrafficMarkRule(prog iptablesInterface) error {
 	// originated from the host.
 	matchFromIPSecEncrypt := fmt.Sprintf("%#08x/%#08x", linux_defaults.RouteMarkDecrypt, linux_defaults.RouteMarkMask)
 	matchFromIPSecDecrypt := fmt.Sprintf("%#08x/%#08x", linux_defaults.RouteMarkEncrypt, linux_defaults.RouteMarkMask)
+	matchOverlay := fmt.Sprintf("%#08x/%#08x", linux_defaults.MagicMarkOverlay, linux_defaults.MagicMarkHostMask)
 	matchFromProxy := fmt.Sprintf("%#08x/%#08x", linux_defaults.MagicMarkIsProxy, linux_defaults.MagicMarkProxyMask)
 	matchFromProxyEPID := fmt.Sprintf("%#08x/%#08x", linux_defaults.MagicMarkIsProxyEPID, linux_defaults.MagicMarkProxyMask)
 	matchFromDNSProxy := fmt.Sprintf("%#08x/%#08x", linux_defaults.MagicMarkIdentity, linux_defaults.MagicMarkHostMask)
@@ -1521,6 +1459,7 @@ func (m *Manager) installHostTrafficMarkRule(prog iptablesInterface) error {
 		"-A", ciliumOutputChain,
 		"-m", "mark", "!", "--mark", matchFromIPSecDecrypt, // Don't match ipsec traffic
 		"-m", "mark", "!", "--mark", matchFromIPSecEncrypt, // Don't match ipsec traffic
+		"-m", "mark", "!", "--mark", matchOverlay, // Don't match Cilium's overlay traffic
 		"-m", "mark", "!", "--mark", matchFromProxy, // Don't match proxy traffic
 		"-m", "mark", "!", "--mark", matchFromProxyEPID, // Don't match proxy traffic
 		"-m", "mark", "!", "--mark", matchFromDNSProxy, // Don't match DNS proxy egress traffic
@@ -1528,92 +1467,45 @@ func (m *Manager) installHostTrafficMarkRule(prog iptablesInterface) error {
 		"-j", "MARK", "--set-xmark", markAsFromHost})
 }
 
-// InstallRules installs iptables rules for Cilium in specific use-cases
-// (most specifically, interaction with kube-proxy).
-func (m *Manager) InstallRules(ctx context.Context, ifName string, firstInitialization, install bool) error {
-	backoff := backoff.Exponential{
-		Min:  20 * time.Second,
-		Max:  3 * time.Minute,
-		Name: "iptables-rules-installer",
-	}
-
-	maxAttempts := 3
-	attempt := 0
-
-	for {
-		attempt += 1
-		err := m.doInstallRules(ifName, firstInitialization, install)
-		if err == nil {
-			log.Info("Iptables rules installed")
-			return nil
-		}
-
-		if attempt == maxAttempts {
-			return fmt.Errorf("failed to install iptables rules: %w", err)
-		}
-
-		log.WithError(err).Warning("Failed to install iptables rules")
-		backoff.Wait(ctx)
-	}
-}
-
-func (m *Manager) doInstallRules(ifName string, firstInitialization, install bool) error {
-	m.Lock()
-	defer m.Unlock()
+func (m *Manager) doInstallRules(state desiredState, firstInit bool) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
 
 	// Make sure we have no old "backups"
 	if err := m.removeRules(oldCiliumPrefix); err != nil {
-		return err
+		// We could fail if netfilter was compiled out from the kernel
+		if !state.installRules {
+			return nil
+		}
+		return fmt.Errorf("failed to remove old backup rules: %w", err)
 	}
 
 	if err := m.renameChains(oldCiliumPrefix); err != nil {
-		return err
+		return fmt.Errorf("failed to rename chains: %w", err)
 	}
 
 	// install rules if needed
-	if install {
-		if err := m.installRules(ifName); err != nil {
-			return err
+	if state.installRules {
+		if err := m.installRules(state); err != nil {
+			return fmt.Errorf("failed to install rules: %w", err)
 		}
 
-		// copy old proxy rules over
-		match := ""
-		if firstInitialization {
-			match = "cilium-dns-egress"
+		// copy old proxy rules over at initialization
+		if firstInit {
+			if err := m.copyProxyRules(oldCiliumPrefix+ciliumPreMangleChain, "cilium-dns-egress"); err != nil {
+				return fmt.Errorf("cannot copy old proxy rules, disruption to traffic selected by L7 policy possible: %w", err)
+			}
 		}
 
-		if err := m.copyProxyRules(oldCiliumPrefix+ciliumPreMangleChain, match); err != nil {
-			return fmt.Errorf("cannot install proxy rules, disruption to traffic selected by L7 policy possible: %w", err)
+		for _, proxy := range state.proxies {
+			if err := m.doInstallProxyRules(proxy.port, proxy.name); err != nil {
+				return fmt.Errorf("cannot install proxy rules for %s: %w", proxy.name, err)
+			}
 		}
 	}
 
 	if err := m.removeRules(oldCiliumPrefix); err != nil {
-		return err
-	}
-
-	// Create ipsets for node IP address only if needed. If they already exist,
-	// we will simply ignore the error.
-	// Note we don't need a backup system as for iptables rules because the
-	// contents of ipsets doesn't depend on configuration. Whether they are
-	// needed depends on the configuration, but the content doesn't.
-	if m.sharedCfg.NodeIpsetNeeded {
-		if m.sharedCfg.IptablesMasqueradingIPv4Enabled {
-			if err := createIpset(ciliumNodeIpsetV4, false); err != nil {
-				return err
-			}
-		}
-		if m.sharedCfg.IptablesMasqueradingIPv6Enabled {
-			if err := createIpset(ciliumNodeIpsetV6, true); err != nil {
-				return err
-			}
-		}
-	} else {
-		if err := removeIpset(ciliumNodeIpsetV4); err != nil {
-			return err
-		}
-		if err := removeIpset(ciliumNodeIpsetV6); err != nil {
-			return err
-		}
+		return fmt.Errorf("failed to remove old rules: %w", err)
 	}
 
 	return nil
@@ -1621,13 +1513,16 @@ func (m *Manager) doInstallRules(ifName string, firstInitialization, install boo
 
 // installRules installs iptables rules for Cilium in specific use-cases
 // (most specifically, interaction with kube-proxy).
-func (m *Manager) installRules(ifName string) error {
+func (m *Manager) installRules(state desiredState) error {
 	// Install new rules
 	for _, c := range ciliumChains {
 		if err := c.add(m.sharedCfg.EnableIPv4, m.sharedCfg.EnableIPv6); err != nil {
 			// do not return error for chain creation that are linked to disabled feeder rules
 			if isDisabledChain(m.cfg.DisableIptablesFeederRules, c.hook) {
-				log.WithField(logfields.Chain, c.name).Warningf("ignoring creation of chain since feeder rules for %s is disabled", c.hook)
+				m.logger.Warn(
+					fmt.Sprintf("ignoring creation of chain since feeder rules for %s is disabled", c.hook),
+					logfields.Chain, c.name,
+				)
 				continue
 			}
 
@@ -1643,9 +1538,9 @@ func (m *Manager) installRules(ifName string) error {
 		return fmt.Errorf("cannot install xfrm rules: %w", err)
 	}
 
-	localDeliveryInterface := m.getDeliveryInterface(ifName)
+	localDeliveryInterface := m.getDeliveryInterface(defaults.HostDevice)
 
-	if err := m.installForwardChainRules(ifName, localDeliveryInterface, ciliumForwardChain); err != nil {
+	if err := m.installForwardChainRules(defaults.HostDevice, localDeliveryInterface, ciliumForwardChain); err != nil {
 		return fmt.Errorf("cannot install forward chain rules to %s: %w", ciliumForwardChain, err)
 	}
 
@@ -1654,11 +1549,11 @@ func (m *Manager) installRules(ifName string) error {
 			return fmt.Errorf("cannot install host traffic mark rule: %w", err)
 		}
 
-		if m.sharedCfg.IptablesMasqueradingIPv4Enabled {
-			if err := m.installMasqueradeRules(ip4tables, ifName, localDeliveryInterface,
-				datapath.RemoteSNATDstAddrExclusionCIDRv4().String(),
-				node.GetIPv4AllocRange().String(),
-				node.GetHostMasqueradeIPv4().String(),
+		if m.sharedCfg.IptablesMasqueradingIPv4Enabled && state.localNodeInfo.internalIPv4 != nil {
+			if err := m.installMasqueradeRules(ip4tables, state.devices.UnsortedList(), localDeliveryInterface,
+				m.remoteSNATDstAddrExclusionCIDR(state.localNodeInfo.ipv4NativeRoutingCIDR, state.localNodeInfo.ipv4AllocCIDR),
+				state.localNodeInfo.ipv4AllocCIDR,
+				state.localNodeInfo.internalIPv4.String(),
 			); err != nil {
 				return fmt.Errorf("cannot install masquerade rules: %w", err)
 			}
@@ -1670,11 +1565,11 @@ func (m *Manager) installRules(ifName string) error {
 			return fmt.Errorf("cannot install host traffic mark rule: %w", err)
 		}
 
-		if m.sharedCfg.IptablesMasqueradingIPv6Enabled {
-			if err := m.installMasqueradeRules(ip6tables, ifName, localDeliveryInterface,
-				datapath.RemoteSNATDstAddrExclusionCIDRv6().String(),
-				node.GetIPv6AllocRange().String(),
-				node.GetHostMasqueradeIPv6().String(),
+		if m.sharedCfg.IptablesMasqueradingIPv6Enabled && state.localNodeInfo.internalIPv6 != nil {
+			if err := m.installMasqueradeRules(ip6tables, state.devices.UnsortedList(), localDeliveryInterface,
+				m.remoteSNATDstAddrExclusionCIDR(state.localNodeInfo.ipv6NativeRoutingCIDR, state.localNodeInfo.ipv6AllocCIDR),
+				state.localNodeInfo.ipv6AllocCIDR,
+				state.localNodeInfo.internalIPv6.String(),
 			); err != nil {
 				return fmt.Errorf("cannot install masquerade rules: %w", err)
 			}
@@ -1693,22 +1588,30 @@ func (m *Manager) installRules(ifName string) error {
 
 	if m.sharedCfg.EnableIPSec {
 		if err := m.addCiliumNoTrackXfrmRules(); err != nil {
-			return fmt.Errorf("cannot install xfrm rules: %s", err)
+			return fmt.Errorf("cannot install xfrm rules: %w", err)
 		}
 	}
 
-	if skipPodTrafficConntrack(false, m.sharedCfg.InstallNoConntrackIptRules) {
-		podsCIDR := m.sharedCfg.IPv4NativeRoutingCIDR.String()
-
+	podsCIDR := state.localNodeInfo.ipv4NativeRoutingCIDR
+	if m.sharedCfg.InstallNoConntrackIptRules && podsCIDR != "" {
 		if err := m.addNoTrackPodTrafficRules(ip4tables, podsCIDR); err != nil {
 			return fmt.Errorf("cannot install pod traffic no CT rules: %w", err)
+		}
+	}
+
+	for noTrackPodInfo := range state.noTrackPods {
+		if err := m.installNoTrackRules(noTrackPodInfo.ip, noTrackPodInfo.port); err != nil {
+			return err
 		}
 	}
 
 	for _, c := range ciliumChains {
 		// do not install feeder for chains that are set to be disabled
 		if isDisabledChain(m.cfg.DisableIptablesFeederRules, c.hook) {
-			log.WithField(logfields.Chain, c.hook).Infof("Skipping the install of feeder rule")
+			m.logger.Info(
+				"Skipping the install of feeder rule",
+				logfields.Chain, c.hook,
+			)
 			continue
 		}
 
@@ -1718,6 +1621,15 @@ func (m *Manager) installRules(ifName string) error {
 	}
 
 	return nil
+}
+
+func (m *Manager) remoteSNATDstAddrExclusionCIDR(nativeRoutingCIDR, allocCIDR string) string {
+	if nativeRoutingCIDR != "" {
+		// ip{v4,v6}-native-routing-cidr is set, so use it
+		return nativeRoutingCIDR
+	}
+
+	return allocCIDR
 }
 
 func (m *Manager) ciliumNoTrackXfrmRules(prog iptablesInterface, input string) error {
@@ -1799,7 +1711,58 @@ func (m *Manager) addCiliumNoTrackXfrmRules() (err error) {
 	return nil
 }
 
-func (m *Manager) addNoTrackPodTrafficRules(prog iptablesInterface, podsCIDR string) error {
+func (m *Manager) installNoTrackRules(addr netip.Addr, port uint16) error {
+	// Do not install per endpoint NOTRACK rules if we are already skipping
+	// conntrack for all pod traffic.
+	if m.skipPodTrafficConntrack(addr) {
+		return nil
+	}
+
+	prog := ip4tables
+	if addr.Is6() {
+		prog = ip6tables
+	}
+	for _, p := range noTrackPorts(port) {
+		if err := m.endpointNoTrackRules(prog, "-A", addr.String(), p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) removeNoTrackRules(addr netip.Addr, port uint16) error {
+	// Do not remove per endpoint NOTRACK rules if we are already skipping
+	// conntrack for all pod traffic.
+	if m.skipPodTrafficConntrack(addr) {
+		return nil
+	}
+
+	prog := ip4tables
+	if addr.Is6() {
+		prog = ip6tables
+	}
+	for _, p := range noTrackPorts(port) {
+		if err := m.endpointNoTrackRules(prog, "-D", addr.String(), p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// skipPodTrafficConntrack returns true if i) it's possible to install iptables
+// `-j CT --notrack` rules to skip tracking pod traffic, ii) if rule installation
+// was disabled completely.
+func (m *Manager) skipPodTrafficConntrack(addr netip.Addr) bool {
+	if !m.sharedCfg.InstallIptRules {
+		return true
+	}
+	if addr.Is4() && m.sharedCfg.InstallNoConntrackIptRules {
+		return true
+	}
+	return false
+}
+
+func (m *Manager) addNoTrackPodTrafficRules(prog runnable, podsCIDR string) error {
 	for _, chain := range []string{ciliumPreRawChain, ciliumOutputRawChain} {
 		if err := prog.runProg([]string{
 			"-t", "raw",
@@ -1828,7 +1791,7 @@ func (m *Manager) addCiliumENIRules() error {
 		return nil
 	}
 
-	iface, err := route.NodeDeviceWithDefaultRoute(m.sharedCfg.EnableIPv4, m.sharedCfg.EnableIPv6)
+	iface, err := route.NodeDeviceWithDefaultRoute(m.logger, m.sharedCfg.EnableIPv4, m.sharedCfg.EnableIPv6)
 	if err != nil {
 		return fmt.Errorf("failed to find interface with default route: %w", err)
 	}
@@ -1855,4 +1818,70 @@ func (m *Manager) addCiliumENIRules() error {
 		"-i", "lxc+",
 		"-m", "comment", "--comment", "cilium: primary ENI",
 		"-j", "CONNMARK", "--restore-mark", "--nfmask", nfmask, "--ctmask", ctmask})
+}
+
+func nodeIpsetNATCmds(allocRange string, ipset string, masqueradeInterfaces []string) [][]string {
+	// Exclude traffic to nodes from masquerade.
+	preArgs := []string{
+		"-t", "nat",
+		"-A", ciliumPostNatChain,
+	}
+
+	postArgs := []string{
+		"-m", "set", "--match-set", ipset, "dst",
+		"-m", "comment", "--comment", "exclude traffic to cluster nodes from masquerade",
+		"-j", "ACCEPT",
+	}
+
+	if len(masqueradeInterfaces) == 0 {
+		cmd := append(preArgs, "-s", allocRange)
+		return [][]string{append(cmd, postArgs...)}
+	}
+
+	// If MasqueradeInterfaces is set, we need to mirror base condition of the
+	// "cilium masquerade non-cluster" rule below, as the allocRange might not
+	// be valid in such setups (e.g. in ENI mode).
+	cmds := make([][]string, 0, len(masqueradeInterfaces))
+	for _, inf := range masqueradeInterfaces {
+		cmd := append(preArgs, "-o", inf)
+		cmds = append(cmds, append(cmd, postArgs...))
+	}
+	return cmds
+}
+
+func allEgressMasqueradeCmds(allocRange string, snatDstExclusionCIDR string,
+	masqueradeInterfaces []string, iptablesRandomFully bool) [][]string {
+	preArgs := []string{
+		"-t", "nat",
+		"-A", ciliumPostNatChain,
+		"!", "-d", snatDstExclusionCIDR,
+	}
+
+	postArgs := []string{
+		"-m", "comment", "--comment", "cilium masquerade non-cluster",
+		"-j", "MASQUERADE",
+	}
+
+	if len(masqueradeInterfaces) == 0 {
+		cmd := append(preArgs,
+			"-s", allocRange,
+			"!", "-o", "cilium_+",
+		)
+		cmd = append(cmd, postArgs...)
+		if iptablesRandomFully {
+			cmd = append(cmd, "--random-fully")
+		}
+		return [][]string{cmd}
+	}
+
+	cmds := make([][]string, 0, len(masqueradeInterfaces))
+	for _, inf := range masqueradeInterfaces {
+		cmd := append(preArgs, "-o", inf)
+		cmd = append(cmd, postArgs...)
+		if iptablesRandomFully {
+			cmd = append(cmd, "--random-fully")
+		}
+		cmds = append(cmds, cmd)
+	}
+	return cmds
 }

@@ -5,8 +5,10 @@ package ingress
 
 import (
 	"fmt"
+	"log/slog"
+	"time"
 
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
 	networkingv1 "k8s.io/api/networking/v1"
 	ctrlRuntime "sigs.k8s.io/controller-runtime"
@@ -14,8 +16,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	operatorOption "github.com/cilium/cilium/operator/option"
+	"github.com/cilium/cilium/operator/pkg/model/translation"
+	ingressTranslation "github.com/cilium/cilium/operator/pkg/model/translation/ingress"
 	"github.com/cilium/cilium/operator/pkg/secretsync"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/option"
 )
 
 // Cell manages the Kubernetes Ingress related controllers.
@@ -23,34 +27,44 @@ var Cell = cell.Module(
 	"ingress",
 	"Manages the Kubernetes Ingress controllers",
 
-	cell.Config(ingressConfig{
-		EnableIngressController:     false,
-		EnforceIngressHTTPS:         true,
-		EnableIngressProxyProtocol:  false,
-		EnableIngressSecretsSync:    true,
-		IngressSecretsNamespace:     "cilium-secrets",
-		IngressLBAnnotationPrefixes: []string{"service.beta.kubernetes.io", "service.kubernetes.io", "cloud.google.com"},
-		IngressSharedLBServiceName:  "cilium-ingress",
-		IngressDefaultLBMode:        "dedicated",
+	cell.Config(IngressConfig{
+		EnableIngressController:      false,
+		EnforceIngressHTTPS:          true,
+		EnableIngressProxyProtocol:   false,
+		EnableIngressSecretsSync:     true,
+		IngressSecretsNamespace:      "cilium-secrets",
+		IngressDefaultRequestTimeout: time.Duration(0),
+		IngressLBAnnotationPrefixes:  []string{"lbipam.cilium.io", "service.beta.kubernetes.io", "service.kubernetes.io", "cloud.google.com"},
+		IngressSharedLBServiceName:   "cilium-ingress",
+		IngressDefaultLBMode:         "dedicated",
+
+		IngressHostnetworkEnabled:            false,
+		IngressHostnetworkSharedListenerPort: 0,
+		IngressHostnetworkNodelabelselector:  "",
 	}),
 	cell.Invoke(registerReconciler),
 	cell.Provide(registerSecretSync),
 )
 
-type ingressConfig struct {
-	EnableIngressController       bool
-	EnforceIngressHTTPS           bool
-	EnableIngressProxyProtocol    bool
-	EnableIngressSecretsSync      bool
-	IngressSecretsNamespace       string
-	IngressLBAnnotationPrefixes   []string
-	IngressSharedLBServiceName    string
-	IngressDefaultLBMode          string
-	IngressDefaultSecretNamespace string
-	IngressDefaultSecretName      string
+type IngressConfig struct {
+	EnableIngressController              bool
+	EnforceIngressHTTPS                  bool
+	EnableIngressProxyProtocol           bool
+	EnableIngressSecretsSync             bool
+	IngressSecretsNamespace              string
+	IngressLBAnnotationPrefixes          []string
+	IngressSharedLBServiceName           string
+	IngressDefaultLBMode                 string
+	IngressDefaultSecretNamespace        string
+	IngressDefaultSecretName             string
+	IngressDefaultRequestTimeout         time.Duration
+	IngressHostnetworkEnabled            bool
+	IngressHostnetworkSharedListenerPort uint32
+	IngressHostnetworkNodelabelselector  string
+	IngressDefaultXffNumTrustedHops      uint32
 }
 
-func (r ingressConfig) Flags(flags *pflag.FlagSet) {
+func (r IngressConfig) Flags(flags *pflag.FlagSet) {
 	flags.Bool("enable-ingress-controller", r.EnableIngressController, "Enables cilium ingress controller. This must be enabled along with enable-envoy-config in cilium agent.")
 	flags.Bool("enforce-ingress-https", r.EnforceIngressHTTPS, "Enforces https for host having matching TLS host in Ingress. Incoming traffic to http listener will return 308 http error code with respective location in header.")
 	flags.Bool("enable-ingress-proxy-protocol", r.EnableIngressProxyProtocol, "Enable proxy protocol for all Ingress listeners. Note that _only_ Proxy protocol traffic will be accepted once this is enabled.")
@@ -61,34 +75,85 @@ func (r ingressConfig) Flags(flags *pflag.FlagSet) {
 	flags.String("ingress-default-lb-mode", r.IngressDefaultLBMode, "Default loadbalancer mode for Ingress. Applicable values: dedicated, shared")
 	flags.String("ingress-default-secret-namespace", r.IngressDefaultSecretNamespace, "Default secret namespace for Ingress.")
 	flags.String("ingress-default-secret-name", r.IngressDefaultSecretName, "Default secret name for Ingress.")
+	flags.Duration("ingress-default-request-timeout", r.IngressDefaultRequestTimeout, "Default request timeout for Ingress.")
+	flags.Bool("ingress-hostnetwork-enabled", r.IngressHostnetworkEnabled, "Exposes ingress listeners on the host network.")
+	flags.Uint32("ingress-hostnetwork-shared-listener-port", r.IngressHostnetworkSharedListenerPort, "Port on the host network that gets used for the shared listener (HTTP, HTTPS & TLS passthrough)")
+	flags.String("ingress-hostnetwork-nodelabelselector", r.IngressHostnetworkNodelabelselector, "Label selector that matches the nodes where the ingress listeners should be exposed. It's a list of comma-separated key-value label pairs. e.g. 'kubernetes.io/os=linux,kubernetes.io/hostname=kind-worker'")
+	flags.Uint32("ingress-default-xff-num-trusted-hops", r.IngressDefaultXffNumTrustedHops, "The number of additional ingress proxy hops from the right side of the HTTP header to trust when determining the origin client's IP address.")
+}
+
+// IsEnabled returns true if the Ingress Controller is enabled.
+func (r IngressConfig) IsEnabled() bool {
+	return r.EnableIngressController
 }
 
 type ingressParams struct {
 	cell.In
 
-	Logger             logrus.FieldLogger
+	Logger             *slog.Logger
 	CtrlRuntimeManager ctrlRuntime.Manager
-	Config             ingressConfig
+	AgentConfig        *option.DaemonConfig
+	OperatorConfig     *operatorOption.OperatorConfig
+	IngressConfig      IngressConfig
 }
 
 func registerReconciler(params ingressParams) error {
-	if !params.Config.EnableIngressController {
+	if !params.IngressConfig.EnableIngressController {
 		return nil
 	}
+
+	if params.OperatorConfig.KubeProxyReplacement != option.KubeProxyReplacementTrue &&
+		!params.OperatorConfig.EnableNodePort {
+		params.Logger.Warn("Ingress Controller support requires either kube-proxy-replacement or enable-node-port enabled")
+		return nil
+	}
+
+	cecTranslator := translation.NewCECTranslator(translation.Config{
+		SecretsNamespace: params.IngressConfig.IngressSecretsNamespace,
+		HostNetworkConfig: translation.HostNetworkConfig{
+			Enabled:           params.IngressConfig.IngressHostnetworkEnabled,
+			NodeLabelSelector: translation.ParseNodeLabelSelector(params.IngressConfig.IngressHostnetworkNodelabelselector),
+		},
+		IPConfig: translation.IPConfig{
+			IPv4Enabled: params.AgentConfig.EnableIPv4,
+			IPv6Enabled: params.AgentConfig.EnableIPv6,
+		},
+		ListenerConfig: translation.ListenerConfig{
+			UseProxyProtocol:         params.IngressConfig.EnableIngressProxyProtocol,
+			StreamIdleTimeoutSeconds: params.OperatorConfig.ProxyStreamIdleTimeoutSeconds,
+		},
+		ClusterConfig: translation.ClusterConfig{
+			IdleTimeoutSeconds: params.OperatorConfig.ProxyIdleTimeoutSeconds,
+			UseAppProtocol:     false,
+		},
+		RouteConfig: translation.RouteConfig{
+			HostNameSuffixMatch: false,
+		},
+		OriginalIPDetectionConfig: translation.OriginalIPDetectionConfig{
+			XFFNumTrustedHops: params.IngressConfig.IngressDefaultXffNumTrustedHops,
+		},
+	})
+
+	dedicatedIngressTranslator := ingressTranslation.NewDedicatedIngressTranslator(params.Logger, cecTranslator, params.IngressConfig.IngressHostnetworkEnabled)
 
 	reconciler := newIngressReconciler(
 		params.Logger,
 		params.CtrlRuntimeManager.GetClient(),
+
+		cecTranslator,
+		dedicatedIngressTranslator,
+
 		operatorOption.Config.CiliumK8sNamespace,
-		params.Config.EnforceIngressHTTPS,
-		params.Config.EnableIngressProxyProtocol,
-		params.Config.IngressSecretsNamespace,
-		params.Config.IngressLBAnnotationPrefixes,
-		params.Config.IngressSharedLBServiceName,
-		params.Config.IngressDefaultLBMode,
-		params.Config.IngressDefaultSecretNamespace,
-		params.Config.IngressDefaultSecretName,
-		operatorOption.Config.ProxyIdleTimeoutSeconds,
+		params.IngressConfig.IngressLBAnnotationPrefixes,
+		params.IngressConfig.IngressSharedLBServiceName,
+		params.IngressConfig.IngressDefaultLBMode,
+		params.IngressConfig.IngressDefaultSecretNamespace,
+		params.IngressConfig.IngressDefaultSecretName,
+		params.IngressConfig.EnforceIngressHTTPS,
+		params.IngressConfig.IngressDefaultRequestTimeout,
+
+		params.IngressConfig.IngressHostnetworkEnabled,
+		params.IngressConfig.IngressHostnetworkSharedListenerPort,
 	)
 
 	if err := reconciler.SetupWithManager(params.CtrlRuntimeManager); err != nil {
@@ -101,7 +166,7 @@ func registerReconciler(params ingressParams) error {
 // registerSecretSync registers the Ingress Controller for secret synchronization based on TLS secrets referenced
 // by a Cilium Ingress resource.
 func registerSecretSync(params ingressParams) secretsync.SecretSyncRegistrationOut {
-	if !params.Config.EnableIngressController || !params.Config.EnableIngressSecretsSync {
+	if !params.IngressConfig.EnableIngressController || !params.IngressConfig.EnableIngressSecretsSync {
 		return secretsync.SecretSyncRegistrationOut{}
 	}
 
@@ -110,7 +175,7 @@ func registerSecretSync(params ingressParams) secretsync.SecretSyncRegistrationO
 			RefObject:            &networkingv1.Ingress{},
 			RefObjectEnqueueFunc: EnqueueReferencedTLSSecrets(params.CtrlRuntimeManager.GetClient(), params.Logger),
 			RefObjectCheckFunc:   IsReferencedByCiliumIngress,
-			SecretsNamespace:     params.Config.IngressSecretsNamespace,
+			SecretsNamespace:     params.IngressConfig.IngressSecretsNamespace,
 			// In addition to changed Ingresses an additional watch on IngressClass gets added.
 			// Its purpose is to detect any changes regarding the default IngressClass
 			// (that is marked via annotation).
@@ -126,10 +191,10 @@ func registerSecretSync(params ingressParams) secretsync.SecretSyncRegistrationO
 		},
 	}
 
-	if params.Config.IngressDefaultSecretName != "" && params.Config.IngressDefaultSecretNamespace != "" {
+	if params.IngressConfig.IngressDefaultSecretName != "" && params.IngressConfig.IngressDefaultSecretNamespace != "" {
 		registration.SecretSyncRegistration.DefaultSecret = &secretsync.DefaultSecret{
-			Namespace: params.Config.IngressDefaultSecretNamespace,
-			Name:      params.Config.IngressDefaultSecretName,
+			Namespace: params.IngressConfig.IngressDefaultSecretNamespace,
+			Name:      params.IngressConfig.IngressDefaultSecretName,
 		}
 	}
 

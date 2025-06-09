@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
 
-#include "common.h"
-
-#include "bpf/compiler.h"
 #include <bpf/ctx/skb.h>
+#include "common.h"
 #include "mock_skb_metadata.h"
 #include "pktgen.h"
 
@@ -31,7 +29,7 @@
 #define ENABLE_INTER_CLUSTER_SNAT
 
 /* Import map definitions and some default values */
-#include "node_config.h"
+#include <bpf/config/node.h>
 
 /* Overwrite the default port range defined in node_config.h
  * to have deterministic source port selection.
@@ -41,7 +39,7 @@
 #undef NODEPORT_PORT_MAX_NAT
 #define NODEPORT_PORT_MAX 32767
 #define NODEPORT_PORT_MIN_NAT (NODEPORT_PORT_MAX + 1)
-#define NODEPORT_PORT_MAX_NAT (NODEPORT_PORT_MIN_NAT + 1)
+#define NODEPORT_PORT_MAX_NAT (NODEPORT_PORT_MIN_NAT)
 
 /* Overwrite (local) CLUSTER_ID defined in node_config.h */
 #undef CLUSTER_ID
@@ -194,7 +192,7 @@ int to_overlay_syn_setup(struct __ctx_buff *ctx)
 	/* Emulate input from bpf_lxc */
 	ctx_set_cluster_id_mark(ctx, 2);
 
-	tail_call_static(ctx, &entry_call_map, TO_OVERLAY);
+	tail_call_static(ctx, entry_call_map, TO_OVERLAY);
 	return TEST_ERROR;
 }
 
@@ -246,11 +244,17 @@ int to_overlay_syn_check(struct __ctx_buff *ctx)
 	if (l3->daddr != BACKEND_IP)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0x4111))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != CLIENT_INTER_CLUSTER_SNAT_PORT)
 		test_fatal("src port hasn't been SNATed for inter-cluster communication");
 
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
+
+	if (l4->check != bpf_htons(0x777e))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	tuple.daddr = BACKEND_IP;
 	tuple.saddr = CLIENT_IP;
@@ -286,10 +290,10 @@ int from_overlay_synack_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "02_from_overlay_synack")
 int from_overlay_synack_setup(struct __ctx_buff *ctx)
 {
-	endpoint_v4_add_entry(CLIENT_IP, CLIENT_IFINDEX, 0, 0,
+	endpoint_v4_add_entry(CLIENT_IP, CLIENT_IFINDEX, 0, 0, 0, 0,
 			      (__u8 *)CLIENT_MAC, (__u8 *)CLIENT_ROUTER_MAC);
 
-	tail_call_static(ctx, &entry_call_map, FROM_OVERLAY);
+	tail_call_static(ctx, entry_call_map, FROM_OVERLAY);
 	return TEST_ERROR;
 }
 
@@ -343,15 +347,21 @@ int from_overlay_synack_check(struct __ctx_buff *ctx)
 	if (l3->daddr != CLIENT_IP)
 		test_fatal("dst IP hasn't been RevSNATed to client IP");
 
+	if (l3->check != bpf_htons(0xfa68))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != BACKEND_PORT)
 		test_fatal("src port has changed");
 
 	if (l4->dest != CLIENT_PORT)
 		test_fatal("dst port hasn't been RevSNATed to client port");
 
-	meta = ctx_load_meta(ctx, CB_IFINDEX);
-	if (meta != CLIENT_IFINDEX)
-		test_fatal("skb->cb[CB_IFINDEX] should be %d, got %d", CLIENT_IFINDEX, meta);
+	if (l4->check != bpf_htons(0x2fc5))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+
+	meta = ctx_load_meta(ctx, CB_DELIVERY_REDIRECT);
+	if (meta != 1)
+		test_fatal("skb->cb[CB_DELIVERY_REDIRECT] should be 1, got %d", meta);
 
 	meta = ctx_load_meta(ctx, CB_SRC_LABEL);
 	if (meta != BACKEND_IDENTITY)
@@ -385,7 +395,7 @@ int to_overlay_ack_setup(struct __ctx_buff *ctx)
 	/* Emulate input from bpf_lxc */
 	ctx_set_cluster_id_mark(ctx, 2);
 
-	tail_call_static(ctx, &entry_call_map, TO_OVERLAY);
+	tail_call_static(ctx, entry_call_map, TO_OVERLAY);
 	return TEST_ERROR;
 }
 
@@ -435,11 +445,17 @@ int to_overlay_ack_check(struct __ctx_buff *ctx)
 	if (l3->daddr != BACKEND_IP)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0x4111))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != CLIENT_INTER_CLUSTER_SNAT_PORT)
 		test_fatal("src port hasn't been SNATed for inter-cluster communication");
 
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
+
+	if (l4->check != bpf_htons(0x7770))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	test_finish();
 }

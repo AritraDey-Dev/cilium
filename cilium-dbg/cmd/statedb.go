@@ -4,96 +4,78 @@
 package cmd
 
 import (
-	"context"
-	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
-	"strings"
-	"text/tabwriter"
-	"time"
 
+	"github.com/cilium/statedb"
 	"github.com/spf13/cobra"
 
-	"github.com/cilium/cilium/pkg/datapath/tables"
-	"github.com/cilium/cilium/pkg/statedb"
+	clientPkg "github.com/cilium/cilium/pkg/client"
 )
 
 var StatedbCmd = &cobra.Command{
 	Use:   "statedb",
-	Short: "Inspect StateDB",
+	Short: "Inspect StateDB (deprecated)",
+	Run: func(cmd *cobra.Command, args []string) {
+		Fatalf(`This command has been deprecated and will be removed in the next Cilium release.
+
+StateDB tables can now be inspected via the Cilium shell:
+
+$ cilium-dbg shell
+cilium> help db
+(shows help for 'db' command)
+
+cilium> db
+(shows all registered tables)
+
+cilium> db/show health
+(shows contents of health table)
+
+$ cilium-dbg shell -- db/show health
+(shows contents of health table)
+
+$ cilium-dbg shell -- db/show -format=json health
+(shows contents as JSON)
+`)
+	},
 }
 
 var statedbDumpCmd = &cobra.Command{
 	Use:   "dump",
 	Short: "Dump StateDB contents as JSON",
 	Run: func(cmd *cobra.Command, args []string) {
-		_, err := client.Statedb.GetStatedbDump(nil, os.Stdout)
+		transport, err := clientPkg.NewTransport("")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %s\n", err)
-			os.Exit(1)
+			Fatalf("NewTransport: %s", err)
 		}
+		client := http.Client{Transport: transport}
+		resp, err := client.Get(statedbURL.JoinPath("dump").String())
+		if err != nil {
+			Fatalf("Get(dump): %s", err)
+		}
+		io.Copy(os.Stdout, resp.Body)
+		resp.Body.Close()
 	},
-}
-
-func statedbTableCommand[Obj statedb.TableWritable](tableName string) *cobra.Command {
-	var watchInterval time.Duration
-	cmd := &cobra.Command{
-		Use:   tableName,
-		Short: fmt.Sprintf("Show contents of table %q", tableName),
-		Run: func(cmd *cobra.Command, args []string) {
-			table := statedb.NewRemoteTable[Obj](client, tableName)
-
-			w := tabwriter.NewWriter(os.Stdout, 5, 0, 3, ' ', 0)
-			var obj Obj
-			fmt.Fprintf(w, "%s\n", strings.Join(obj.TableHeader(), "\t"))
-			defer w.Flush()
-
-			revision := statedb.Revision(0)
-
-			for {
-				// Query the contents of the table by revision, so that objects
-				// that were last modified are shown last.
-				iter, errChan := table.LowerBound(context.Background(), statedb.ByRevision[Obj](revision))
-
-				if iter != nil {
-					err := statedb.ProcessEach[Obj](
-						iter,
-						func(obj Obj, rev statedb.Revision) error {
-							// Remember the latest revision to query from.
-							revision = rev + 1
-							_, err := fmt.Fprintf(w, "%s\n", strings.Join(obj.TableRow(), "\t"))
-							return err
-						})
-					w.Flush()
-
-					if err != nil {
-						return
-					}
-				}
-
-				if err := <-errChan; err != nil {
-					Fatalf("LowerBound: %s", err)
-				}
-
-				if watchInterval == 0 {
-					break
-				}
-
-				time.Sleep(watchInterval)
-			}
-
-		},
-	}
-	cmd.Flags().DurationVarP(&watchInterval, "watch", "w", time.Duration(0), "Watch for new changes with the given interval (e.g. --watch=100ms)")
-	return cmd
 }
 
 func init() {
 	StatedbCmd.AddCommand(
 		statedbDumpCmd,
-
-		statedbTableCommand[*tables.Device]("devices"),
-		statedbTableCommand[*tables.Route]("routes"),
-		statedbTableCommand[*tables.L2AnnounceEntry]("l2-announce"),
 	)
 	RootCmd.AddCommand(StatedbCmd)
+}
+
+// StateDB HTTP handler is mounted at /statedb by configureAPIServer() in daemon/cmd/cells.go.
+var statedbURL, _ = url.Parse("http://localhost/statedb")
+
+func newRemoteTable[Obj any](tableName string) *statedb.RemoteTable[Obj] {
+	table := statedb.NewRemoteTable[Obj](statedbURL, tableName)
+	transport, err := clientPkg.NewTransport("")
+	if err != nil {
+		Fatalf("NewTransport: %s", err)
+	}
+	table.SetTransport(transport)
+	return table
 }

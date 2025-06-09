@@ -20,8 +20,6 @@ import (
 
 // Srv6 Status of the SRv6
 //
-// +k8s:deepcopy-gen=true
-//
 // swagger:model Srv6
 type Srv6 struct {
 
@@ -29,7 +27,7 @@ type Srv6 struct {
 	Enabled bool `json:"enabled,omitempty"`
 
 	// srv6 encap mode
-	// Enum: [SRH Reduced]
+	// Enum: ["SRH","Reduced"]
 	Srv6EncapMode string `json:"srv6EncapMode,omitempty"`
 }
 

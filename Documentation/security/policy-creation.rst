@@ -77,7 +77,7 @@ This approach is meant to be temporary.  **Restarting Cilium pod will reset the 
 Mode to match the daemon's configuration.**
 
 Policy Audit Mode is enabled for a given endpoint by modifying the endpoint configuration via
-the ``cilium`` tool on the endpoint's Kubernetes node. The steps include:
+the ``cilium-dbg`` tool on the endpoint's Kubernetes node. The steps include:
 
 #. Determine the endpoint id on which Policy Audit Mode will be enabled.
 #. Identify the Cilium pod running on the same Kubernetes node corresponding to the endpoint.
@@ -117,6 +117,7 @@ to allow that traffic.
 Apply a default-deny policy:
 
 .. literalinclude:: ../../examples/minikube/sw_deny_policy.yaml
+     :language: yaml
 
 CiliumNetworkPolicies match on pod labels using an ``endpointSelector`` to identify
 the sources and destinations to which the policy applies. The above policy denies
@@ -175,6 +176,7 @@ expect this traffic to arrive at the deathstar, we can form a policy to match
 the traffic:
 
 .. literalinclude:: ../../examples/minikube/sw_l3_l4_policy.yaml
+     :language: yaml
 
 To apply this L3/L4 policy, run:
 
@@ -220,7 +222,7 @@ after deploying the policy is to disable Policy Audit Mode again:
             configmap/cilium-config patched
             $ kubectl -n $CILIUM_NAMESPACE rollout restart ds/cilium
             daemonset.apps/cilium restarted
-            $ kubectl -n kube-system rollout status ds/cilium
+            $ kubectl -n $CILIUM_NAMESPACE rollout status ds/cilium
             Waiting for daemon set "cilium" rollout to finish: 0 of 1 updated pods are available...
             daemon set "cilium" successfully rolled out
 

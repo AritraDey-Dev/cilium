@@ -4,19 +4,15 @@
 package api
 
 import (
+	"context"
 	"fmt"
+	"slices"
 	"strings"
 )
 
 // Exists returns true if the HTTP rule already exists in the list of rules
 func (h *PortRuleHTTP) Exists(rules L7Rules) bool {
-	for _, existingRule := range rules.HTTP {
-		if h.Equal(existingRule) {
-			return true
-		}
-	}
-
-	return false
+	return slices.ContainsFunc(rules.HTTP, h.Equal)
 }
 
 // Equal returns true if both HTTP rules are equal
@@ -61,24 +57,12 @@ func (h *HeaderMatch) Equal(o *HeaderMatch) bool {
 
 // Exists returns true if the DNS rule already exists in the list of rules
 func (d *PortRuleDNS) Exists(rules L7Rules) bool {
-	for _, existingRule := range rules.DNS {
-		if d.Equal(existingRule) {
-			return true
-		}
-	}
-
-	return false
+	return slices.ContainsFunc(rules.DNS, d.Equal)
 }
 
 // Exists returns true if the L7 rule already exists in the list of rules
 func (h *PortRuleL7) Exists(rules L7Rules) bool {
-	for _, existingRule := range rules.L7 {
-		if h.Equal(existingRule) {
-			return true
-		}
-	}
-
-	return false
+	return slices.ContainsFunc(rules.L7, h.Equal)
 }
 
 // Equal returns true if both rules are equal
@@ -169,4 +153,28 @@ func ResourceQualifiedName(namespace, cecName, resourceName string, options ...O
 	sb.WriteString(resourceName)
 
 	return sb.String(), true
+}
+
+// ParseQualifiedName returns the namespace, name, and the resource name of a name qualified with ResourceQualifiedName()
+func ParseQualifiedName(qualifiedName string) (namespace, name, resourceName string) {
+	parts := strings.SplitN(qualifiedName, "/", 3)
+	if len(parts) < 3 {
+		return "", "", qualifiedName
+	}
+	return parts[0], parts[1], parts[2]
+}
+
+// ExtractCidrSet abstracts away some of the logic from the CreateDerivative methods
+func ExtractCidrSet(ctx context.Context, groups []Groups) ([]CIDRRule, error) {
+	var cidrSet []CIDRRule
+	for _, group := range groups {
+		c, err := group.GetCidrSet(ctx)
+		if err != nil {
+			return cidrSet, err
+		}
+		if len(c) > 0 {
+			cidrSet = append(cidrSet, c...)
+		}
+	}
+	return cidrSet, nil
 }

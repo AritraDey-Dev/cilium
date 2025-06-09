@@ -9,7 +9,7 @@ set -eux
 
 IMG_OWNER=${1:-cilium}
 IMG_TAG=${2:-latest}
-HELM_CHART_DIR=${3:-/vagrant/kubernetes/cilium}
+HELM_CHART_DIR=${3:-install/kubernetes/cilium}
 
 # With Kind we create three nodes cluster:
 #
@@ -33,7 +33,7 @@ helm install cilium ${HELM_CHART_DIR} \
     --set ipv6.enabled=true \
     --set routingMode='native' \
     --set bpf.masquerade=true \
-    --set kubeProxyReplacement=strict \
+    --set kubeProxyReplacement=true \
     --set ipam.mode=kubernetes \
     --set autoDirectNodeRoutes=true \
     --set hostLegacyRouting=false \

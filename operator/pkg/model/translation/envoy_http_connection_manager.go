@@ -4,26 +4,39 @@
 package translation
 
 import (
-	envoy_config_core "github.com/cilium/proxy/go/envoy/config/core/v3"
-	grpcStatsv3 "github.com/cilium/proxy/go/envoy/extensions/filters/http/grpc_stats/v3"
-	grpcWebv3 "github.com/cilium/proxy/go/envoy/extensions/filters/http/grpc_web/v3"
-	httpRouterv3 "github.com/cilium/proxy/go/envoy/extensions/filters/http/router/v3"
-	httpConnectionManagerv3 "github.com/cilium/proxy/go/envoy/extensions/filters/network/http_connection_manager/v3"
-	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/anypb"
+	envoy_config_core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	grpcStatsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/grpc_stats/v3"
+	grpcWebv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/grpc_web/v3"
+	httpRouterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
+	httpConnectionManagerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	operatorOption "github.com/cilium/cilium/operator/option"
 	"github.com/cilium/cilium/pkg/envoy"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 )
 
 type HttpConnectionManagerMutator func(*httpConnectionManagerv3.HttpConnectionManager) *httpConnectionManagerv3.HttpConnectionManager
 
-// NewHTTPConnectionManager returns a new HTTP connection manager filter with the given name and route.
-// Mutation functions can be passed to modify the filter based on the caller's needs.
-func NewHTTPConnectionManager(name, routeName string, mutationFunc ...HttpConnectionManagerMutator) (ciliumv2.XDSResource, error) {
+func WithInternalAddressConfig(enableIpv4, enableIpv6 bool) HttpConnectionManagerMutator {
+	return func(hcm *httpConnectionManagerv3.HttpConnectionManager) *httpConnectionManagerv3.HttpConnectionManager {
+		hcm.InternalAddressConfig = &httpConnectionManagerv3.HttpConnectionManager_InternalAddressConfig{
+			UnixSockets: false,
+			CidrRanges:  envoy.GetInternalListenerCIDRs(enableIpv4, enableIpv6),
+		}
+		return hcm
+	}
+}
+
+// httpConnectionManagerMutators returns a list of mutator functions for customizing the HTTP connection manager.
+func (i *cecTranslator) httpConnectionManagerMutators() []HttpConnectionManagerMutator {
+	return []HttpConnectionManagerMutator{
+		WithInternalAddressConfig(i.Config.IPConfig.IPv4Enabled, i.Config.IPConfig.IPv6Enabled),
+	}
+}
+
+// desiredHTTPConnectionManager returns a new HTTP connection manager filter with the given name and route.
+func (i *cecTranslator) desiredHTTPConnectionManager(name, routeName string) (ciliumv2.XDSResource, error) {
 	connectionManager := &httpConnectionManagerv3.HttpConnectionManager{
 		StatPrefix: name,
 		RouteSpecifier: &httpConnectionManagerv3.HttpConnectionManager_Rds{
@@ -65,26 +78,9 @@ func NewHTTPConnectionManager(name, routeName string, mutationFunc ...HttpConnec
 	}
 
 	// Apply mutation functions for customizing the connection manager.
-	for _, fn := range mutationFunc {
+	for _, fn := range i.httpConnectionManagerMutators() {
 		connectionManager = fn(connectionManager)
 	}
 
-	connectionManagerBytes, err := proto.Marshal(connectionManager)
-	if err != nil {
-		return ciliumv2.XDSResource{}, err
-	}
-
-	return ciliumv2.XDSResource{
-		Any: &anypb.Any{
-			TypeUrl: envoy.HttpConnectionManagerTypeURL,
-			Value:   connectionManagerBytes,
-		},
-	}, nil
-}
-
-func WithXffNumTrustedHops() func(*httpConnectionManagerv3.HttpConnectionManager) *httpConnectionManagerv3.HttpConnectionManager {
-	return func(connectionManager *httpConnectionManagerv3.HttpConnectionManager) *httpConnectionManagerv3.HttpConnectionManager {
-		connectionManager.XffNumTrustedHops = operatorOption.Config.IngressProxyXffNumTrustedHops
-		return connectionManager
-	}
+	return toXdsResource(connectionManager, envoy.HttpConnectionManagerTypeURL)
 }

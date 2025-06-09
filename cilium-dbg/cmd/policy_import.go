@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 
@@ -12,6 +13,7 @@ import (
 
 	"github.com/cilium/cilium/pkg/command"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/policy/api"
 )
 
 var printPolicy bool
@@ -30,7 +32,7 @@ var policyImportCmd = &cobra.Command{
 		if ruleList, err := loadPolicy(path); err != nil {
 			Fatalf("Cannot parse policy %s: %s\n", path, err)
 		} else {
-			log.WithField("rule", logfields.Repr(ruleList)).Debug("Constructed policy object for import")
+			log.Debug("Constructed policy object for import", logfields.Rule, ruleList)
 
 			// Ignore request if no policies have been found
 			if len(ruleList) == 0 {
@@ -40,7 +42,12 @@ var policyImportCmd = &cobra.Command{
 
 			for _, r := range ruleList {
 				if err := r.Sanitize(); err != nil {
-					Fatalf("%s", err)
+					if errors.Is(err, api.ErrFromToNodesRequiresNodeSelectorOption) {
+						// Don't error out as this can't be validated client-side
+						fmt.Printf("Validation of policy %s has been skipped in the client, further validation will occur server-side.\n", path)
+					} else {
+						Fatalf("%s", err)
+					}
 				}
 			}
 

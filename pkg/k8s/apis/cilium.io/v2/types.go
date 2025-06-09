@@ -17,6 +17,9 @@ import (
 	"github.com/cilium/cilium/pkg/node/addressing"
 )
 
+// +kubebuilder:validation:Format=cidr
+type IPv4orIPv6CIDR string
+
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +k8s:openapi-gen=false
@@ -24,7 +27,6 @@ import (
 // +kubebuilder:printcolumn:JSONPath=".status.identity.id",description="Security Identity",name="Security Identity",type=integer
 // +kubebuilder:printcolumn:JSONPath=".status.policy.ingress.state",description="Ingress enforcement in the endpoint",name="Ingress Enforcement",type=string,priority=1
 // +kubebuilder:printcolumn:JSONPath=".status.policy.egress.state",description="Egress enforcement in the endpoint",name="Egress Enforcement",type=string,priority=1
-// +kubebuilder:printcolumn:JSONPath=".status.visibility-policy-status",description="Status of visibility policy in the endpoint",name="Visibility Policy",type=string,priority=1
 // +kubebuilder:printcolumn:JSONPath=".status.state",description="Endpoint current state",name="Endpoint State",type=string
 // +kubebuilder:printcolumn:JSONPath=".status.networking.addressing[0].ipv4",description="Endpoint IPv4 address",name="IPv4",type=string
 // +kubebuilder:printcolumn:JSONPath=".status.networking.addressing[0].ipv6",description="Endpoint IPv6 address",name="IPv6",type=string
@@ -77,8 +79,6 @@ type EndpointStatus struct {
 
 	Policy *EndpointPolicy `json:"policy,omitempty"`
 
-	VisibilityPolicyStatus *string `json:"visibility-policy-status,omitempty"`
-
 	// State is the state of the endpoint.
 	//
 	// +kubebuilder:validation:Enum=creating;waiting-for-identity;not-ready;waiting-to-regenerate;regenerating;restoring;ready;disconnecting;disconnected;invalid
@@ -86,10 +86,6 @@ type EndpointStatus struct {
 
 	NamedPorts models.NamedPorts `json:"named-ports,omitempty"`
 }
-
-// EndpointStatusLogEntries is the maximum number of log entries in
-// EndpointStatus.Log.
-const EndpointStatusLogEntries = 5
 
 // +k8s:deepcopy-gen=false
 
@@ -346,6 +342,11 @@ type NodeSpec struct {
 	// typically refers to the identifier used by the cloud provider or
 	// some other means of identification.
 	InstanceID string `json:"instance-id,omitempty"`
+
+	// BootID is a unique node identifier generated on boot
+	//
+	// +kubebuilder:validation:Optional
+	BootID string `json:"bootid,omitempty"`
 
 	// Addresses is the list of all node addresses.
 	//

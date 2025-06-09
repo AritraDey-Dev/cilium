@@ -8,53 +8,57 @@ package linux
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"slices"
 	"strings"
 
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/statedb"
+	"github.com/spf13/pflag"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
-	"github.com/vishvananda/netns"
+	vns "github.com/vishvananda/netns"
+	"go4.org/netipx"
 	"golang.org/x/sys/unix"
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/asm"
-
-	"github.com/cilium/cilium/pkg/datapath/linux/probes"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/defaults"
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/inctimer"
-	"github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/cilium/cilium/pkg/statedb"
+	"github.com/cilium/cilium/pkg/netns"
+	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/time"
 )
 
 // DevicesControllerCell registers a controller that subscribes to network devices
-// and routes via netlink and populates the devices and routes devices.
+// and routes via netlink and populates the devices, routes and neighbors.
 var DevicesControllerCell = cell.Module(
 	"devices-controller",
-	"Synchronizes the device and route tables with the kernel",
+	"Synchronizes the device route and neighbor tables with the kernel",
 
-	// This controller owns the device and route tables. It provides
+	// This controller owns the device, route and neighbor tables. It provides
 	// the Table[*Device] from a constructor here to enforce start
 	// ordering and to populate the tables before there are any readers.
 	// But these cells are still usable directly in tests to provide
-	// the modules under test device and route test data.
+	// the modules under test device, route and neighbor test data.
 	cell.ProvidePrivate(
 		tables.NewDeviceTable,
 		tables.NewRouteTable,
+		tables.NewNeighborTable,
+	),
+	cell.Invoke(
+		statedb.RegisterTable[*tables.Device],
+		statedb.RegisterTable[*tables.Route],
+		statedb.RegisterTable[*tables.Neighbor],
 	),
 
 	cell.Provide(
 		newDevicesController,
-		newDeviceManager,
 	),
+	cell.Config(DevicesConfig{}),
 
 	// Always construct the devices controller. We provide the
 	// *devicesController for DeviceManager, but once it has been removed,
@@ -62,6 +66,16 @@ var DevicesControllerCell = cell.Module(
 	// controller jobs.
 	cell.Invoke(func(*devicesController) {}),
 )
+
+func (c DevicesConfig) Flags(flags *pflag.FlagSet) {
+	flags.StringSlice(option.Devices, []string{}, "List of devices facing cluster/external network (used for BPF NodePort, BPF masquerading and host firewall); supports '+' as wildcard in device name, e.g. 'eth+'")
+
+	flags.Bool(option.ForceDeviceDetection, false, "Forces the auto-detection of devices, even if specific devices are explicitly listed")
+
+	// Temporary flag until we start using the neighbor table more widely
+	flags.Bool("enable-statedb-neighbor-sync", false, "Enables synchronization of host neighbors to the neighbor table in statedb")
+	flags.MarkHidden("enable-statedb-neighbor-sync")
+}
 
 var (
 	// batchingDuration is the amount of time to wait for more
@@ -85,16 +99,23 @@ type DevicesConfig struct {
 	// If empty the devices are auto-detected according to rules defined
 	// by isSelectedDevice().
 	Devices []string
+	// ForceDeviceDetection forces the auto-detection of devices,
+	// even if user-specific devices are explicitly listed.
+	ForceDeviceDetection bool
+	// EnableStateDBNeighborSync enables synchronization of host neighbors
+	// to the neighbor table in statedb.
+	EnableStateDBNeighborSync bool
 }
 
 type devicesControllerParams struct {
 	cell.In
 
-	Config      DevicesConfig
-	Log         logrus.FieldLogger
-	DB          *statedb.DB
-	DeviceTable statedb.RWTable[*tables.Device]
-	RouteTable  statedb.RWTable[*tables.Route]
+	Config        DevicesConfig
+	Log           *slog.Logger
+	DB            *statedb.DB
+	DeviceTable   statedb.RWTable[*tables.Device]
+	RouteTable    statedb.RWTable[*tables.Route]
+	NeighborTable statedb.RWTable[*tables.Neighbor]
 
 	// netlinkFuncs is optional and used by tests to verify error handling behavior.
 	NetlinkFuncs *netlinkFuncs `optional:"true"`
@@ -102,11 +123,11 @@ type devicesControllerParams struct {
 
 type devicesController struct {
 	params devicesControllerParams
-	log    logrus.FieldLogger
+	log    *slog.Logger
 
-	initialized    chan struct{}
-	filter         deviceFilter
-	l3DevSupported bool
+	initialized          chan struct{}
+	filter               tables.DeviceFilter
+	enforceAutoDetection bool
 
 	// deadLinkIndexes tracks the set of links that have been deleted. This is needed
 	// to avoid processing route or address updates after a link delete as they may
@@ -116,32 +137,26 @@ type devicesController struct {
 	cancel context.CancelFunc // controller's context is cancelled when stopped.
 }
 
-func newDevicesController(lc hive.Lifecycle, p devicesControllerParams) (*devicesController, statedb.Table[*tables.Device], statedb.Table[*tables.Route]) {
-	p.DB.RegisterTable(
-		p.DeviceTable,
-		p.RouteTable,
-	)
+func newDevicesController(lc cell.Lifecycle, p devicesControllerParams) (*devicesController, statedb.Table[*tables.Device], statedb.Table[*tables.Route], statedb.Table[*tables.Neighbor]) {
 	dc := &devicesController{
-		params:          p,
-		initialized:     make(chan struct{}),
-		filter:          deviceFilter(p.Config.Devices),
-		log:             p.Log,
-		deadLinkIndexes: sets.New[int](),
+		params:               p,
+		initialized:          make(chan struct{}),
+		filter:               tables.DeviceFilter(p.Config.Devices),
+		enforceAutoDetection: p.Config.ForceDeviceDetection,
+		log:                  p.Log,
+		deadLinkIndexes:      sets.New[int](),
 	}
 	lc.Append(dc)
-	return dc, p.DeviceTable, p.RouteTable
+	return dc, p.DeviceTable, p.RouteTable, p.NeighborTable
 }
 
-func (dc *devicesController) Start(startCtx hive.HookContext) error {
+func (dc *devicesController) Start(startCtx cell.HookContext) error {
 	if dc.params.NetlinkFuncs == nil {
 		var err error
-		dc.params.NetlinkFuncs, err = makeNetlinkFuncs(netns.None())
+		dc.params.NetlinkFuncs, err = makeNetlinkFuncs()
 		if err != nil {
 			return err
 		}
-
-		// Only probe for L3 device support when netlink isn't mocked by tests.
-		dc.l3DevSupported = probes.HaveProgramHelper(ebpf.SchedCLS, asm.FnSkbChangeHead) == nil
 	}
 
 	var ctx context.Context
@@ -169,13 +184,10 @@ func (dc *devicesController) run(ctx context.Context) {
 	for ctx.Err() == nil {
 		dc.subscribeAndProcess(ctx)
 
-		t, stop := inctimer.New()
-
 		select {
 		case <-ctx.Done():
-			stop()
 			return
-		case <-t.After(restartWaitDuration):
+		case <-time.After(restartWaitDuration):
 		}
 	}
 }
@@ -189,7 +201,14 @@ func (dc *devicesController) subscribeAndProcess(ctx context.Context) {
 	// It cancels the context to unsubscribe from netlink updates
 	// which stops the processing.
 	errorCallback := func(err error) {
-		dc.log.WithError(err).Warn("Netlink error received, restarting")
+		if ctx.Err() != nil {
+			// The netlink unsubscribe can lead to errorCallback being called after
+			// context cancellation with a "receive called on closed socket".
+			// Thus ignore the error if the context was cancelled.
+			return
+		}
+
+		dc.log.Warn("Netlink error received, restarting", logfields.Error, err)
 
 		// Cancel the context to stop the subscriptions.
 		cancel()
@@ -197,20 +216,29 @@ func (dc *devicesController) subscribeAndProcess(ctx context.Context) {
 
 	addrUpdates := make(chan netlink.AddrUpdate)
 	if err := dc.params.NetlinkFuncs.AddrSubscribe(addrUpdates, ctx.Done(), errorCallback); err != nil {
-		dc.log.WithError(err).Warn("AddrSubscribe failed, restarting")
+		dc.log.Warn("AddrSubscribe failed, restarting", logfields.Error, err)
 		return
 	}
 	routeUpdates := make(chan netlink.RouteUpdate)
 	err := dc.params.NetlinkFuncs.RouteSubscribe(routeUpdates, ctx.Done(), errorCallback)
 	if err != nil {
-		dc.log.WithError(err).Warn("RouteSubscribe failed, restarting")
+		dc.log.Warn("RouteSubscribe failed, restarting", logfields.Error, err)
 		return
 	}
 	linkUpdates := make(chan netlink.LinkUpdate)
 	err = dc.params.NetlinkFuncs.LinkSubscribe(linkUpdates, ctx.Done(), errorCallback)
 	if err != nil {
-		dc.log.WithError(err).Warn("LinkSubscribe failed, restarting", err)
+		dc.log.Warn("LinkSubscribe failed, restarting", logfields.Error, err)
 		return
+	}
+	var neighborUpdates chan netlink.NeighUpdate
+	if dc.params.Config.EnableStateDBNeighborSync {
+		neighborUpdates = make(chan netlink.NeighUpdate)
+		err = dc.params.NetlinkFuncs.NeighSubscribe(neighborUpdates, ctx.Done(), errorCallback)
+		if err != nil {
+			dc.log.Warn("NeighSubscribe failed, restarting", logfields.Error, err)
+			return
+		}
 	}
 
 	// Initialize the tables by listing links, routes and addresses.
@@ -219,16 +247,16 @@ func (dc *devicesController) subscribeAndProcess(ctx context.Context) {
 	// ends and updates begin.
 	err = dc.initialize()
 	if err != nil {
-		dc.log.WithError(err).Warn("Initialization failed, restarting")
+		dc.log.Warn("Initialization failed, restarting", logfields.Error, err)
 		return
 	}
 
 	// Start processing the incremental updates until we're stopping or
 	// a failure is encountered.
-	dc.processUpdates(addrUpdates, routeUpdates, linkUpdates)
+	dc.processUpdates(addrUpdates, routeUpdates, linkUpdates, neighborUpdates)
 }
 
-func (dc *devicesController) Stop(hive.HookContext) error {
+func (dc *devicesController) Stop(cell.HookContext) error {
 	dc.cancel()
 
 	// Unfortunately vishvananda/netlink is buggy and does not return from Recvfrom even
@@ -285,12 +313,25 @@ func (dc *devicesController) initialize() error {
 			Route: route,
 		})
 	}
+	if dc.params.Config.EnableStateDBNeighborSync {
+		neighbors, err := dc.params.NetlinkFuncs.NeighList(0, netlink.FAMILY_ALL)
+		if err != nil {
+			return fmt.Errorf("NeighList failed: %w", err)
+		}
+		for _, neighbor := range neighbors {
+			batch[neighbor.LinkIndex] = append(batch[neighbor.LinkIndex], netlink.NeighUpdate{
+				Type:  unix.RTM_NEWNEIGH,
+				Neigh: neighbor,
+			})
+		}
+	}
 
-	txn := dc.params.DB.WriteTxn(dc.params.DeviceTable, dc.params.RouteTable)
+	txn := dc.params.DB.WriteTxn(dc.params.DeviceTable, dc.params.RouteTable, dc.params.NeighborTable)
 
 	// Flush existing data from potential prior run.
 	dc.params.DeviceTable.DeleteAll(txn)
 	dc.params.RouteTable.DeleteAll(txn)
+	dc.params.NeighborTable.DeleteAll(txn)
 
 	// Process the initial batch.
 	dc.processBatch(txn, batch)
@@ -308,13 +349,14 @@ func (dc *devicesController) initialize() error {
 
 func (dc *devicesController) deviceNameSet(txn statedb.ReadTxn) sets.Set[string] {
 	devs, _ := tables.SelectedDevices(dc.params.DeviceTable, txn)
-	return sets.New[string](tables.DeviceNames(devs)...)
+	return sets.New(tables.DeviceNames(devs)...)
 }
 
 func (dc *devicesController) processUpdates(
 	addrUpdates chan netlink.AddrUpdate,
 	routeUpdates chan netlink.RouteUpdate,
 	linkUpdates chan netlink.LinkUpdate,
+	neighborUpdates chan netlink.NeighUpdate,
 ) {
 	// Use a ticker to periodically commit the batch of updates to the device and route tables.
 	// We do this to reduce the number of write transactions to the state in cases like large
@@ -332,7 +374,7 @@ func (dc *devicesController) processUpdates(
 	// periodically commit it. We loop until all channels have
 	// been closed in order to release the netlink subscriptions
 	// when being stopped.
-	for addrUpdates != nil || routeUpdates != nil || linkUpdates != nil {
+	for addrUpdates != nil || routeUpdates != nil || linkUpdates != nil || neighborUpdates != nil {
 		select {
 		case u, ok := <-addrUpdates:
 			if !ok {
@@ -348,6 +390,13 @@ func (dc *devicesController) processUpdates(
 				appendUpdate(r.LinkIndex, r)
 			}
 
+		case n, ok := <-neighborUpdates:
+			if !ok {
+				neighborUpdates = nil
+			} else {
+				appendUpdate(n.LinkIndex, n)
+			}
+
 		case l, ok := <-linkUpdates:
 			if !ok {
 				linkUpdates = nil
@@ -357,7 +406,7 @@ func (dc *devicesController) processUpdates(
 
 		case <-ticker.C:
 			if len(batch) > 0 {
-				txn := dc.params.DB.WriteTxn(dc.params.DeviceTable, dc.params.RouteTable)
+				txn := dc.params.DB.WriteTxn(dc.params.DeviceTable, dc.params.RouteTable, dc.params.NeighborTable)
 				dc.processBatch(txn, batch)
 				txn.Commit()
 				batch = map[int][]any{}
@@ -368,11 +417,11 @@ func (dc *devicesController) processUpdates(
 
 func deviceAddressFromAddrUpdate(upd netlink.AddrUpdate) tables.DeviceAddress {
 	return tables.DeviceAddress{
-		Addr:      ip.MustAddrFromIP(upd.LinkAddress.IP),
+		Addr:      netipx.MustFromStdIP(upd.LinkAddress.IP),
 		Secondary: upd.Flags&unix.IFA_F_SECONDARY != 0,
 
 		// ifaddrmsg.ifa_scope is uint8, vishvananda/netlink has wrong type
-		Scope: uint8(upd.Scope),
+		Scope: tables.RouteScope(upd.Scope),
 	}
 }
 
@@ -386,6 +435,7 @@ func populateFromLink(d *tables.Device, link netlink.Link) {
 	d.RawFlags = a.RawFlags
 	d.MasterIndex = a.MasterIndex
 	d.Type = link.Type()
+	d.OperStatus = a.OperState.String()
 }
 
 // processBatch processes a batch of address, link and route updates.
@@ -394,7 +444,7 @@ func populateFromLink(d *tables.Device, link netlink.Link) {
 func (dc *devicesController) processBatch(txn statedb.WriteTxn, batch map[int][]any) {
 	before := dc.deviceNameSet(txn)
 	for index, updates := range batch {
-		d, _, _ := dc.params.DeviceTable.First(txn, tables.DeviceIDIndex.Query(index))
+		d, _, _ := dc.params.DeviceTable.Get(txn, tables.DeviceIDIndex.Query(index))
 		if d == nil {
 			// Unseen device. We may receive address updates before link updates
 			// and thus the only thing we know at this point is the index.
@@ -434,10 +484,11 @@ func (dc *devicesController) processBatch(txn statedb.WriteTxn, batch map[int][]
 					continue
 				}
 				r := tables.Route{
-					Table:     u.Table,
+					Table:     tables.RouteTable(u.Table),
 					LinkIndex: index,
 					Scope:     uint8(u.Scope),
 					Dst:       ipnetToPrefix(u.Family, u.Dst),
+					Priority:  u.Priority,
 				}
 				r.Src, _ = netip.AddrFromSlice(u.Src)
 				r.Gw, _ = netip.AddrFromSlice(u.Gw)
@@ -445,12 +496,57 @@ func (dc *devicesController) processBatch(txn statedb.WriteTxn, batch map[int][]
 				if u.Type == unix.RTM_NEWROUTE {
 					_, _, err := dc.params.RouteTable.Insert(txn, &r)
 					if err != nil {
-						dc.log.WithError(err).WithField(logfields.Route, r).Warn("Failed to insert route")
+						dc.log.Warn("Failed to insert route",
+							logfields.Error, err,
+							logfields.Route, r,
+						)
 					}
 				} else if u.Type == unix.RTM_DELROUTE {
 					_, _, err := dc.params.RouteTable.Delete(txn, &r)
 					if err != nil {
-						dc.log.WithError(err).WithField(logfields.Route, r).Warn("Failed to delete route")
+						dc.log.Warn("Failed to delete route",
+							logfields.Error, err,
+							logfields.Route, r,
+						)
+					}
+				}
+			case netlink.NeighUpdate:
+				if dc.deadLinkIndexes.Has(u.LinkIndex) {
+					// Ignore neighbor updates for a device that has been removed
+					continue
+				}
+				if u.State&netlink.NUD_NOARP != 0 {
+					// Ignore special entries with NUD_NOARP pseudo-state to keep the table smaller,
+					// as we do not have any use-case for them and they are quite numerous
+					// (`ip neigh show` filters them as well by default).
+					// They are safe to skip this way as their state never changes.
+					continue
+				}
+				n := tables.Neighbor{
+					LinkIndex:    index,
+					HardwareAddr: tables.HardwareAddr(u.HardwareAddr),
+					Type:         tables.NeighborType(u.Neigh.Type),
+					State:        tables.NeighborState(u.State),
+					Flags:        tables.NeighborFlags(u.Flags),
+					FlagsExt:     tables.NeighborFlagsExt(u.FlagsExt),
+				}
+				n.IPAddr, _ = netip.AddrFromSlice(u.IP)
+
+				if u.Type == unix.RTM_NEWNEIGH {
+					_, _, err := dc.params.NeighborTable.Insert(txn, &n)
+					if err != nil {
+						dc.log.Warn("Failed to insert neighbor",
+							logfields.Error, err,
+							logfields.Neighbor, n,
+						)
+					}
+				} else if u.Type == unix.RTM_DELNEIGH {
+					_, _, err := dc.params.NeighborTable.Delete(txn, &n)
+					if err != nil {
+						dc.log.Warn("Failed to delete neighbor",
+							logfields.Error, err,
+							logfields.Neighbor, n,
+						)
 					}
 				}
 			case netlink.LinkUpdate:
@@ -485,21 +581,31 @@ func (dc *devicesController) processBatch(txn statedb.WriteTxn, batch map[int][]
 
 			// Remove all routes for the device. For a deleted device netlink does not
 			// send complete set of route delete messages.
-			iter, _ := dc.params.RouteTable.Get(txn, tables.RouteLinkIndex.Query(d.Index))
-			for r, _, ok := iter.Next(); ok; r, _, ok = iter.Next() {
+			routes := dc.params.RouteTable.List(txn, tables.RouteLinkIndex.Query(d.Index))
+			for r := range routes {
 				dc.params.RouteTable.Delete(txn, r)
+			}
+
+			// Remove all neighbors for the device. For a deleted device netlink does not
+			// always send complete set of neighbor delete messages.
+			neighbors := dc.params.NeighborTable.List(txn, tables.NeighborLinkIndex.Query(d.Index))
+			for n := range neighbors {
+				dc.params.NeighborTable.Delete(txn, n)
 			}
 		} else if deviceUpdated {
 			// Create or update the device.
 			_, _, err := dc.params.DeviceTable.Insert(txn, d)
 			if err != nil {
-				dc.log.WithError(err).WithField(logfields.Device, d).Warn("Failed to insert route")
+				dc.log.Warn("Failed to insert device",
+					logfields.Error, err,
+					logfields.Device, d,
+				)
 			}
 		}
 	}
 	after := dc.deviceNameSet(txn)
 	if !before.Equal(after) {
-		dc.log.WithField(logfields.Devices, after.UnsortedList()).Info("Devices changed")
+		dc.log.Info("Devices changed", logfields.Devices, after.UnsortedList())
 	}
 }
 
@@ -524,34 +630,31 @@ func (dc *devicesController) isSelectedDevice(d *tables.Device, txn statedb.Writ
 		return false, "device has no addresses"
 	}
 
-	// Skip devices that have an excluded interface flag set.
-	if d.RawFlags&excludedIfFlagsMask != 0 {
-		return false, fmt.Sprintf("excluded flag set (mask=0x%x, flags=0x%x)", excludedIfFlagsMask, d.RawFlags)
-	}
-
 	// Skip devices that don't have the required flags set.
 	if d.RawFlags&requiredIfFlagsMask == 0 {
 		return false, fmt.Sprintf("missing required flag (mask=0x%x, flags=0x%x)", requiredIfFlagsMask, d.RawFlags)
 	}
 
+	// If user specified devices or wildcards, then skip the device if it doesn't match.
+	// If the device does match and user not requested auto detection, then skip further checks.
+	// If the device does match and user requested auto detection, then continue to further checks.
+	if dc.filter.NonEmpty() {
+		if dc.filter.Match(d.Name) {
+			return true, ""
+		}
+		if !dc.enforceAutoDetection {
+			return false, fmt.Sprintf("not matching user filter %v", dc.filter)
+		}
+	}
+
+	// Skip devices that have an excluded interface flag set.
+	if d.RawFlags&excludedIfFlagsMask != 0 {
+		return false, fmt.Sprintf("excluded flag set (mask=0x%x, flags=0x%x)", excludedIfFlagsMask, d.RawFlags)
+	}
+
 	// Ignore bridge and bonding slave devices
 	if d.MasterIndex != 0 {
 		return false, fmt.Sprintf("bridged or bonded to ifindex %d", d.MasterIndex)
-	}
-
-	// Ignore L3 devices if we cannot support them.
-	hasMacAddr := len(d.HardwareAddr) != 0
-	if !dc.l3DevSupported && !hasMacAddr {
-		return false, "L3 device, kernel too old, >= 5.8 required"
-	}
-
-	// If user specified devices or wildcards, then skip the device if it doesn't match.
-	// If the device does match, then skip further checks.
-	if dc.filter.nonEmpty() {
-		if dc.filter.match(d.Name) {
-			return true, ""
-		}
-		return false, fmt.Sprintf("not matching user filter %v", dc.filter)
 	}
 
 	// Never consider devices with any of the excluded devices.
@@ -567,7 +670,7 @@ func (dc *devicesController) isSelectedDevice(d *tables.Device, txn statedb.Writ
 		// the device manually).
 		// This is a workaround for kubernetes-in-docker. We want to avoid
 		// veth devices in general as they may be leftovers from another CNI.
-		if !dc.filter.nonEmpty() && !tables.HasDefaultRoute(dc.params.RouteTable, txn, d.Index) {
+		if !dc.filter.NonEmpty() && !tables.HasDefaultRoute(dc.params.RouteTable, txn, d.Index) {
 			return false, "veth without default route"
 		}
 
@@ -576,6 +679,12 @@ func (dc *devicesController) isSelectedDevice(d *tables.Device, txn statedb.Writ
 		// purposes. In the rare cases where a user wants to load datapath
 		// programs onto them they can override device detection with --devices.
 		return false, "bridge-like device, use --devices to override"
+
+	case "ipoib":
+		// Skip IPoIB devices since they are untested and assumed to not work.
+		// In the rare cases where a user wants to load datapath programs onto
+		// them they can override device detection with --devices.
+		return false, "IPoIB device, use --devices to override"
 	}
 
 	if !hasGlobalRoute(d.Index, dc.params.RouteTable, txn) {
@@ -586,9 +695,9 @@ func (dc *devicesController) isSelectedDevice(d *tables.Device, txn statedb.Writ
 }
 
 func hasGlobalRoute(devIndex int, tbl statedb.Table[*tables.Route], rxn statedb.ReadTxn) bool {
-	iter, _ := tbl.Get(rxn, tables.RouteLinkIndex.Query(devIndex))
+	routes := tbl.List(rxn, tables.RouteLinkIndex.Query(devIndex))
 	hasGlobal := false
-	for r, _, ok := iter.Next(); ok; r, _, ok = iter.Next() {
+	for r := range routes {
 		if r.Dst.Addr().IsGlobalUnicast() {
 			hasGlobal = true
 			break
@@ -598,88 +707,82 @@ func hasGlobalRoute(devIndex int, tbl statedb.Table[*tables.Route], rxn statedb.
 	return hasGlobal
 }
 
-// deviceFilter implements filtering device names either by
-// concrete name ("eth0") or by iptables-like wildcard ("eth+").
-type deviceFilter []string
-
-// nonEmpty returns true if the filter has been defined
-// (i.e. user has specified --devices).
-func (lst deviceFilter) nonEmpty() bool {
-	return len(lst) > 0
-}
-
-// match checks whether the given device name passes the filter
-func (lst deviceFilter) match(dev string) bool {
-	if len(lst) == 0 {
-		return true
-	}
-	for _, entry := range lst {
-		if strings.HasSuffix(entry, "+") {
-			prefix := strings.TrimRight(entry, "+")
-			if strings.HasPrefix(dev, prefix) {
-				return true
-			}
-		} else if dev == entry {
-			return true
-		}
-	}
-	return false
-}
-
 // netlinkFuncs wraps the netlink subscribe functions into a simpler interface to facilitate
 // testing of the error handling paths.
 type netlinkFuncs struct {
 	RouteSubscribe    func(ch chan<- netlink.RouteUpdate, done <-chan struct{}, errorCallback func(error)) error
 	AddrSubscribe     func(ch chan<- netlink.AddrUpdate, done <-chan struct{}, errorCallback func(error)) error
 	LinkSubscribe     func(ch chan<- netlink.LinkUpdate, done <-chan struct{}, errorCallback func(error)) error
+	NeighSubscribe    func(ch chan<- netlink.NeighUpdate, done <-chan struct{}, errorCallback func(error)) error
 	Close             func()
 	LinkList          func() ([]netlink.Link, error)
 	AddrList          func(link netlink.Link, family int) ([]netlink.Addr, error)
 	RouteListFiltered func(family int, filter *netlink.Route, filterMask uint64) ([]netlink.Route, error)
+	NeighList         func(linkIndex, family int) ([]netlink.Neigh, error)
 }
 
-func makeNetlinkFuncs(netns netns.NsHandle) (*netlinkFuncs, error) {
-	h, err := netlink.NewHandleAt(netns)
+// makeNetlinkFuncs returns a *netlinkFuncs containing netlink accessors to the
+// network namespace of the calling goroutine's OS thread.
+func makeNetlinkFuncs() (*netlinkFuncs, error) {
+	netlinkHandle, err := netlink.NewHandle(unix.NETLINK_ROUTE)
 	if err != nil {
-		return nil, fmt.Errorf("NewHandleAt failed: %w", err)
+		return nil, fmt.Errorf("creating netlink handle: %w", err)
+	}
+
+	cur, err := netns.Current()
+	if err != nil {
+		return nil, fmt.Errorf("getting current netns: %w", err)
 	}
 
 	return &netlinkFuncs{
 		RouteSubscribe: func(ch chan<- netlink.RouteUpdate, done <-chan struct{}, errorCallback func(error)) error {
-			return netlink.RouteSubscribeWithOptions(ch, done,
+			h := vns.NsHandle(cur.FD())
+			return safenetlink.RouteSubscribeWithOptions(ch, done,
 				netlink.RouteSubscribeOptions{
 					ListExisting:  false,
-					Namespace:     &netns,
 					ErrorCallback: errorCallback,
+					Namespace:     &h,
 				})
 		},
 		AddrSubscribe: func(ch chan<- netlink.AddrUpdate, done <-chan struct{}, errorCallback func(error)) error {
+			h := vns.NsHandle(cur.FD())
 			return netlink.AddrSubscribeWithOptions(ch, done,
 				netlink.AddrSubscribeOptions{
 					ListExisting:  false,
-					Namespace:     &netns,
 					ErrorCallback: errorCallback,
+					Namespace:     &h,
 				})
 		},
 		LinkSubscribe: func(ch chan<- netlink.LinkUpdate, done <-chan struct{}, errorCallback func(error)) error {
-			return netlink.LinkSubscribeWithOptions(ch, done,
+			h := vns.NsHandle(cur.FD())
+			return safenetlink.LinkSubscribeWithOptions(ch, done,
 				netlink.LinkSubscribeOptions{
 					ListExisting:  false,
-					Namespace:     &netns,
 					ErrorCallback: errorCallback,
+					Namespace:     &h,
 				})
 		},
-		Close:             h.Close,
-		LinkList:          h.LinkList,
-		AddrList:          h.AddrList,
-		RouteListFiltered: h.RouteListFiltered,
+		NeighSubscribe: func(ch chan<- netlink.NeighUpdate, done <-chan struct{}, errorCallback func(error)) error {
+			h := vns.NsHandle(cur.FD())
+			return safenetlink.NeighSubscribeWithOptions(ch, done,
+				netlink.NeighSubscribeOptions{
+					ListExisting:  false,
+					ErrorCallback: errorCallback,
+					Namespace:     &h,
+				})
+		},
+		Close:             netlinkHandle.Close,
+		LinkList:          netlinkHandle.LinkList,
+		AddrList:          netlinkHandle.AddrList,
+		RouteListFiltered: netlinkHandle.RouteListFiltered,
+		NeighList:         netlinkHandle.NeighList,
 	}, nil
 }
 
 func ipnetToPrefix(family int, ipn *net.IPNet) netip.Prefix {
 	if ipn != nil {
 		cidr, _ := ipn.Mask.Size()
-		return netip.PrefixFrom(ip.MustAddrFromIP(ipn.IP), cidr)
+		return netip.PrefixFrom(netipx.MustFromStdIP(ipn.IP), cidr)
 	}
 	return netip.PrefixFrom(zeroAddr(family), 0)
 }

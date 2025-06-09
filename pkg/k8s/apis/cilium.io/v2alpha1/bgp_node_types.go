@@ -12,7 +12,8 @@ import (
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:resource:categories={cilium,ciliumbgp},singular="ciliumbgpnodeconfig",path="ciliumbgpnodeconfigs",scope="Cluster",shortName={cbgpnode}
 // +kubebuilder:printcolumn:JSONPath=".metadata.creationTimestamp",name="Age",type=date
-// +kubebuilder:storageversion
+// +kubebuilder:subresource:status
+// +kubebuilder:deprecatedversion
 
 // CiliumBGPNodeConfig is node local configuration for BGP agent. Name of the object should be node name.
 // This resource will be created by Cilium operator and is read-only for the users.
@@ -26,6 +27,7 @@ type CiliumBGPNodeConfig struct {
 	Spec CiliumBGPNodeSpec `json:"spec"`
 
 	// Status is the most recently observed status of the CiliumBGPNodeConfig.
+	// +kubebuilder:validation:Optional
 	Status CiliumBGPNodeStatus `json:"status"`
 }
 
@@ -113,7 +115,7 @@ type CiliumBGPNodePeer struct {
 	// Supports extended 32bit ASNs
 	//
 	// +kubebuilder:validation:Optional
-	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=4294967295
 	PeerASN *int64 `json:"peerASN,omitempty"`
 
@@ -135,10 +137,18 @@ type CiliumBGPNodePeer struct {
 type CiliumBGPNodeStatus struct {
 	// BGPInstances is the status of the BGP instances on the node.
 	//
-	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Optional
 	// +listType=map
 	// +listMapKey=name
-	BGPInstances []CiliumBGPNodeInstanceStatus `json:"bgpInstances"`
+	BGPInstances []CiliumBGPNodeInstanceStatus `json:"bgpInstances,omitempty"`
+
+	// The current conditions of the CiliumBGPNodeConfig
+	//
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	// +deepequal-gen=false
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 type CiliumBGPNodeInstanceStatus struct {
@@ -187,20 +197,16 @@ type CiliumBGPNodePeerStatus struct {
 	// +kubebuilder:validation:Optional
 	Timers *CiliumBGPTimersState `json:"timers,omitempty"`
 
-	// Uptime is the time since the last peering session was established.
+	// EstablishedTime is the time when the peering session was established.
+	// It is represented in RFC3339 form and is in UTC.
 	//
 	// +kubebuilder:validation:Optional
-	Uptime *string `json:"uptime,omitempty"`
+	EstablishedTime *string `json:"establishedTime,omitempty"`
 
-	// RoutesReceived is the number of routes received from this peer.
+	// RouteCount is the number of routes exchanged with this peer per AFI/SAFI.
 	//
 	// +kubebuilder:validation:Optional
-	RoutesReceived *int32 `json:"routesReceived,omitempty"`
-
-	// RoutesAdvertised is the number of routes advertised to this peer.
-	//
-	// +kubebuilder:validation:Optional
-	RoutesAdvertised *int32 `json:"routesAdvertised,omitempty"`
+	RouteCount []BGPFamilyRouteCount `json:"routeCount,omitempty"`
 }
 
 // CiliumBGPTimersState is the state of the negotiated BGP timers for a peer.
@@ -215,3 +221,31 @@ type CiliumBGPTimersState struct {
 	// +kubebuilder:validation:Optional
 	AppliedKeepaliveSeconds *int32 `json:"appliedKeepaliveSeconds,omitempty"`
 }
+
+type BGPFamilyRouteCount struct {
+	// Afi is the Address Family Identifier (AFI) of the family.
+	//
+	// +kubebuilder:validation:Enum=ipv4;ipv6;l2vpn;ls;opaque
+	// +kubebuilder:validation:Required
+	Afi string `json:"afi"`
+
+	// Safi is the Subsequent Address Family Identifier (SAFI) of the family.
+	//
+	// +kubebuilder:validation:Enum=unicast;multicast;mpls_label;encapsulation;vpls;evpn;ls;sr_policy;mup;mpls_vpn;mpls_vpn_multicast;route_target_constraints;flowspec_unicast;flowspec_vpn;key_value
+	// +kubebuilder:validation:Required
+	Safi string `json:"safi"`
+
+	// Received is the number of routes received from this peer.
+	//
+	// +kubebuilder:validation:Optional
+	Received *int32 `json:"received,omitempty"`
+
+	// Advertised is the number of routes advertised to this peer.
+	//
+	// +kubebuilder:validation:Optional
+	Advertised *int32 `json:"advertised,omitempty"`
+}
+
+const (
+	BGPInstanceConditionReconcileError = "cilium.io/BGPReconcileError"
+)

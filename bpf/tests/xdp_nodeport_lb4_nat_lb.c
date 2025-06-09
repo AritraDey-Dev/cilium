@@ -1,24 +1,17 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
 
-#include "common.h"
-
 #include <bpf/ctx/xdp.h>
+#include "common.h"
 #include "pktgen.h"
-
-/* Set ETH_HLEN to 14 to indicate that the packet has a 14 byte ethernet header */
-#define ETH_HLEN 14
 
 /* Enable code paths under test */
 #define ENABLE_IPV4
 #define ENABLE_NODEPORT
 #define ENABLE_NODEPORT_ACCELERATION
 
-#define DISABLE_LOOPBACK_LB
-
-/* Skip ingress policy checks, not needed to validate hairpin flow */
+/* Skip ingress policy checks */
 #define USE_BPF_PROG_FOR_INGRESS_POLICY
-#undef FORCE_LOCAL_POLICY_EVAL_AT_SOURCE
 
 #define CLIENT_IP		v4_ext_one
 #define CLIENT_PORT		__bpf_htons(111)
@@ -43,13 +36,32 @@ static volatile const __u8 *node_mac = mac_three;
 static volatile const __u8 *local_backend_mac = mac_four;
 static volatile const __u8 *remote_backend_mac = mac_five;
 
-static __be16 nat_source_port;
-static bool fail_fib;
+#include <bpf/compiler.h>
+#include <bpf/helpers.h>
+#include <bpf/loader.h>
+#include <bpf/section.h>
+#include <linux/bpf.h>
+#include <linux/types.h>
+
+struct mock_settings {
+	__be16 nat_source_port;
+	bool fail_fib;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(struct mock_settings));
+	__uint(max_entries, 1);
+} settings_map __section_maps_btf;
 
 long mock_fib_lookup(__maybe_unused void *ctx, struct bpf_fib_lookup *params,
 		     __maybe_unused int plen, __maybe_unused __u32 flags)
 {
-	if (fail_fib)
+	__u32 key = 0;
+	struct mock_settings *settings = map_lookup_elem(&settings_map, &key);
+
+	if (settings && settings->fail_fib)
 		return BPF_FIB_LKUP_RET_NO_NEIGH;
 
 	params->ifindex = 0;
@@ -120,17 +132,17 @@ int nodeport_local_backend_setup(struct __ctx_buff *ctx)
 {
 	__u16 revnat_id = 1;
 
-	lb_v4_add_service(FRONTEND_IP_LOCAL, FRONTEND_PORT, 1, revnat_id);
+	lb_v4_add_service(FRONTEND_IP_LOCAL, FRONTEND_PORT, IPPROTO_TCP, 1, revnat_id);
 	lb_v4_add_backend(FRONTEND_IP_LOCAL, FRONTEND_PORT, 1, 124,
 			  BACKEND_IP_LOCAL, BACKEND_PORT, IPPROTO_TCP, 0);
 
 	/* add local backend */
-	endpoint_v4_add_entry(BACKEND_IP_LOCAL, 0, 0, 0,
+	endpoint_v4_add_entry(BACKEND_IP_LOCAL, 0, 0, 0, 0, 0,
 			      (__u8 *)local_backend_mac, (__u8 *)node_mac);
 	ipcache_v4_add_entry(BACKEND_IP_LOCAL, 0, 112233, 0, 0);
 
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, FROM_NETDEV);
+	tail_call_static(ctx, entry_call_map, FROM_NETDEV);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
 }
@@ -185,11 +197,17 @@ int nodeport_local_backend_check(const struct __ctx_buff *ctx)
 	if (l3->daddr != BACKEND_IP_LOCAL)
 		test_fatal("dst IP hasn't been NATed to local backend IP");
 
+	if (l3->check != bpf_htons(0x4112))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != CLIENT_PORT)
 		test_fatal("src port has changed");
 
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst TCP port hasn't been NATed to backend port");
+
+	if (l4->check != bpf_htons(0xd7d0))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	test_finish();
 }
@@ -230,14 +248,14 @@ int nodeport_nat_fwd_setup(struct __ctx_buff *ctx)
 {
 	__u16 revnat_id = 1;
 
-	lb_v4_add_service(FRONTEND_IP_REMOTE, FRONTEND_PORT, 1, revnat_id);
+	lb_v4_add_service(FRONTEND_IP_REMOTE, FRONTEND_PORT, IPPROTO_TCP, 1, revnat_id);
 	lb_v4_add_backend(FRONTEND_IP_REMOTE, FRONTEND_PORT, 1, 124,
 			  BACKEND_IP_REMOTE, BACKEND_PORT, IPPROTO_TCP, 0);
 
 	ipcache_v4_add_entry(BACKEND_IP_REMOTE, 0, 112233, 0, 0);
 
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, FROM_NETDEV);
+	tail_call_static(ctx, entry_call_map, FROM_NETDEV);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
 }
@@ -250,6 +268,7 @@ int nodeport_nat_fwd_check(__maybe_unused const struct __ctx_buff *ctx)
 	struct tcphdr *l4;
 	struct ethhdr *l2;
 	struct iphdr *l3;
+	__u32 key = 0;
 
 	test_init();
 
@@ -286,13 +305,19 @@ int nodeport_nat_fwd_check(__maybe_unused const struct __ctx_buff *ctx)
 	if (l3->daddr != BACKEND_IP_REMOTE)
 		test_fatal("dst IP hasn't been NATed to remote backend IP");
 
+	if (l3->check != bpf_htons(0xa711))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source == CLIENT_PORT)
 		test_fatal("src port hasn't been NATed");
 
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port hasn't been NATed to backend port");
 
-	nat_source_port = l4->source;
+	struct mock_settings *settings = map_lookup_elem(&settings_map, &key);
+
+	if (settings)
+		settings->nat_source_port = l4->source;
 
 	test_finish();
 }
@@ -302,6 +327,13 @@ static __always_inline int build_reply(struct __ctx_buff *ctx)
 	struct pktgen builder;
 	struct tcphdr *l4;
 	void *data;
+	__u16 nat_source_port = 0;
+	__u32 key = 0;
+
+	struct mock_settings *settings = map_lookup_elem(&settings_map, &key);
+
+	if (settings && settings->nat_source_port)
+		nat_source_port = settings->nat_source_port;
 
 	/* Init packet builder */
 	pktgen__init(&builder, ctx);
@@ -366,11 +398,17 @@ static __always_inline int check_reply(const struct __ctx_buff *ctx)
 	if (l3->daddr != CLIENT_IP)
 		test_fatal("dst IP hasn't been RevNATed to client IP");
 
+	if (l3->check != bpf_htons(0x4ca9))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != FRONTEND_PORT)
 		test_fatal("src port hasn't been RevNATed to frontend port");
 
 	if (l4->dest != CLIENT_PORT)
 		test_fatal("dst port hasn't been RevNATed to client port");
+
+	if (l4->check != bpf_htons(0x01a8))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	test_finish();
 }
@@ -388,7 +426,7 @@ SETUP("xdp", "xdp_nodeport_nat_fwd_reply")
 int nodeport_nat_fwd_reply_setup(struct __ctx_buff *ctx)
 {
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, FROM_NETDEV);
+	tail_call_static(ctx, entry_call_map, FROM_NETDEV);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
 }
@@ -412,10 +450,14 @@ int nodepoirt_nat_fwd_reply_no_fib_pktgen(struct __ctx_buff *ctx)
 SETUP("xdp", "xdp_nodeport_nat_fwd_reply_no_fib")
 int nodeport_nat_fwd_reply_no_fib_setup(struct __ctx_buff *ctx)
 {
-	fail_fib = 1;
+	__u32 key = 0;
+	struct mock_settings *settings = map_lookup_elem(&settings_map, &key);
+
+	if (settings)
+		settings->fail_fib = true;
 
 	/* Jump into the entrypoint */
-	tail_call_static(ctx, &entry_call_map, FROM_NETDEV);
+	tail_call_static(ctx, entry_call_map, FROM_NETDEV);
 	/* Fail if we didn't jump */
 	return TEST_ERROR;
 }

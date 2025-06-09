@@ -5,16 +5,17 @@ package identitybackend
 
 import (
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	. "github.com/cilium/checkmate"
-	"golang.org/x/net/context"
+	"github.com/cilium/hive/hivetest"
+	"github.com/stretchr/testify/require"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	"github.com/cilium/cilium/pkg/allocator"
-	"github.com/cilium/cilium/pkg/checker"
 	"github.com/cilium/cilium/pkg/identity/key"
 	"github.com/cilium/cilium/pkg/idpool"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
@@ -23,89 +24,61 @@ import (
 	"github.com/cilium/cilium/pkg/labels"
 )
 
-// Hook up gocheck into the "go test" runner.
-func Test(t *testing.T) {
-	TestingT(t)
-}
-
-type K8sIdentityBackendSuite struct{}
-
-var _ = Suite(&K8sIdentityBackendSuite{})
-
-func (s *K8sIdentityBackendSuite) TestSanitizeK8sLabels(c *C) {
+func TestSelectK8sLabels(t *testing.T) {
 	path := field.NewPath("test", "labels")
 	testCases := []struct {
-		input            map[string]string
-		selected         map[string]string
-		skipped          map[string]string
-		validationErrors field.ErrorList
+		input    map[string]string
+		selected map[string]string
 	}{
 		{
-			input:            map[string]string{},
-			selected:         map[string]string{},
-			skipped:          map[string]string{},
-			validationErrors: field.ErrorList{},
+			input:    map[string]string{},
+			selected: map[string]string{},
 		},
 		{
-			input:            map[string]string{"k8s:foo": "bar"},
-			selected:         map[string]string{"foo": "bar"},
-			skipped:          map[string]string{},
-			validationErrors: field.ErrorList{},
-		},
-		{
-			input:            map[string]string{"k8s:foo": "bar", "k8s:abc": "def"},
-			selected:         map[string]string{"foo": "bar", "abc": "def"},
-			skipped:          map[string]string{},
-			validationErrors: field.ErrorList{},
-		},
-		{
-			input:            map[string]string{"k8s:foo": "bar", "k8s:abc": "def", "container:something": "else"},
-			selected:         map[string]string{"foo": "bar", "abc": "def"},
-			skipped:          map[string]string{"container:something": "else"},
-			validationErrors: field.ErrorList{},
+			input:    map[string]string{"k8s:io.kubernetes.pod.namespace": "bar", "k8s:abc": "def", "container:something": "else"},
+			selected: map[string]string{"io.kubernetes.pod.namespace": "bar"},
 		},
 		{
 			input:    map[string]string{"k8s:some.really.really.really.really.really.really.really.long.label.name": "someval"},
-			selected: map[string]string{"some.really.really.really.really.really.really.really.long.label.name": "someval"},
-			skipped:  map[string]string{},
-			validationErrors: field.ErrorList{
-				&field.Error{
-					Type:     "FieldValueInvalid",
-					Field:    "test.labels",
-					BadValue: "some.really.really.really.really.really.really.really.long.label.name",
-					Detail:   "name part must be no more than 63 characters",
-				},
-			},
+			selected: map[string]string{},
 		},
 		{
-			input:            map[string]string{"k8s:io.cilium.k8s.namespace.labels.some.really.really.long.namespace.label.name": "someval"},
-			selected:         map[string]string{},
-			skipped:          map[string]string{"k8s:io.cilium.k8s.namespace.labels.some.really.really.long.namespace.label.name": "someval"},
-			validationErrors: field.ErrorList{},
+			input:    map[string]string{"k8s:io.cilium.k8s.namespace.labels.some.really.really.long.namespace.label.name": "someval"},
+			selected: map[string]string{},
+		},
+		{
+			input:    map[string]string{"k8s:io.cilium.k8s.policy.serviceaccount": "emr-containers-sa-spark-executor-123456789012-h94a5lkq1wmdnn0lu3ldn86aul757y413dgn7tj9zmkq4tujzz4mzp"},
+			selected: map[string]string{},
 		},
 	}
 
 	for _, test := range testCases {
-		selected, skipped := sanitizeK8sLabels(test.input)
-		c.Assert(selected, checker.DeepEquals, test.selected)
-		c.Assert(skipped, checker.DeepEquals, test.skipped)
-		c.Assert(validation.ValidateLabels(selected, path), checker.DeepEquals, test.validationErrors)
+		selected := SelectK8sLabels(test.input)
+		require.Equal(t, test.selected, selected)
+		require.Equal(t, field.ErrorList{}, validation.ValidateLabels(selected, path))
 	}
 }
 
-type FakeHandler struct{}
+type FakeHandler struct {
+	onUpsertFunc func()
+	onListDone   func()
+}
 
-func (f FakeHandler) OnListDone()                                       {}
-func (f FakeHandler) OnAdd(id idpool.ID, key allocator.AllocatorKey)    {}
-func (f FakeHandler) OnModify(id idpool.ID, key allocator.AllocatorKey) {}
+func (f FakeHandler) OnListDone() {
+	f.onListDone()
+}
+
+func (f FakeHandler) OnUpsert(id idpool.ID, key allocator.AllocatorKey) { f.onUpsertFunc() }
 func (f FakeHandler) OnDelete(id idpool.ID, key allocator.AllocatorKey) {}
 
 func getLabelsKey(rawMap map[string]string) allocator.AllocatorKey {
 	return &key.GlobalIdentity{LabelArray: labels.Map2Labels(rawMap, labels.LabelSourceK8s).LabelArray()}
 }
+
 func getLabelsMap(rawMap map[string]string) map[string]string {
 	return getLabelsKey(rawMap).GetAsMap()
 }
+
 func createCiliumIdentity(id int, labels map[string]string) v2.CiliumIdentity {
 	return v2.CiliumIdentity{
 		ObjectMeta: v1.ObjectMeta{
@@ -184,46 +157,60 @@ func TestGetIdentity(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
-			_, client := k8sClient.NewFakeClientset()
-			backend, err := NewCRDBackend(CRDBackendConfiguration{
-				Store:   nil,
-				Client:  client,
-				KeyFunc: (&key.GlobalIdentity{}).PutKeyFromMap,
-			})
-			ctx := context.Background()
-			stopChan := make(chan struct{}, 1)
-			defer func() {
-				stopChan <- struct{}{}
-			}()
-			go backend.ListAndWatch(ctx, FakeHandler{}, stopChan)
+			t.Parallel()
+			_, client := k8sClient.NewFakeClientset(hivetest.Logger(t))
+			backend, err := NewCRDBackend(hivetest.Logger(t),
+				CRDBackendConfiguration{
+					Store:    nil,
+					StoreSet: &atomic.Bool{},
+					Client:   client,
+					KeyFunc:  (&key.GlobalIdentity{}).PutKeyFromMap,
+				})
 			if err != nil {
 				t.Fatalf("Can't create CRD Backend: %s", err)
 			}
 
+			ctx := t.Context()
+
+			addWaitGroup := sync.WaitGroup{}
+			addWaitGroup.Add(len(tc.identities))
+
+			// To avoid a race, we must create these before we start ListAndWatch, see #30873. There
+			// is no easy way of knowing when the watch is established. Specifically, 'HasSynced'
+			// does _not_ guarantee it: the fake object tracker doesn't do resource versioning and
+			// hence cannot replay events in the reflector's gap between list and watch. Ironically,
+			// therefore, if we waited for the informer's HasSynced, we'd _increase_ the likelihood
+			// of the race. Avoid the whole issue by creating the objects before the informer is
+			// even started, thus guaranteeing the objects are part of the initial list.
 			for _, identity := range tc.identities {
 				_, err = client.CiliumV2().CiliumIdentities().Create(ctx, &identity, v1.CreateOptions{})
 				if err != nil {
 					t.Fatalf("Can't create identity %s: %s", identity.Name, err)
 				}
 			}
+
+			var listSynced sync.WaitGroup
+			listSynced.Add(1)
+			go backend.ListAndWatch(ctx, FakeHandler{
+				onListDone:   func() { listSynced.Done() },
+				onUpsertFunc: func() { addWaitGroup.Done() },
+			})
+
 			// Wait for watcher to process the identities in the background
-			for i := 0; i < 10; i++ {
-				id, err := backend.Get(ctx, tc.requestedKey)
-				if err != nil {
-					t.Fatalf("Can't get identity by key %s: %s", tc.requestedKey.GetKey(), err)
-				}
-				if id == idpool.NoID {
-					time.Sleep(25 * time.Millisecond)
-					continue
-				}
-				if id.String() != tc.expectedId {
-					t.Errorf("Expected key %s, got %s", tc.expectedId, id.String())
-				} else {
-					return
-				}
+			addWaitGroup.Wait()
+			listSynced.Wait()
+
+			id, err := backend.Get(ctx, tc.requestedKey)
+			if err != nil {
+				t.Fatalf("Can't get identity by key %s: %s", tc.requestedKey.GetKey(), err)
 			}
-			if tc.expectedId != idpool.NoID.String() {
+
+			if id == idpool.NoID && tc.expectedId != idpool.NoID.String() {
 				t.Errorf("Identity not found in the store")
+			}
+
+			if id.String() != tc.expectedId {
+				t.Errorf("Expected key %s, got %s", tc.expectedId, id.String())
 			}
 		})
 	}

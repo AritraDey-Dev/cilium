@@ -3,7 +3,7 @@ This page guides you through the different mechanics of Gateway API and how to t
 Be sure to follow the Generic and Setup Verification steps from the :ref:`Troubleshooting Ingress & Service Mesh page<troubleshooting_servicemesh>`.
 
 Checking resources
-----------------------
+******************
 
 #. Check the Gateway resource 
 
@@ -126,8 +126,23 @@ Checking resources
   
   If any of these are set to false, you can get more information by looking at the ``Message`` and ``Reason`` fields.
 
+#. Check Cilium Operator logs
+
+  The Cilium Operator logs may contain further debugging information. For example, if the required Custom Resource Definitions (CRDs) are not installed, an error will be logged:
+
+  .. code-block:: shell-session
+    
+    $ kubectl logs -n kube-system deployments/cilium-operator | grep gateway
+    level=error msg="Required GatewayAPI resources are not found, please
+    refer to docs for installation instructions" error="customresourcedefinitions.apiextensions.k8s.io \"gatewayclasses.gateway.networking.k8s.io\" not found
+    customresourcedefinitions.apiextensions.k8s.io \"gateways.gateway.networking.k8s.io\" not found
+    customresourcedefinitions.apiextensions.k8s.io \"httproutes.gateway.networking.k8s.io\" not found
+    customresourcedefinitions.apiextensions.k8s.io \"referencegrants.gateway.networking.k8s.io\" not found
+    customresourcedefinitions.apiextensions.k8s.io \"grpcroutes.gateway.networking.k8s.io\" not found
+    customresourcedefinitions.apiextensions.k8s.io \"tlsroutes.gateway.networking.k8s.io\" not found" subsys=gateway-api
+
 Common mistakes
----------------
+***************
 
 .. include:: mistakes-warning.rst
 
@@ -162,14 +177,14 @@ Common mistakes
   Parents:
     Conditions:
       Last Transition Time:  2023-06-06T13:56:40Z
-      Message:               Gateway.gateway.networking.k8s.io "my-gatewai" not found
+      Message:               Gateway.gateway.networking.k8s.io "my-gateway" not found
       Observed Generation:   2
         Reason:                InvalidHTTPRoute
         Status:                False
         Type:                  Accepted
 
 Underlying mechanics: a high level overview
--------------------------------------------
+*******************************************
 
 A Cilium deployment has two parts that handle Gateway API resources: the Cilium agent and the Cilium operator.
 

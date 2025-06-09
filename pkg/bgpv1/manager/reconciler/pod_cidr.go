@@ -6,11 +6,14 @@ package reconciler
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/netip"
+
+	"github.com/cilium/hive/cell"
 
 	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/types"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/option"
 )
 
 type ExportPodCIDRReconcilerOut struct {
@@ -21,14 +24,22 @@ type ExportPodCIDRReconcilerOut struct {
 
 // exportPodCIDRReconciler is a ConfigReconciler which reconciles the
 // advertisement of the private Kubernetes PodCIDR block.
-type ExportPodCIDRReconciler struct{}
+type ExportPodCIDRReconciler struct {
+	Logger *slog.Logger
+}
 
 // ExportPodCIDRReconcilerMetadata keeps a list of all advertised Paths
 type ExportPodCIDRReconcilerMetadata []*types.Path
 
-func NewExportPodCIDRReconciler() ExportPodCIDRReconcilerOut {
+func NewExportPodCIDRReconciler(logger *slog.Logger, dc *option.DaemonConfig) ExportPodCIDRReconcilerOut {
+	// Don't provide the reconciler if the IPAM mode is not supported
+	if !types.CanAdvertisePodCIDR(dc.IPAMMode()) {
+		logger.Info("Unsupported IPAM mode, disabling PodCIDR advertisements. exportPodCIDR doesn't take effect.")
+		return ExportPodCIDRReconcilerOut{}
+	}
+
 	return ExportPodCIDRReconcilerOut{
-		Reconciler: &ExportPodCIDRReconciler{},
+		Reconciler: &ExportPodCIDRReconciler{Logger: logger},
 	}
 }
 
@@ -39,6 +50,12 @@ func (r *ExportPodCIDRReconciler) Name() string {
 func (r *ExportPodCIDRReconciler) Priority() int {
 	return 30
 }
+
+func (r *ExportPodCIDRReconciler) Init(_ *instance.ServerWithConfig) error {
+	return nil
+}
+
+func (r *ExportPodCIDRReconciler) Cleanup(_ *instance.ServerWithConfig) {}
 
 func (r *ExportPodCIDRReconciler) Reconcile(ctx context.Context, p ReconcileParams) error {
 	if p.DesiredConfig == nil {
@@ -61,6 +78,7 @@ func (r *ExportPodCIDRReconciler) Reconcile(ctx context.Context, p ReconcilePara
 	}
 
 	advertisements, err := exportAdvertisementsReconciler(&advertisementsReconcilerParams{
+		logger:    r.Logger,
 		ctx:       ctx,
 		name:      "pod CIDR",
 		component: "exportPodCIDRReconciler",

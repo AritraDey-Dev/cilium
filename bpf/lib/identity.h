@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_IDENTITY_H_
-#define __LIB_IDENTITY_H_
+#pragma once
 
 #include "dbg.h"
 
@@ -11,8 +10,13 @@ static __always_inline bool identity_in_range(__u32 identity, __u32 range_start,
 	return range_start <= identity && identity <= range_end;
 }
 
-#define IDENTITY_SCOPE_MASK 0xFF000000
-#define IDENTITY_SCOPE_REMOTE_NODE 0x02000000
+#define IDENTITY_LOCAL_SCOPE_MASK 0xFF000000
+#define IDENTITY_LOCAL_SCOPE_REMOTE_NODE 0x02000000
+
+static __always_inline bool identity_is_host(__u32 identity)
+{
+	return identity == HOST_ID;
+}
 
 static __always_inline bool identity_is_remote_node(__u32 identity)
 {
@@ -37,12 +41,12 @@ static __always_inline bool identity_is_remote_node(__u32 identity)
 	 */
 	return identity == REMOTE_NODE_ID ||
 		identity == KUBE_APISERVER_NODE_ID ||
-		(identity & IDENTITY_SCOPE_MASK) == IDENTITY_SCOPE_REMOTE_NODE;
+		(identity & IDENTITY_LOCAL_SCOPE_MASK) == IDENTITY_LOCAL_SCOPE_REMOTE_NODE;
 }
 
 static __always_inline bool identity_is_node(__u32 identity)
 {
-	return identity == HOST_ID || identity_is_remote_node(identity);
+	return identity_is_host(identity) || identity_is_remote_node(identity);
 }
 
 /**
@@ -110,6 +114,15 @@ static __always_inline bool identity_is_world_ipv6(__u32 identity)
 }
 
 /**
+ * identity_is_cidr_range is used to determine whether an identity is assigned
+ * to a CIDR range.
+ */
+static __always_inline bool identity_is_cidr_range(__u32 identity)
+{
+	return identity_in_range(identity, CIDR_IDENTITY_RANGE_START, CIDR_IDENTITY_RANGE_END);
+}
+
+/**
  * identity_is_cluster is used to determine whether an identity is assigned to
  * an entity inside the cluster.
  *
@@ -139,8 +152,7 @@ static __always_inline bool identity_is_cluster(__u32 identity)
 		return false;
 #endif
 
-	if (identity_in_range(identity, CIDR_IDENTITY_RANGE_START,
-			      CIDR_IDENTITY_RANGE_END))
+	if (identity_is_cidr_range(identity))
 		return false;
 
 	return true;
@@ -171,28 +183,6 @@ static __always_inline __u32 inherit_identity_from_host(struct __ctx_buff *ctx, 
 		*identity = HOST_ID;
 	} else if (magic == MARK_MAGIC_ENCRYPT) {
 		*identity = ctx_load_meta(ctx, CB_ENCRYPT_IDENTITY);
-
-		/* Special case needed to handle upgrades. Can be removed in v1.15.
-		 * Before the upgrade, bpf_lxc will write the tunnel endpoint in
-		 * skb->cb[4]. After the upgrade, it will write the security identity.
-		 * For the upgrade to happen without drops, bpf_host thus needs to
-		 * handle both cases.
-		 * We can distinguish between the two cases by looking at the first
-		 * byte. Identities are on 24-bits so the first byte will be zero;
-		 * conversely, tunnel endpoint addresses within the range 0.0.0.0/8
-		 * (first byte is zero) are impossible because special purpose
-		 * (RFC6890).
-		 */
-		if ((*identity & 0xFF000000) != 0) {
-			/* skb->cb[4] was actually carrying the tunnel endpoint and the
-			 * security identity is in the mark.
-			 */
-			*identity = get_identity(ctx);
-		}
-#if defined(ENABLE_L7_LB)
-	} else if (magic == MARK_MAGIC_PROXY_EGRESS_EPID) {
-		*identity = get_epid(ctx); /* endpoint identity, not security identity! */
-#endif
 	} else {
 #if defined ENABLE_IPV4 && defined ENABLE_IPV6
 		__u16 proto = ctx_get_protocol(ctx);
@@ -211,16 +201,17 @@ static __always_inline __u32 inherit_identity_from_host(struct __ctx_buff *ctx, 
 	/* Reset packet mark to avoid hitting routing rules again */
 	ctx->mark = 0;
 
-#if defined(ENABLE_L7_LB)
-	/* Caller tail calls back to source endpoint egress in this case,
-	 * do not log the (world) identity.
-	 */
-	if (magic != MARK_MAGIC_PROXY_EGRESS_EPID)
-#endif
-		cilium_dbg(ctx, DBG_INHERIT_IDENTITY, *identity, 0);
+	cilium_dbg(ctx, DBG_INHERIT_IDENTITY, *identity, 0);
 
 	return magic;
 }
 #endif /* __ctx_is == __ctx_skb */
 
-#endif
+/**
+ * identity_is_local is used to determine whether an identity is locally
+ * allocated.
+ */
+static __always_inline bool identity_is_local(__u32 identity)
+{
+	return (identity & IDENTITY_LOCAL_SCOPE_MASK) != 0;
+}

@@ -93,11 +93,13 @@ func (s *server) serve() error {
 	serve := func(lis net.Listener) {
 		defer wg.Done()
 		err := s.grpcServer.Serve(lis)
-		s.bgpServer.logger.Warn("accept failed",
-			log.Fields{
-				"Topic": "grpc",
-				"Key":   lis,
-				"Error": err})
+		if err != nil {
+			s.bgpServer.logger.Warn("accept failed",
+				log.Fields{
+					"Topic": "grpc",
+					"Key":   lis.Addr().String(),
+					"Error": err})
+		}
 	}
 
 	for _, lis := range l {
@@ -190,6 +192,21 @@ func toPathAPI(binNlri []byte, binPattrs [][]byte, anyNlri *apb.Any, anyPattrs [
 	return p
 }
 
+func eorToPathAPI(path *table.Path) *api.Path {
+	nlri := path.GetNlri()
+	p := &api.Path{
+		Age:        tspb.New(path.GetTimestamp()),
+		IsWithdraw: path.IsWithdraw,
+		Family:     &api.Family{Afi: api.Family_Afi(nlri.AFI()), Safi: api.Family_Safi(nlri.SAFI())},
+	}
+	if s := path.GetSource(); s != nil {
+		p.SourceAsn = s.AS
+		p.SourceId = s.ID.String()
+		p.NeighborIp = s.Address.String()
+	}
+	return p
+}
+
 func toPathApi(path *table.Path, v *table.Validation, onlyBinary, nlriBinary, attributeBinary bool) *api.Path {
 	var (
 		anyNlri   *apb.Any
@@ -244,8 +261,8 @@ func (s *server) ListPath(r *api.ListPathRequest, stream api.GobgpApi_ListPathSe
 	}
 	var sendErr error
 	err := s.bgpServer.ListPath(ctx, r, func(d *api.Destination) {
-		if uint64(len(l)) < batchSize {
-			l = append(l, d)
+		l = append(l, d)
+		if uint64(len(l)) <= batchSize {
 			return
 		}
 		if sendErr = send(); sendErr != nil {
@@ -674,6 +691,7 @@ func newNeighborFromAPIStruct(a *api.Peer) (*oc.Neighbor, error) {
 		pconf.Config.Vrf = a.Conf.Vrf
 		pconf.AsPathOptions.Config.AllowOwnAs = uint8(a.Conf.AllowOwnAsn)
 		pconf.AsPathOptions.Config.ReplacePeerAs = a.Conf.ReplacePeerAsn
+		pconf.AsPathOptions.Config.AllowAsPathLoopLocal = a.Conf.AllowAspathLoopLocal
 		pconf.Config.SendSoftwareVersion = a.Conf.SendSoftwareVersion
 
 		switch a.Conf.RemovePrivate {
@@ -801,6 +819,7 @@ func newPeerGroupFromAPIStruct(a *api.PeerGroup) (*oc.PeerGroup, error) {
 		pconf.Config.RouteFlapDamping = a.Conf.RouteFlapDamping
 		pconf.Config.Description = a.Conf.Description
 		pconf.Config.PeerGroupName = a.Conf.PeerGroupName
+		pconf.Config.SendSoftwareVersion = a.Conf.SendSoftwareVersion
 
 		switch a.Conf.RemovePrivate {
 		case api.RemovePrivate_REMOVE_ALL:
@@ -1105,6 +1124,12 @@ func toStatementApi(s *oc.Statement) *api.Statement {
 			Name: s.Conditions.MatchNeighborSet.NeighborSet,
 		}
 	}
+	if s.Conditions.BgpConditions.CommunityCount.Operator != "" {
+		cs.CommunityCount = &api.CommunityCount{
+			Count: s.Conditions.BgpConditions.CommunityCount.Value,
+			Type:  api.CommunityCount_Type(s.Conditions.BgpConditions.CommunityCount.Operator.ToInt()),
+		}
+	}
 	if s.Conditions.BgpConditions.AsPathLength.Operator != "" {
 		cs.AsPathLength = &api.AsPathLength{
 			Length: s.Conditions.BgpConditions.AsPathLength.Value,
@@ -1233,14 +1258,18 @@ func toStatementApi(s *oc.Statement) *api.Statement {
 				return nil
 			}
 
-			if string(s.Actions.BgpActions.SetNextHop) == "self" {
+			switch string(s.Actions.BgpActions.SetNextHop) {
+			case "self":
 				return &api.NexthopAction{
 					Self: true,
 				}
-			}
-			if string(s.Actions.BgpActions.SetNextHop) == "unchanged" {
+			case "unchanged":
 				return &api.NexthopAction{
 					Unchanged: true,
+				}
+			case "peer-address":
+				return &api.NexthopAction{
+					PeerAddress: true,
 				}
 			}
 			return &api.NexthopAction{
@@ -1252,6 +1281,23 @@ func toStatementApi(s *oc.Statement) *api.Statement {
 				return nil
 			}
 			return &api.LocalPrefAction{Value: s.Actions.BgpActions.SetLocalPref}
+		}(),
+		OriginAction: func() *api.OriginAction {
+			if s.Actions.BgpActions.SetRouteOrigin.ToInt() == -1 {
+				return nil
+			}
+			var apiOrigin api.RouteOriginType
+			switch s.Actions.BgpActions.SetRouteOrigin {
+			case oc.BGP_ORIGIN_ATTR_TYPE_IGP:
+				apiOrigin = api.RouteOriginType_ORIGIN_IGP
+			case oc.BGP_ORIGIN_ATTR_TYPE_EGP:
+				apiOrigin = api.RouteOriginType_ORIGIN_EGP
+			case oc.BGP_ORIGIN_ATTR_TYPE_INCOMPLETE:
+				apiOrigin = api.RouteOriginType_ORIGIN_INCOMPLETE
+			default:
+				return nil
+			}
+			return &api.OriginAction{Origin: apiOrigin}
 		}(),
 	}
 	return &api.Statement{
@@ -1319,6 +1365,16 @@ func newNeighborConditionFromApiStruct(a *api.MatchSet) (*table.NeighborConditio
 	return table.NewNeighborCondition(c)
 }
 
+func newCommunityCountConditionFromApiStruct(a *api.CommunityCount) (*table.CommunityCountCondition, error) {
+	if a == nil {
+		return nil, nil
+	}
+	return table.NewCommunityCountCondition(oc.CommunityCount{
+		Operator: oc.IntToAttributeComparisonMap[int(a.Type)],
+		Value:    a.Count,
+	})
+}
+
 func newAsPathLengthConditionFromApiStruct(a *api.AsPathLength) (*table.AsPathLengthCondition, error) {
 	if a == nil {
 		return nil, nil
@@ -1360,6 +1416,24 @@ func newRouteTypeConditionFromApiStruct(a api.Conditions_RouteType) (*table.Rout
 		return nil, fmt.Errorf("invalid route type: %d", a)
 	}
 	return table.NewRouteTypeCondition(typ)
+}
+
+func newOriginConditionFromApiStruct(apiOrigin api.RouteOriginType) (*table.OriginCondition, error) {
+	var origin oc.BgpOriginAttrType
+	switch apiOrigin {
+	case api.RouteOriginType_ORIGIN_NONE:
+		return nil, nil
+	case api.RouteOriginType_ORIGIN_IGP:
+		origin = oc.BGP_ORIGIN_ATTR_TYPE_IGP
+	case api.RouteOriginType_ORIGIN_EGP:
+		origin = oc.BGP_ORIGIN_ATTR_TYPE_EGP
+	case api.RouteOriginType_ORIGIN_INCOMPLETE:
+		origin = oc.BGP_ORIGIN_ATTR_TYPE_INCOMPLETE
+	default:
+		return nil, fmt.Errorf("unrecognized route origin type: %v", apiOrigin)
+	}
+
+	return table.NewOriginCondition(origin)
 }
 
 func newCommunityConditionFromApiStruct(a *api.MatchSet) (*table.CommunityCondition, error) {
@@ -1494,6 +1568,28 @@ func newLocalPrefActionFromApiStruct(a *api.LocalPrefAction) (*table.LocalPrefAc
 	return table.NewLocalPrefAction(a.Value)
 }
 
+func newOriginActionFromApiStruct(a *api.OriginAction) (*table.OriginAction, error) {
+	if a == nil {
+		return nil, nil
+	}
+
+	var origin oc.BgpOriginAttrType
+	switch v := a.GetOrigin(); v {
+	case api.RouteOriginType_ORIGIN_NONE:
+		return nil, nil
+	case api.RouteOriginType_ORIGIN_IGP:
+		origin = oc.BGP_ORIGIN_ATTR_TYPE_IGP
+	case api.RouteOriginType_ORIGIN_EGP:
+		origin = oc.BGP_ORIGIN_ATTR_TYPE_EGP
+	case api.RouteOriginType_ORIGIN_INCOMPLETE:
+		origin = oc.BGP_ORIGIN_ATTR_TYPE_INCOMPLETE
+	default:
+		return nil, fmt.Errorf("unrecognized route origin type: %v", v)
+	}
+
+	return table.NewOriginAction(origin)
+}
+
 func newAsPathPrependActionFromApiStruct(a *api.AsPrependAction) (*table.AsPathPrependAction, error) {
 	if a == nil {
 		return nil, nil
@@ -1515,11 +1611,13 @@ func newNexthopActionFromApiStruct(a *api.NexthopAction) (*table.NexthopAction, 
 	}
 	return table.NewNexthopAction(oc.BgpNextHopType(
 		func() string {
-			if a.Self {
+			switch {
+			case a.Self:
 				return "self"
-			}
-			if a.Unchanged {
+			case a.Unchanged:
 				return "unchanged"
+			case a.PeerAddress:
+				return "peer-address"
 			}
 			return a.Address
 		}(),
@@ -1543,6 +1641,9 @@ func newStatementFromApiStruct(a *api.Statement) (*table.Statement, error) {
 				return newNeighborConditionFromApiStruct(a.Conditions.NeighborSet)
 			},
 			func() (table.Condition, error) {
+				return newCommunityCountConditionFromApiStruct(a.Conditions.CommunityCount)
+			},
+			func() (table.Condition, error) {
 				return newAsPathLengthConditionFromApiStruct(a.Conditions.AsPathLength)
 			},
 			func() (table.Condition, error) {
@@ -1550,6 +1651,9 @@ func newStatementFromApiStruct(a *api.Statement) (*table.Statement, error) {
 			},
 			func() (table.Condition, error) {
 				return newRouteTypeConditionFromApiStruct(a.Conditions.RouteType)
+			},
+			func() (table.Condition, error) {
+				return newOriginConditionFromApiStruct(a.Conditions.Origin)
 			},
 			func() (table.Condition, error) {
 				return newAsPathConditionFromApiStruct(a.Conditions.AsPathSet)
@@ -1607,6 +1711,9 @@ func newStatementFromApiStruct(a *api.Statement) (*table.Statement, error) {
 			},
 			func() (table.Action, error) {
 				return newNexthopActionFromApiStruct(a.Actions.Nexthop)
+			},
+			func() (table.Action, error) {
+				return newOriginActionFromApiStruct(a.Actions.OriginAction)
 			},
 		}
 		as = make([]table.Action, 0, len(afs))

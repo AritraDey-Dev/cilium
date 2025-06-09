@@ -12,9 +12,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -22,17 +24,18 @@ import (
 	"github.com/go-openapi/loads"
 	"github.com/go-openapi/runtime/middleware"
 	"github.com/go-openapi/swag"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 	"golang.org/x/net/netutil"
 
 	"github.com/cilium/cilium/api/v1/operator/server/restapi"
+	"github.com/cilium/cilium/api/v1/operator/server/restapi/cluster"
 	"github.com/cilium/cilium/api/v1/operator/server/restapi/metrics"
 	"github.com/cilium/cilium/api/v1/operator/server/restapi/operator"
+	"github.com/cilium/hive/cell"
 
 	"github.com/cilium/cilium/pkg/api"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/logging"
 )
 
 // Cell implements the cilium operator REST API server when provided
@@ -55,8 +58,11 @@ type apiParams struct {
 
 	Spec *Spec
 
+	Logger *slog.Logger
+
 	Middleware middleware.Builder `name:"cilium-operator-middleware" optional:"true"`
 
+	ClusterGetClusterHandler  cluster.GetClusterHandler
 	OperatorGetHealthzHandler operator.GetHealthzHandler
 	MetricsGetMetricsHandler  metrics.GetMetricsHandler
 }
@@ -66,6 +72,7 @@ func newAPI(p apiParams) *restapi.CiliumOperatorAPI {
 
 	// Construct the API from the provided handlers
 
+	api.ClusterGetClusterHandler = p.ClusterGetClusterHandler
 	api.OperatorGetHealthzHandler = p.OperatorGetHealthzHandler
 	api.MetricsGetMetricsHandler = p.MetricsGetMetricsHandler
 
@@ -76,15 +83,17 @@ func newAPI(p apiParams) *restapi.CiliumOperatorAPI {
 		}
 	}
 
+	api.Logger = p.Logger.Info
+
 	return api
 }
 
 type serverParams struct {
 	cell.In
 
-	Lifecycle  hive.Lifecycle
+	Lifecycle  cell.Lifecycle
 	Shutdowner hive.Shutdowner
-	Logger     logrus.FieldLogger
+	Logger     *slog.Logger
 	Spec       *Spec
 	API        *restapi.CiliumOperatorAPI
 }
@@ -196,7 +205,7 @@ func NewServer(api *restapi.CiliumOperatorAPI) *Server {
 // ConfigureAPI configures the API and handlers.
 func (s *Server) ConfigureAPI() {
 	if s.api != nil {
-		s.handler = configureAPI(s.api)
+		s.handler = configureAPI(s.logger, s.api)
 	}
 }
 
@@ -243,15 +252,15 @@ type Server struct {
 
 	wg         sync.WaitGroup
 	shutdowner hive.Shutdowner
-	logger     logrus.FieldLogger
+	logger     *slog.Logger
 }
 
 // Logf logs message either via defined user logger or via system one if no user logger is defined.
 func (s *Server) Logf(f string, args ...interface{}) {
 	if s.logger != nil {
-		s.logger.Infof(f, args...)
+		s.logger.Info(fmt.Sprintf(f, args...))
 	} else if s.api != nil && s.api.Logger != nil {
-		s.api.Logger(f, args...)
+		s.api.Logger(fmt.Sprintf(f, args...))
 	} else {
 		log.Printf(f, args...)
 	}
@@ -279,7 +288,7 @@ func (s *Server) SetAPI(api *restapi.CiliumOperatorAPI) {
 	}
 
 	s.api = api
-	s.handler = configureAPI(api)
+	s.handler = configureAPI(s.logger, api)
 }
 
 // GetAPI returns the configured API. Modifications on the API must be performed
@@ -294,12 +303,7 @@ func (s *Server) hasScheme(scheme string) bool {
 		schemes = defaultSchemes
 	}
 
-	for _, v := range schemes {
-		if v == scheme {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(schemes, scheme)
 }
 
 func (s *Server) Serve() error {
@@ -312,9 +316,7 @@ func (s *Server) Serve() error {
 }
 
 // Start the server
-func (s *Server) Start(hive.HookContext) (err error) {
-	s.ConfigureAPI()
-
+func (s *Server) Start(cell.HookContext) (err error) {
 	if !s.hasListeners {
 		if err = s.Listen(); err != nil {
 			return err
@@ -331,6 +333,7 @@ func (s *Server) Start(hive.HookContext) (err error) {
 			return errors.New("can't create the default handler, as no api is set")
 		}
 
+		s.ConfigureAPI()
 		s.SetHandler(s.api.Serve(nil))
 	}
 
@@ -345,7 +348,7 @@ func (s *Server) Start(hive.HookContext) (err error) {
 		configureServer(domainSocket, "unix", s.SocketPath)
 
 		if os.Getuid() == 0 {
-			err := api.SetDefaultPermissions(s.SocketPath)
+			err := api.SetDefaultPermissions(logging.DefaultSlogLogger, s.SocketPath)
 			if err != nil {
 				return err
 			}
@@ -471,9 +474,6 @@ func (s *Server) Start(hive.HookContext) (err error) {
 			s.Fatalf("no certificate was configured for TLS")
 		}
 
-		// must have at least one certificate or panics
-		httpsServer.TLSConfig.BuildNameToCertificate()
-
 		configureServer(httpsServer, "https", s.httpsServerL.Addr().String())
 
 		s.servers = append(s.servers, httpsServer)
@@ -573,7 +573,7 @@ func (s *Server) Shutdown() error {
 	return s.Stop(ctx)
 }
 
-func (s *Server) Stop(ctx hive.HookContext) error {
+func (s *Server) Stop(ctx cell.HookContext) error {
 	// first execute the pre-shutdown hook
 	s.api.PreServerShutdown()
 

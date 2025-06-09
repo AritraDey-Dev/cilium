@@ -4,19 +4,21 @@
 package gateway_api
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"testing"
 	"time"
 
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -26,8 +28,8 @@ import (
 	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 
 	controllerruntime "github.com/cilium/cilium/operator/pkg/controller-runtime"
-	"github.com/cilium/cilium/operator/pkg/model"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	ciliumv2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 )
 
 func testScheme() *runtime.Scheme {
@@ -35,8 +37,10 @@ func testScheme() *runtime.Scheme {
 
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(ciliumv2.AddToScheme(scheme))
+	utilruntime.Must(ciliumv2alpha1.AddToScheme(scheme))
+	utilruntime.Must(apiextensionsv1.AddToScheme(scheme))
 
-	registerGatewayAPITypesToScheme(scheme)
+	registerGatewayAPITypesToScheme(scheme, optionalGVKs)
 
 	return scheme
 }
@@ -76,7 +80,7 @@ var controllerTestFixture = []client.Object{
 			Listeners: []gatewayv1.Listener{
 				{
 					Name:     "https",
-					Hostname: model.AddressOf[gatewayv1.Hostname]("example.com"),
+					Hostname: ptr.To[gatewayv1.Hostname]("example.com"),
 					Port:     443,
 					TLS: &gatewayv1.GatewayTLSConfig{
 						CertificateRefs: []gatewayv1.SecretObjectReference{
@@ -100,7 +104,7 @@ var controllerTestFixture = []client.Object{
 			Listeners: []gatewayv1.Listener{
 				{
 					Name:     "https",
-					Hostname: model.AddressOf[gatewayv1.Hostname]("example2.com"),
+					Hostname: ptr.To[gatewayv1.Hostname]("example2.com"),
 					Port:     443,
 					TLS: &gatewayv1.GatewayTLSConfig{
 						CertificateRefs: []gatewayv1.SecretObjectReference{},
@@ -159,7 +163,7 @@ var controllerTestFixture = []client.Object{
 					Port: 80,
 					AllowedRoutes: &gatewayv1.AllowedRoutes{
 						Namespaces: &gatewayv1.RouteNamespaces{
-							From: model.AddressOf(gatewayv1.NamespacesFromSame),
+							From: ptr.To(gatewayv1.NamespacesFromSame),
 						},
 					},
 				},
@@ -181,7 +185,7 @@ var controllerTestFixture = []client.Object{
 					Port: 80,
 					AllowedRoutes: &gatewayv1.AllowedRoutes{
 						Namespaces: &gatewayv1.RouteNamespaces{
-							From: model.AddressOf(gatewayv1.NamespacesFromAll),
+							From: ptr.To(gatewayv1.NamespacesFromAll),
 						},
 					},
 				},
@@ -203,7 +207,7 @@ var controllerTestFixture = []client.Object{
 					Port: 80,
 					AllowedRoutes: &gatewayv1.AllowedRoutes{
 						Namespaces: &gatewayv1.RouteNamespaces{
-							From: model.AddressOf(gatewayv1.NamespacesFromSelector),
+							From: ptr.To(gatewayv1.NamespacesFromSelector),
 							Selector: &metav1.LabelSelector{
 								MatchLabels: map[string]string{
 									"gateway": "allowed",
@@ -247,8 +251,9 @@ var namespaceFixtures = []client.Object{
 }
 
 func Test_hasMatchingController(t *testing.T) {
+	logger := hivetest.Logger(t)
 	c := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(controllerTestFixture...).Build()
-	fn := hasMatchingController(context.Background(), c, "io.cilium/gateway-controller")
+	fn := hasMatchingController(t.Context(), c, "io.cilium/gateway-controller", logger)
 
 	t.Run("invalid object", func(t *testing.T) {
 		res := fn(&corev1.Pod{})
@@ -276,28 +281,29 @@ func Test_hasMatchingController(t *testing.T) {
 
 func Test_getGatewaysForSecret(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(controllerTestFixture...).Build()
+	logger := hivetest.Logger(t)
 
 	t.Run("secret is used in gateway", func(t *testing.T) {
-		gwList := getGatewaysForSecret(context.Background(), c, &corev1.Secret{
+		gwList := getGatewaysForSecret(t.Context(), c, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "tls-secret",
 				Namespace: "default",
 			},
-		})
+		}, logger)
 
 		require.Len(t, gwList, 1)
 		require.Equal(t, "valid-gateway", gwList[0].Name)
 	})
 
 	t.Run("secret is not used in gateway", func(t *testing.T) {
-		gwList := getGatewaysForSecret(context.Background(), c, &corev1.Secret{
+		gwList := getGatewaysForSecret(t.Context(), c, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "tls-secret-not-used",
 				Namespace: "default",
 			},
-		})
+		}, logger)
 
-		require.Len(t, gwList, 0)
+		require.Empty(t, gwList)
 	})
 }
 
@@ -307,6 +313,7 @@ func Test_getGatewaysForNamespace(t *testing.T) {
 		WithObjects(namespaceFixtures...).
 		WithObjects(controllerTestFixture...).
 		Build()
+	logger := hivetest.Logger(t)
 
 	type args struct {
 		namespace string
@@ -340,11 +347,11 @@ func Test_getGatewaysForNamespace(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gwList := getGatewaysForNamespace(context.Background(), c, &corev1.Namespace{
+			gwList := getGatewaysForNamespace(t.Context(), c, &corev1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: tt.args.namespace,
 				},
-			})
+			}, logger)
 			names := make([]string, 0, len(gwList))
 			for _, gw := range gwList {
 				names = append(names, gw.Name)
@@ -496,9 +503,9 @@ func Test_onlyStatusChanged(t *testing.T) {
 						Status: gatewayv1.GatewayClassStatus{
 							Conditions: []metav1.Condition{
 								{
-									Type:               string(gatewayv1.GatewayConditionScheduled),
+									Type:               string(gatewayv1.GatewayConditionAccepted),
 									Status:             metav1.ConditionTrue,
-									Reason:             string(gatewayv1.GatewayReasonScheduled),
+									Reason:             string(gatewayv1.GatewayReasonAccepted),
 									LastTransitionTime: metav1.NewTime(time.Now()),
 								},
 							},
@@ -516,9 +523,9 @@ func Test_onlyStatusChanged(t *testing.T) {
 						Status: gatewayv1.GatewayStatus{
 							Conditions: []metav1.Condition{
 								{
-									Type:               string(gatewayv1.GatewayConditionScheduled),
+									Type:               string(gatewayv1.GatewayConditionAccepted),
 									Status:             metav1.ConditionTrue,
-									Reason:             string(gatewayv1.GatewayReasonScheduled),
+									Reason:             string(gatewayv1.GatewayReasonAccepted),
 									LastTransitionTime: metav1.NewTime(time.Now()),
 								},
 							},
@@ -528,9 +535,9 @@ func Test_onlyStatusChanged(t *testing.T) {
 						Status: gatewayv1.GatewayStatus{
 							Conditions: []metav1.Condition{
 								{
-									Type:               string(gatewayv1.GatewayConditionScheduled),
+									Type:               string(gatewayv1.GatewayConditionAccepted),
 									Status:             metav1.ConditionTrue,
-									Reason:             string(gatewayv1.GatewayReasonScheduled),
+									Reason:             string(gatewayv1.GatewayReasonAccepted),
 									LastTransitionTime: metav1.NewTime(time.Now()),
 								},
 							},
@@ -560,9 +567,9 @@ func Test_onlyStatusChanged(t *testing.T) {
 						Status: gatewayv1.GatewayStatus{
 							Conditions: []metav1.Condition{
 								{
-									Type:               string(gatewayv1.GatewayConditionScheduled),
+									Type:               string(gatewayv1.GatewayConditionAccepted),
 									Status:             metav1.ConditionTrue,
-									Reason:             string(gatewayv1.GatewayReasonScheduled),
+									Reason:             string(gatewayv1.GatewayReasonAccepted),
 									LastTransitionTime: metav1.NewTime(time.Now()),
 								},
 							},
@@ -580,9 +587,9 @@ func Test_onlyStatusChanged(t *testing.T) {
 						Status: gatewayv1.GatewayStatus{
 							Conditions: []metav1.Condition{
 								{
-									Type:               string(gatewayv1.GatewayConditionScheduled),
+									Type:               string(gatewayv1.GatewayConditionAccepted),
 									Status:             metav1.ConditionTrue,
-									Reason:             string(gatewayv1.GatewayReasonScheduled),
+									Reason:             string(gatewayv1.GatewayReasonAccepted),
 									LastTransitionTime: metav1.NewTime(time.Now()),
 								},
 							},
@@ -592,9 +599,9 @@ func Test_onlyStatusChanged(t *testing.T) {
 						Status: gatewayv1.GatewayStatus{
 							Conditions: []metav1.Condition{
 								{
-									Type:               string(gatewayv1.GatewayConditionScheduled),
+									Type:               string(gatewayv1.GatewayConditionAccepted),
 									Status:             metav1.ConditionTrue,
-									Reason:             string(gatewayv1.GatewayReasonScheduled),
+									Reason:             string(gatewayv1.GatewayReasonAccepted),
 									LastTransitionTime: metav1.NewTime(time.Now()),
 								},
 							},

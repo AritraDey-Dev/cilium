@@ -5,8 +5,9 @@ package seven
 
 import (
 	"fmt"
-	neturl "net/url"
-	"sort"
+	"maps"
+	"net/url"
+	"slices"
 	"strings"
 
 	flowpb "github.com/cilium/cilium/api/v1/flow"
@@ -18,19 +19,13 @@ import (
 
 func decodeHTTP(flowType accesslog.FlowType, http *accesslog.LogRecordHTTP, opts *options.Options) *flowpb.Layer7_Http {
 	var headers []*flowpb.HTTPHeader
-	keys := make([]string, 0, len(http.Headers))
-	for key := range http.Headers {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
+	for _, key := range slices.Sorted(maps.Keys(http.Headers)) {
 		for _, value := range http.Headers[key] {
 			filteredValue := filterHeader(key, value, opts.HubbleRedactSettings)
 			headers = append(headers, &flowpb.HTTPHeader{Key: key, Value: filteredValue})
 		}
 	}
-	url, _ := neturl.Parse(http.URL.String())
-	filterURL(url, opts.HubbleRedactSettings)
+	uri := filteredURL(http.URL, opts.HubbleRedactSettings)
 
 	if flowType == accesslog.TypeRequest {
 		// Set only fields that are relevant for requests.
@@ -38,7 +33,7 @@ func decodeHTTP(flowType accesslog.FlowType, http *accesslog.LogRecordHTTP, opts
 			Http: &flowpb.HTTP{
 				Method:   http.Method,
 				Protocol: http.Protocol,
-				Url:      url.String(),
+				Url:      uri.String(),
 				Headers:  headers,
 			},
 		}
@@ -49,16 +44,15 @@ func decodeHTTP(flowType accesslog.FlowType, http *accesslog.LogRecordHTTP, opts
 			Code:     uint32(http.Code),
 			Method:   http.Method,
 			Protocol: http.Protocol,
-			Url:      url.String(),
+			Url:      uri.String(),
 			Headers:  headers,
 		},
 	}
 }
 
 func (p *Parser) httpSummary(flowType accesslog.FlowType, http *accesslog.LogRecordHTTP, flow *flowpb.Flow) string {
-	url, _ := neturl.Parse(http.URL.String())
-	filterURL(url, p.opts.HubbleRedactSettings)
-	httpRequest := http.Method + " " + url.String()
+	uri := filteredURL(http.URL, p.opts.HubbleRedactSettings)
+	httpRequest := http.Method + " " + uri.String()
 	switch flowType {
 	case accesslog.TypeRequest:
 		return fmt.Sprintf("%s %s", http.Protocol, httpRequest)
@@ -101,20 +95,39 @@ func filterHeader(key string, value string, redactSettings options.HubbleRedactS
 	return value
 }
 
-// filterURL receives the observed URL and a set of Hubble redact settings and
-// conditionally redacts sensitive values.
+// filteredURL return a copy of the given URL potentially mutated depending on
+// Hubble redact settings.
 // If configured and user info exists, it removes the password from the flow.
 // If configured, it removes the URL's query parts from the flow.
-func filterURL(url *neturl.URL, redactSettings options.HubbleRedactSettings) {
-	if url != nil {
-		if redactSettings.RedactHTTPUserInfo && url.User != nil {
-			if _, ok := url.User.Password(); ok {
-				url.User = neturl.UserPassword(url.User.Username(), defaults.SensitiveValueRedacted)
-			}
-		}
-		if redactSettings.RedactHTTPQuery {
-			url.RawQuery = ""
-			url.Fragment = ""
+func filteredURL(uri *url.URL, redactSettings options.HubbleRedactSettings) *url.URL {
+	if uri == nil {
+		// NOTE: return a non-nil URL so that we can always call String() on
+		// it.
+		return &url.URL{}
+	}
+	u2 := cloneURL(uri)
+	if redactSettings.RedactHTTPUserInfo && u2.User != nil {
+		if _, ok := u2.User.Password(); ok {
+			u2.User = url.UserPassword(u2.User.Username(), defaults.SensitiveValueRedacted)
 		}
 	}
+	if redactSettings.RedactHTTPQuery {
+		u2.RawQuery = ""
+		u2.Fragment = ""
+	}
+	return u2
+}
+
+// cloneURL return a copy of the given URL. Copied from src/net/http/clone.go.
+func cloneURL(u *url.URL) *url.URL {
+	if u == nil {
+		return nil
+	}
+	u2 := new(url.URL)
+	*u2 = *u
+	if u.User != nil {
+		u2.User = new(url.Userinfo)
+		*u2.User = *u.User
+	}
+	return u2
 }

@@ -10,8 +10,6 @@
 Per-node configuration
 **********************
 
-.. include:: ../beta.rst
-
 The Cilium agent process (a.k.a. DaemonSet) supports setting configuration
 on a per-node basis. This allows overriding :ref:`cilium-config-configmap`
 for a node or set of nodes. It is managed by CiliumNodeConfig objects.
@@ -45,7 +43,7 @@ hardware, one would label the relevant nodes and override their configuration.
 
 .. code-block:: yaml
 
-    apiVersion: cilium.io/v2alpha1
+    apiVersion: cilium.io/v2
     kind: CiliumNodeConfig
     metadata:
       namespace: kube-system
@@ -67,7 +65,7 @@ nodes with ``io.cilium.migration/kube-proxy-replacement: true``
 .. warning::
 
     You must have installed Cilium with the Helm values ``k8sServiceHost`` and
-    ``k8sServicePort``. Otherwise Cilium will not be able to reach the Kubernetes
+    ``k8sServicePort``. Otherwise, Cilium will not be able to reach the Kubernetes
     APIServer after kube-proxy is uninstalled.
 
     You can apply these two values to a running cluster via ``helm upgrade``.
@@ -83,7 +81,7 @@ nodes with ``io.cilium.migration/kube-proxy-replacement: true``
     .. code-block:: shell-session
 
         cat <<EOF | kubectl apply --server-side -f -
-        apiVersion: cilium.io/v2alpha1
+        apiVersion: cilium.io/v2
         kind: CiliumNodeConfig
         metadata:
           namespace: kube-system
@@ -91,10 +89,10 @@ nodes with ``io.cilium.migration/kube-proxy-replacement: true``
         spec:
           nodeSelector:
             matchLabels:
-              io.cilium.migration/kube-proxy-replacement: true
+              io.cilium.migration/kube-proxy-replacement: "true"
           defaults:
-            kube-proxy-replacement: true
-            kube-proxy-replacement-healthz-bind-address: "0.0.0.0:10256"
+            kube-proxy-replacement: "true"
+            kube-proxy-replacement-healthz-bind-address: "'0.0.0.0:10256'"
 
         EOF
 
@@ -131,7 +129,7 @@ nodes with ``io.cilium.migration/kube-proxy-replacement: true``
     .. code-block:: shell-session
 
         cilium config set --restart=false kube-proxy-replacement true
-        cilium config set --restart=false kube-proxy-replacement-healthz-bind-address "0.0.0.0:10256"
+        cilium config set --restart=false kube-proxy-replacement-healthz-bind-address '0.0.0.0:10256'
         kubectl -n kube-system delete ciliumnodeconfig kube-proxy-replacement
 
 #. Cleanup: delete kube-proxy daemonset, unlabel nodes

@@ -6,14 +6,17 @@ package test
 import (
 	"context"
 	"fmt"
-
-	"github.com/cilium/cilium/pkg/bgpv1/gobgp"
+	"log/slog"
+	"slices"
 
 	gobgpapi "github.com/osrg/gobgp/v3/api"
 	"github.com/osrg/gobgp/v3/pkg/apiutil"
-	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
 	gobgpb "github.com/osrg/gobgp/v3/pkg/packet/bgp"
 	"github.com/osrg/gobgp/v3/pkg/server"
+
+	"github.com/cilium/cilium/pkg/bgpv1/gobgp"
+	"github.com/cilium/cilium/pkg/bgpv1/types"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 )
 
 // goBGP configuration used in tests
@@ -151,7 +154,7 @@ type routeEvent struct {
 	prefix              string
 	prefixLen           uint8
 	isWithdrawn         bool
-	extraPathAttributes []bgp.PathAttributeInterface // non-standard path attributes (other than Origin / ASPath / NextHop / MpReachNLRI)
+	extraPathAttributes []gobgpb.PathAttributeInterface // non-standard path attributes (other than Origin / ASPath / NextHop / MpReachNLRI)
 }
 
 // peerEvent contains information about peer state change of gobgp
@@ -163,6 +166,7 @@ type peerEvent struct {
 // goBGP wrapper on gobgp server and provides route and peer event handling
 type goBGP struct {
 	context context.Context
+	logger  *slog.Logger
 
 	server      *server.BgpServer
 	peerEvents  chan *gobgpapi.WatchEventResponse_PeerEvent
@@ -173,10 +177,11 @@ type goBGP struct {
 }
 
 // startGoBGP initialized new gobgp server, configures neighbors and starts listening on route and peer events
-func startGoBGP(ctx context.Context, conf gobgpConfig) (g *goBGP, err error) {
+func startGoBGP(ctx context.Context, logger *slog.Logger, conf gobgpConfig) (g *goBGP, err error) {
 	g = &goBGP{
 		context: ctx,
-		server: server.NewBgpServer(server.LoggerOption(gobgp.NewServerLogger(log, gobgp.LogParams{
+		logger:  logger,
+		server: server.NewBgpServer(server.LoggerOption(gobgp.NewServerLogger(logger, gobgp.LogParams{
 			AS:        conf.global.Asn,
 			Component: "tests.BGP",
 			SubSys:    "basic",
@@ -197,7 +202,7 @@ func startGoBGP(ctx context.Context, conf gobgpConfig) (g *goBGP, err error) {
 		}
 	}()
 
-	log.Info("GoBGP test instance: starting")
+	g.logger.Info("GoBGP test instance: starting")
 	err = g.server.StartBgp(ctx, &gobgpapi.StartBgpRequest{Global: conf.global})
 	if err != nil {
 		return
@@ -241,7 +246,7 @@ func startGoBGP(ctx context.Context, conf gobgpConfig) (g *goBGP, err error) {
 
 // stopGoBGP stops server
 func (g *goBGP) stopGoBGP() {
-	log.Infof("GoBGP test instance: stopping")
+	g.logger.Info("GoBGP test instance: stopping")
 	g.server.Stop()
 }
 
@@ -259,7 +264,10 @@ func (g *goBGP) readEvents() {
 
 				nlri, err := apiutil.UnmarshalNLRI(gobgpb.AfiSafiToRouteFamily(uint16(p.Family.Afi), uint8(p.Family.Safi)), p.Nlri)
 				if err != nil {
-					log.Errorf("failed to unmarshal path nlri %v: %v", p, err)
+					g.logger.Error("failed to unmarshal path nlri",
+						logfields.Error, err,
+						types.PathLogField, p,
+					)
 					continue
 				}
 
@@ -271,13 +279,16 @@ func (g *goBGP) readEvents() {
 					prefix = a.Prefix.String()
 					length = a.Length
 				default:
-					log.Errorf("failed to identify nlri %v", nlri)
+					g.logger.Error("failed to identify nlri", types.NLRILogField, nlri)
 					continue
 				}
 
 				pattrs, err := apiutil.UnmarshalPathAttributes(p.Pattrs)
 				if err != nil {
-					log.Errorf("failed to unmarshal path attributes %v: %v", p, err)
+					g.logger.Error("failed to unmarshal path attributes",
+						logfields.Error, err,
+						types.PathLogField, p,
+					)
 					continue
 				}
 
@@ -317,15 +328,13 @@ func (g *goBGP) waitForSessionState(ctx context.Context, expectedStates []string
 	for {
 		select {
 		case e := <-g.peerNotif:
-			log.Infof("GoBGP test instance: Peer Event: %v", e)
+			g.logger.Info("GoBGP test instance", types.PeerEventLogField, e)
 
-			for _, state := range expectedStates {
-				if e.state == state {
-					return nil
-				}
+			if slices.Contains(expectedStates, e.state) {
+				return nil
 			}
 		case <-ctx.Done():
-			return fmt.Errorf("did not receive expected peering state %q, %v", expectedStates, ctx.Err())
+			return fmt.Errorf("did not receive expected peering state %q: %w", expectedStates, ctx.Err())
 		}
 	}
 }
@@ -334,13 +343,13 @@ func (g *goBGP) waitForSessionState(ctx context.Context, expectedStates []string
 func (g *goBGP) getRouteEvents(ctx context.Context, numExpectedEvents int) ([]routeEvent, error) {
 	var receivedEvents []routeEvent
 
-	for i := 0; i < numExpectedEvents; i++ {
+	for range numExpectedEvents {
 		select {
 		case r := <-g.routeNotif:
-			log.Infof("GoBGP test instance: Route Event: %v", r)
+			g.logger.Info("GoBGP test instance", types.RouteLogField, r)
 			receivedEvents = append(receivedEvents, r)
 		case <-ctx.Done():
-			return receivedEvents, fmt.Errorf("time elapsed waiting for all route events - received %d, expected %d : %v",
+			return receivedEvents, fmt.Errorf("time elapsed waiting for all route events - received %d, expected %d : %w",
 				len(receivedEvents), numExpectedEvents, ctx.Err())
 		}
 	}
@@ -350,17 +359,17 @@ func (g *goBGP) getRouteEvents(ctx context.Context, numExpectedEvents int) ([]ro
 
 // filterStandardPathAttributes filters standard path attributes (usually present on all routes) from the
 // provided list of the path attributes.
-func (g *goBGP) filterStandardPathAttributes(attrs []bgp.PathAttributeInterface) []bgp.PathAttributeInterface {
-	var res []bgp.PathAttributeInterface
+func (g *goBGP) filterStandardPathAttributes(attrs []gobgpb.PathAttributeInterface) []gobgpb.PathAttributeInterface {
+	var res []gobgpb.PathAttributeInterface
 	for _, a := range attrs {
 		switch a.(type) {
-		case *bgp.PathAttributeOrigin:
+		case *gobgpb.PathAttributeOrigin:
 			continue
-		case *bgp.PathAttributeAsPath:
+		case *gobgpb.PathAttributeAsPath:
 			continue
-		case *bgp.PathAttributeNextHop:
+		case *gobgpb.PathAttributeNextHop:
 			continue
-		case *bgp.PathAttributeMpReachNLRI:
+		case *gobgpb.PathAttributeMpReachNLRI:
 			continue
 		}
 		res = append(res, a)

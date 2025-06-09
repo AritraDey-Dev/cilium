@@ -4,8 +4,6 @@
 package option
 
 import (
-	"time"
-
 	"github.com/spf13/pflag"
 
 	"github.com/cilium/cilium/pkg/option"
@@ -25,30 +23,19 @@ const (
 // LegacyClusterMeshConfig is used to register the flags for the options which
 // are still accessed through the global DaemonConfig variable.
 type LegacyClusterMeshConfig struct {
-	Debug          bool
-	CRDWaitTimeout time.Duration
+	Debug     bool
+	LogDriver []string
+	LogOpt    map[string]string
 }
 
 var DefaultLegacyClusterMeshConfig = LegacyClusterMeshConfig{
-	Debug:          false,
-	CRDWaitTimeout: 5 * time.Minute,
+	Debug:     false,
+	LogDriver: []string{},
+	LogOpt:    make(map[string]string),
 }
 
 func (def LegacyClusterMeshConfig) Flags(flags *pflag.FlagSet) {
 	flags.BoolP(option.DebugArg, "D", def.Debug, "Enable debugging mode")
-	flags.Duration(option.CRDWaitTimeout, def.CRDWaitTimeout, "Cilium will exit if CRDs are not available within this duration upon startup")
-}
-
-// LegacyKVStoreMeshConfig is used to register the flags for the options which
-// are still accessed through the global DaemonConfig variable.
-type LegacyKVStoreMeshConfig struct {
-	Debug bool
-}
-
-var DefaultLegacyKVStoreMeshConfig = LegacyKVStoreMeshConfig{
-	Debug: false,
-}
-
-func (def LegacyKVStoreMeshConfig) Flags(flags *pflag.FlagSet) {
-	flags.BoolP(option.DebugArg, "D", def.Debug, "Enable debugging mode")
+	flags.StringSlice(option.LogDriver, def.LogDriver, "Logging endpoints to use (example: syslog)")
+	flags.Var(option.NewNamedMapOptions(option.LogOpt, &option.Config.LogOpt, nil), option.LogOpt, "Log driver options (example: format=json)")
 }

@@ -6,11 +6,27 @@ package types
 import (
 	"context"
 	"net/netip"
+	"strings"
 
 	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
 
 	"github.com/cilium/cilium/api/v1/models"
-	v2alpha1api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
+)
+
+// BGP metric labels
+const (
+	LabelClusterConfig = "bgp_cluster_config"
+	LabelVRouter       = "vrouter"
+	LabelNeighbor      = "neighbor"
+	LabelNeighborAsn   = "neighbor_asn"
+	LabelAfi           = "afi"
+	LabelSafi          = "safi"
+	LabelResourceKind  = "resource_kind"
+	LabelResourceName  = "resource_name"
+
+	MetricsSubsystem                  = "bgp_control_plane"
+	MetricReconcileErrorsTotal        = "reconcile_errors_total"
+	MetricReconcileRunDurationSeconds = "reconcile_run_duration_seconds"
 )
 
 // BGPGlobal contains high level BGP configuration for given instance.
@@ -27,25 +43,63 @@ type RouteSelectionOptions struct {
 	AdvertiseInactiveRoutes bool
 }
 
+// StateNotificationCh is a channel used to notify the state of the BGP instance has changed
+type StateNotificationCh chan struct{}
+
 // Path is an object representing a single routing Path. It is an analogue of GoBGP's Path object,
 // but only contains minimal fields required for Cilium usecases.
 type Path struct {
 	// read/write
 	NLRI           bgp.AddrPrefixInterface
 	PathAttributes []bgp.PathAttributeInterface
+	Family         Family // can be empty, in which case it will be inferred from NLRI
 
 	// readonly
 	AgeNanoseconds int64 // time duration in nanoseconds since the Path was created
 	Best           bool
 	UUID           []byte // path identifier in underlying implementation
+	SourceASN      uint32
 }
 
-// NeighborRequest contains neighbor parameters used when enabling or disabling peer
-type NeighborRequest struct {
-	Neighbor *v2alpha1api.CiliumBGPNeighbor
-	VR       *v2alpha1api.CiliumBGPVirtualRouter
-	// Password is the "AuthSecret" in the Neighbor, fetched from a secret
-	Password string
+// Neighbor is an object representing a single BGP neighbor. It is an analogue
+// of GoBGP's Peer object, but only contains minimal fields required for Cilium
+// usecases.
+type Neighbor struct {
+	Address         netip.Addr
+	ASN             uint32
+	AuthPassword    string
+	EbgpMultihop    *NeighborEbgpMultihop
+	RouteReflector  *NeighborRouteReflector
+	Timers          *NeighborTimers
+	Transport       *NeighborTransport
+	GracefulRestart *NeighborGracefulRestart
+	AfiSafis        []*Family
+}
+
+type NeighborTransport struct {
+	LocalAddress string
+	LocalPort    uint32
+	RemotePort   uint32
+}
+
+type NeighborEbgpMultihop struct {
+	TTL uint32
+}
+
+type NeighborTimers struct {
+	ConnectRetry      uint64
+	HoldTime          uint64
+	KeepaliveInterval uint64
+}
+
+type NeighborGracefulRestart struct {
+	Enabled     bool
+	RestartTime uint32
+}
+
+type NeighborRouteReflector struct {
+	Client    bool
+	ClusterID string
 }
 
 // SoftResetDirection defines the direction in which a BGP soft reset should be performed
@@ -100,6 +154,21 @@ type RoutePolicyConditions struct {
 	MatchNeighbors []string
 	// MatchPrefixes matches ANY of the provided prefixes. If empty matches all prefixes.
 	MatchPrefixes []*RoutePolicyPrefixMatch
+	// MatchFamilies matches ANY of the provided address families. If empty matches all address families.
+	MatchFamilies []Family
+}
+
+// String() constructs a string identifier
+func (r RoutePolicyConditions) String() string {
+	values := []string{}
+	values = append(values, r.MatchNeighbors...)
+	for _, family := range r.MatchFamilies {
+		values = append(values, family.String())
+	}
+	for _, prefix := range r.MatchPrefixes {
+		values = append(values, prefix.CIDR.String())
+	}
+	return strings.Join(values, "-")
 }
 
 // RoutePolicyAction defines the action taken on a route matched by a routing policy.
@@ -132,6 +201,19 @@ type RoutePolicyActions struct {
 	// SetLocalPreference define a BGP local preference value to be set on the matched route.
 	// If nil, no local preference is set.
 	SetLocalPreference *int64
+	// NextHop sets (or doesn't set) a next hop value on the matched route.
+	NextHop *RoutePolicyActionNextHop
+}
+
+// RoutingPolicyActionNextHop defines the action taken on the next hop of a
+// route matched by a routing policy.
+//
+// +deepequal-gen=true
+type RoutePolicyActionNextHop struct {
+	// Set nexthop to the self address of the router
+	Self bool
+	// Don't change the nexthop of the route
+	Unchanged bool
 }
 
 // RoutePolicyStatement represents a single statement of a routing RoutePolicy. It contains conditions for
@@ -173,7 +255,8 @@ type RoutePolicy struct {
 
 // RoutePolicyRequest contains parameters for adding or removing a routing policy.
 type RoutePolicyRequest struct {
-	Policy *RoutePolicy
+	DefaultExportAction RoutePolicyAction
+	Policy              *RoutePolicy
 }
 
 // GetPeerStateResponse contains state of peers configured in given instance
@@ -188,13 +271,20 @@ type GetBGPResponse struct {
 
 // ServerParameters contains information for underlying bgp implementation layer to initializing BGP process.
 type ServerParameters struct {
-	Global BGPGlobal
+	Global            BGPGlobal
+	StateNotification StateNotificationCh
 }
 
 // Family holds Address Family Indicator (AFI) and Subsequent Address Family Indicator for Multi-Protocol BGP
+//
+// +deepequal-gen=true
 type Family struct {
 	Afi  Afi
 	Safi Safi
+}
+
+func (f Family) String() string {
+	return f.Afi.String() + "-" + f.Safi.String()
 }
 
 // Route represents a single route in the RIB of underlying router
@@ -251,19 +341,27 @@ type GetRoutePoliciesResponse struct {
 	Policies []*RoutePolicy
 }
 
+// StopRequest contains parameters for stopping the underlying router
+type StopRequest struct {
+	// FullDestroy should be set to true if full destroy of the router instance should be performed.
+	// Note that this causes sending a Cease notification to BGP peers, which terminates Graceful Restart progress.
+	FullDestroy bool
+}
+
 // Router is vendor-agnostic cilium bgp configuration layer. Parameters of this layer
 // are standard BGP RFC complaint and not specific to any underlying implementation.
 type Router interface {
-	Stop()
+	// Stop stops the router
+	Stop(ctx context.Context, r StopRequest)
 
 	// AddNeighbor configures BGP peer
-	AddNeighbor(ctx context.Context, n NeighborRequest) error
+	AddNeighbor(ctx context.Context, n *Neighbor) error
 
 	// UpdateNeighbor updates BGP peer
-	UpdateNeighbor(ctx context.Context, n NeighborRequest) error
+	UpdateNeighbor(ctx context.Context, n *Neighbor) error
 
 	// RemoveNeighbor removes BGP peer
-	RemoveNeighbor(ctx context.Context, n NeighborRequest) error
+	RemoveNeighbor(ctx context.Context, n *Neighbor) error
 
 	// ResetNeighbor resets BGP peering with the provided neighbor address
 	ResetNeighbor(ctx context.Context, r ResetNeighborRequest) error

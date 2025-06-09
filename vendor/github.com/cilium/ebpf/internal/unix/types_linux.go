@@ -4,27 +4,9 @@ package unix
 
 import (
 	"syscall"
+	"unsafe"
 
 	linux "golang.org/x/sys/unix"
-)
-
-const (
-	ENOENT     = linux.ENOENT
-	EEXIST     = linux.EEXIST
-	EAGAIN     = linux.EAGAIN
-	ENOSPC     = linux.ENOSPC
-	EINVAL     = linux.EINVAL
-	EPOLLIN    = linux.EPOLLIN
-	EINTR      = linux.EINTR
-	EPERM      = linux.EPERM
-	ESRCH      = linux.ESRCH
-	ENODEV     = linux.ENODEV
-	EBADF      = linux.EBADF
-	E2BIG      = linux.E2BIG
-	EFAULT     = linux.EFAULT
-	EACCES     = linux.EACCES
-	EILSEQ     = linux.EILSEQ
-	EOPNOTSUPP = linux.EOPNOTSUPP
 )
 
 const (
@@ -39,6 +21,8 @@ const (
 	BPF_F_MMAPABLE            = linux.BPF_F_MMAPABLE
 	BPF_F_INNER_MAP           = linux.BPF_F_INNER_MAP
 	BPF_F_KPROBE_MULTI_RETURN = linux.BPF_F_KPROBE_MULTI_RETURN
+	BPF_F_UPROBE_MULTI_RETURN = linux.BPF_F_UPROBE_MULTI_RETURN
+	BPF_F_LOCK                = linux.BPF_F_LOCK
 	BPF_OBJ_NAME_LEN          = linux.BPF_OBJ_NAME_LEN
 	BPF_TAG_SIZE              = linux.BPF_TAG_SIZE
 	BPF_RINGBUF_BUSY_BIT      = linux.BPF_RINGBUF_BUSY_BIT
@@ -55,6 +39,7 @@ const (
 	PROT_WRITE                = linux.PROT_WRITE
 	MAP_ANON                  = linux.MAP_ANON
 	MAP_SHARED                = linux.MAP_SHARED
+	MAP_FIXED                 = linux.MAP_FIXED
 	MAP_PRIVATE               = linux.MAP_PRIVATE
 	PERF_ATTR_SIZE_VER1       = linux.PERF_ATTR_SIZE_VER1
 	PERF_TYPE_SOFTWARE        = linux.PERF_TYPE_SOFTWARE
@@ -78,15 +63,16 @@ const (
 	SO_DETACH_BPF             = linux.SO_DETACH_BPF
 	SOL_SOCKET                = linux.SOL_SOCKET
 	SIGPROF                   = linux.SIGPROF
+	SIGUSR1                   = linux.SIGUSR1
 	SIG_BLOCK                 = linux.SIG_BLOCK
 	SIG_UNBLOCK               = linux.SIG_UNBLOCK
-	EM_NONE                   = linux.EM_NONE
-	EM_BPF                    = linux.EM_BPF
 	BPF_FS_MAGIC              = linux.BPF_FS_MAGIC
 	TRACEFS_MAGIC             = linux.TRACEFS_MAGIC
 	DEBUGFS_MAGIC             = linux.DEBUGFS_MAGIC
 	BPF_RB_NO_WAKEUP          = linux.BPF_RB_NO_WAKEUP
 	BPF_RB_FORCE_WAKEUP       = linux.BPF_RB_FORCE_WAKEUP
+	AF_UNSPEC                 = linux.AF_UNSPEC
+	IFF_UP                    = linux.IFF_UP
 )
 
 type Statfs_t = linux.Statfs_t
@@ -98,6 +84,7 @@ type PerfEventMmapPage = linux.PerfEventMmapPage
 type EpollEvent = linux.EpollEvent
 type PerfEventAttr = linux.PerfEventAttr
 type Utsname = linux.Utsname
+type CPUSet = linux.CPUSet
 
 func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err syscall.Errno) {
 	return linux.Syscall(trap, a1, a2, a3)
@@ -151,6 +138,11 @@ func Mmap(fd int, offset int64, length int, prot int, flags int) (data []byte, e
 	return linux.Mmap(fd, offset, length, prot, flags)
 }
 
+//go:nocheckptr
+func MmapPtr(fd int, offset int64, addr unsafe.Pointer, length uintptr, prot int, flags int) (ret unsafe.Pointer, err error) {
+	return linux.MmapPtr(fd, offset, addr, length, prot, flags)
+}
+
 func Munmap(b []byte) (err error) {
 	return linux.Munmap(b)
 }
@@ -183,6 +175,10 @@ func ByteSliceToString(s []byte) string {
 	return linux.ByteSliceToString(s)
 }
 
+func ByteSliceFromString(s string) ([]byte, error) {
+	return linux.ByteSliceFromString(s)
+}
+
 func Renameat2(olddirfd int, oldpath string, newdirfd int, newpath string, flags uint) error {
 	return linux.Renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
 }
@@ -201,4 +197,16 @@ func Fstat(fd int, stat *Stat_t) error {
 
 func SetsockoptInt(fd, level, opt, value int) error {
 	return linux.SetsockoptInt(fd, level, opt, value)
+}
+
+func SchedSetaffinity(pid int, set *CPUSet) error {
+	return linux.SchedSetaffinity(pid, set)
+}
+
+func SchedGetaffinity(pid int, set *CPUSet) error {
+	return linux.SchedGetaffinity(pid, set)
+}
+
+func Auxv() ([][2]uintptr, error) {
+	return linux.Auxv()
 }

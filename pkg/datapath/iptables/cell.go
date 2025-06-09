@@ -4,10 +4,10 @@
 package iptables
 
 import (
+	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
 
-	"github.com/cilium/cilium/pkg/cidr"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/datapath/iptables/ipset"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/time"
 )
@@ -16,6 +16,11 @@ var Cell = cell.Module(
 	"iptables",
 	"Handle iptables-related configuration for Cilium",
 
+	// Manage "cilium_node_set_v4" and "cilium_node_set_v6" kernel IP sets to
+	// collect IPv4 and IPv6 node addresses (respectively) and exclude traffic to
+	// those IPs from being masqueraded.
+	ipset.Cell,
+
 	cell.Config(defaultConfig),
 	cell.ProvidePrivate(func(
 		cfg *option.DaemonConfig,
@@ -23,14 +28,11 @@ var Cell = cell.Module(
 		return SharedConfig{
 			TunnelingEnabled:                cfg.TunnelingEnabled(),
 			NodeIpsetNeeded:                 cfg.NodeIpsetNeeded(),
-			Devices:                         cfg.GetDevices(),
 			IptablesMasqueradingIPv4Enabled: cfg.IptablesMasqueradingIPv4Enabled(),
 			IptablesMasqueradingIPv6Enabled: cfg.IptablesMasqueradingIPv6Enabled(),
-			IPv4NativeRoutingCIDR:           cfg.GetIPv4NativeRoutingCIDR(),
 
 			EnableIPv4:                  cfg.EnableIPv4,
 			EnableIPv6:                  cfg.EnableIPv6,
-			EnableXTSocketFallback:      cfg.EnableXTSocketFallback,
 			EnableBPFTProxy:             cfg.EnableBPFTProxy,
 			InstallNoConntrackIptRules:  cfg.InstallNoConntrackIptRules,
 			EnableEndpointRoutes:        cfg.EnableEndpointRoutes,
@@ -38,6 +40,8 @@ var Cell = cell.Module(
 			EnableIPSec:                 cfg.EnableIPSec,
 			MasqueradeInterfaces:        cfg.MasqueradeInterfaces,
 			EnableMasqueradeRouteSource: cfg.EnableMasqueradeRouteSource,
+			EnableL7Proxy:               cfg.EnableL7Proxy,
+			InstallIptRules:             cfg.InstallIptRules,
 		}
 	}),
 	cell.Provide(newIptablesManager),
@@ -58,11 +62,18 @@ type Config struct {
 
 	// PrependIptablesChains, when enabled, prepends custom iptables chains instead of appending.
 	PrependIptablesChains bool
+
+	// EnableXTSocketFallback allows disabling of kernel's ip_early_demux
+	// sysctl option if `xt_socket` kernel module is not available.
+	EnableXTSocketFallback bool
 }
 
 var defaultConfig = Config{
-	IPTablesLockTimeout:   5 * time.Second,
-	PrependIptablesChains: true,
+	IPTablesLockTimeout:        5 * time.Second,
+	PrependIptablesChains:      true,
+	DisableIptablesFeederRules: []string{},
+	IPTablesRandomFully:        false,
+	EnableXTSocketFallback:     true,
 }
 
 func (def Config) Flags(flags *pflag.FlagSet) {
@@ -70,15 +81,14 @@ func (def Config) Flags(flags *pflag.FlagSet) {
 	flags.StringSlice("disable-iptables-feeder-rules", def.DisableIptablesFeederRules, "Chains to ignore when installing feeder rules.")
 	flags.Bool("iptables-random-fully", def.IPTablesRandomFully, "Set iptables flag random-fully on masquerading rules")
 	flags.Bool("prepend-iptables-chains", def.PrependIptablesChains, "Prepend custom iptables chains instead of appending")
+	flags.Bool("enable-xt-socket-fallback", def.EnableXTSocketFallback, "Enable fallback for missing xt_socket module")
 }
 
 type SharedConfig struct {
 	TunnelingEnabled                bool
 	NodeIpsetNeeded                 bool
-	Devices                         []string
 	IptablesMasqueradingIPv4Enabled bool
 	IptablesMasqueradingIPv6Enabled bool
-	IPv4NativeRoutingCIDR           *cidr.CIDR
 
 	EnableIPv4                  bool
 	EnableIPv6                  bool
@@ -90,4 +100,6 @@ type SharedConfig struct {
 	EnableIPSec                 bool
 	MasqueradeInterfaces        []string
 	EnableMasqueradeRouteSource bool
+	EnableL7Proxy               bool
+	InstallIptRules             bool
 }

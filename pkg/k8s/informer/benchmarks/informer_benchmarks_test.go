@@ -12,29 +12,18 @@ import (
 	"sync"
 	"testing"
 
-	. "github.com/cilium/checkmate"
+	"github.com/cilium/hive/hivetest"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/cilium/cilium/pkg/annotation"
-	"github.com/cilium/cilium/pkg/k8s"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 
 	"github.com/cilium/cilium/pkg/k8s/informer"
 )
-
-func Test(t *testing.T) {
-	TestingT(t)
-}
-
-type K8sIntegrationSuite struct{}
-
-var _ = Suite(&K8sIntegrationSuite{})
-
-func (k *K8sIntegrationSuite) SetUpSuite(c *C) {
-}
 
 var nodeSampleJSON = `{
     "apiVersion": "v1",
@@ -414,11 +403,11 @@ var nodeSampleJSON = `{
 }
 `
 
-func (k *K8sIntegrationSuite) benchmarkInformer(ctx context.Context, nCycles int, newInformer bool, c *C) {
+func benchmarkInformer(ctx context.Context, nCycles int, newInformer bool, b *testing.B) {
 	n := slim_corev1.Node{}
 	err := json.Unmarshal([]byte(nodeSampleJSON), &n)
 	n.ResourceVersion = "1"
-	c.Assert(err, IsNil)
+	require.NoError(b, err)
 	w := watch.NewFakeWithChanSize(nCycles, false)
 	wg := sync.WaitGroup{}
 
@@ -439,18 +428,18 @@ func (k *K8sIntegrationSuite) benchmarkInformer(ctx context.Context, nCycles int
 			&slim_corev1.Node{},
 			0,
 			cache.ResourceEventHandlerFuncs{
-				AddFunc: func(obj interface{}) {},
-				UpdateFunc: func(oldObj, newObj interface{}) {
-					if oldK8sNP := k8s.CastInformerEvent[slim_corev1.Node](oldObj); oldK8sNP != nil {
-						if newK8sNP := k8s.CastInformerEvent[slim_corev1.Node](newObj); newK8sNP != nil {
+				AddFunc: func(obj any) {},
+				UpdateFunc: func(oldObj, newObj any) {
+					if oldK8sNP := informer.CastInformerEvent[slim_corev1.Node](hivetest.Logger(b), oldObj); oldK8sNP != nil {
+						if newK8sNP := informer.CastInformerEvent[slim_corev1.Node](hivetest.Logger(b), newObj); newK8sNP != nil {
 							if reflect.DeepEqual(oldK8sNP, newK8sNP) {
 								return
 							}
 						}
 					}
 				},
-				DeleteFunc: func(obj interface{}) {
-					k8sNP := k8s.CastInformerEvent[slim_corev1.Node](obj)
+				DeleteFunc: func(obj any) {
+					k8sNP := informer.CastInformerEvent[slim_corev1.Node](hivetest.Logger(b), obj)
 					if k8sNP == nil {
 						deletedObj, ok := obj.(cache.DeletedFinalStateUnknown)
 						if !ok {
@@ -459,7 +448,7 @@ func (k *K8sIntegrationSuite) benchmarkInformer(ctx context.Context, nCycles int
 						// Delete was not observed by the watcher but is
 						// removed from kube-apiserver. This is the last
 						// known state and the object no longer exists.
-						k8sNP = k8s.CastInformerEvent[slim_corev1.Node](deletedObj.Obj)
+						k8sNP = informer.CastInformerEvent[slim_corev1.Node](hivetest.Logger(b), deletedObj.Obj)
 						if k8sNP == nil {
 							return
 						}
@@ -476,8 +465,8 @@ func (k *K8sIntegrationSuite) benchmarkInformer(ctx context.Context, nCycles int
 			&slim_corev1.Node{},
 			0,
 			cache.ResourceEventHandlerFuncs{
-				AddFunc: func(obj interface{}) {},
-				UpdateFunc: func(oldObj, newObj interface{}) {
+				AddFunc: func(obj any) {},
+				UpdateFunc: func(oldObj, newObj any) {
 					if oldK8sNP := OldCopyObjToV1Node(oldObj); oldK8sNP != nil {
 						if newK8sNP := OldCopyObjToV1Node(newObj); newK8sNP != nil {
 							if OldEqualV1Node(oldK8sNP, newK8sNP) {
@@ -486,7 +475,7 @@ func (k *K8sIntegrationSuite) benchmarkInformer(ctx context.Context, nCycles int
 						}
 					}
 				},
-				DeleteFunc: func(obj interface{}) {
+				DeleteFunc: func(obj any) {
 					k8sNP := OldCopyObjToV1Node(obj)
 					if k8sNP == nil {
 						deletedObj, ok := obj.(cache.DeletedFinalStateUnknown)
@@ -509,14 +498,14 @@ func (k *K8sIntegrationSuite) benchmarkInformer(ctx context.Context, nCycles int
 	}
 
 	wg.Add(1)
-	c.ResetTimer()
+	b.ResetTimer()
 	for i := 2; i <= nCycles; i++ {
 		n.ResourceVersion = strconv.Itoa(i)
 		w.Action(watch.Modified, &n)
 	}
 	w.Action(watch.Deleted, &n)
 	wg.Wait()
-	c.StopTimer()
+	b.StopTimer()
 }
 
 func OldEqualV1Node(node1, node2 *slim_corev1.Node) bool {
@@ -526,7 +515,7 @@ func OldEqualV1Node(node1, node2 *slim_corev1.Node) bool {
 		node1.GetAnnotations()[annotation.CiliumHostIP] == node2.GetAnnotations()[annotation.CiliumHostIP]
 }
 
-func OldCopyObjToV1Node(obj interface{}) *slim_corev1.Node {
+func OldCopyObjToV1Node(obj any) *slim_corev1.Node {
 	node, ok := obj.(*slim_corev1.Node)
 	if !ok {
 		return nil
@@ -534,20 +523,20 @@ func OldCopyObjToV1Node(obj interface{}) *slim_corev1.Node {
 	return node.DeepCopy()
 }
 
-func (k *K8sIntegrationSuite) Benchmark_Informer(ctx context.Context, c *C) {
+func Benchmark_Informer(b *testing.B) {
 	nCycles, err := strconv.Atoi(os.Getenv("CYCLES"))
 	if err != nil {
-		nCycles = c.N
+		nCycles = b.N
 	}
 
-	k.benchmarkInformer(ctx, nCycles, true, c)
+	benchmarkInformer(context.Background(), nCycles, true, b)
 }
 
-func (k *K8sIntegrationSuite) Benchmark_K8sInformer(ctx context.Context, c *C) {
+func Benchmark_K8sInformer(b *testing.B) {
 	nCycles, err := strconv.Atoi(os.Getenv("CYCLES"))
 	if err != nil {
-		nCycles = c.N
+		nCycles = b.N
 	}
 
-	k.benchmarkInformer(ctx, nCycles, false, c)
+	benchmarkInformer(context.Background(), nCycles, false, b)
 }

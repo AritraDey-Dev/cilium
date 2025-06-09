@@ -5,19 +5,17 @@ package metrics
 
 import (
 	"strings"
+	"testing"
 
-	. "github.com/cilium/checkmate"
+	"github.com/cilium/hive/hivetest"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/cilium/api/v1/client/daemon"
 	"github.com/cilium/cilium/api/v1/health/client/connectivity"
 	healthModels "github.com/cilium/cilium/api/v1/health/models"
 	"github.com/cilium/cilium/api/v1/models"
 )
-
-type StatusCollectorTest struct{}
-
-var _ = Suite(&StatusCollectorTest{})
 
 var sampleHealthResponse = &daemon.GetHealthzOK{
 	Payload: &models.StatusResponse{
@@ -125,7 +123,8 @@ func (f *fakeDaemonClient) GetHealthz(params *daemon.GetHealthzParams, opts ...d
 	return f.response, nil
 }
 
-func (s *StatusCollectorTest) Test_statusCollector_Collect(c *C) {
+func Test_statusCollector_Collect(t *testing.T) {
+	logger := hivetest.Logger(t)
 	tests := []struct {
 		name                 string
 		healthResponse       *daemon.GetHealthzOK
@@ -143,8 +142,8 @@ func (s *StatusCollectorTest) Test_statusCollector_Collect(c *C) {
 	}
 
 	for _, tt := range tests {
-		c.Log("Test :", tt.name)
-		collector := newStatusCollectorWithClients(&fakeDaemonClient{
+		t.Log("Test :", tt.name)
+		collector := newStatusCollectorWithClients(logger, &fakeDaemonClient{
 			response: tt.healthResponse,
 		}, &fakeConnectivityClient{
 			response: tt.connectivityResponse,
@@ -152,16 +151,16 @@ func (s *StatusCollectorTest) Test_statusCollector_Collect(c *C) {
 
 		// perform static checks such as prometheus naming convention, number of labels matching, etc
 		lintProblems, err := testutil.CollectAndLint(collector)
-		c.Assert(err, IsNil)
-		c.Assert(lintProblems, HasLen, 0)
+		require.NoError(t, err)
+		require.Empty(t, lintProblems)
 
 		// check the number of metrics
 		count := testutil.CollectAndCount(collector)
-		c.Assert(count, Equals, tt.expectedCount)
+		require.Equal(t, tt.expectedCount, count)
 
 		// compare the metric output
 		err = testutil.CollectAndCompare(collector, strings.NewReader(tt.expectedMetric))
-		c.Assert(err, IsNil)
+		require.NoError(t, err)
 	}
 
 }

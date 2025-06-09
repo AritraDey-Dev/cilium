@@ -7,22 +7,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/netip"
-	"runtime/pprof"
+
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
+	"github.com/cilium/statedb"
+	"github.com/vishvananda/netlink"
 
 	"github.com/cilium/cilium/pkg/datapath/garp"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/ebpf"
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/hive/job"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/l2respondermap"
-	"github.com/cilium/cilium/pkg/statedb"
 	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/types"
-
-	"github.com/sirupsen/logrus"
-	"github.com/vishvananda/netlink"
 )
 
 // Cell provides the L2 Responder Reconciler. This component takes the desired state, calculated by
@@ -48,14 +48,15 @@ var Cell = cell.Module(
 type params struct {
 	cell.In
 
-	Lifecycle           hive.Lifecycle
-	Logger              logrus.FieldLogger
+	Lifecycle           cell.Lifecycle
+	Logger              *slog.Logger
 	L2AnnouncementTable statedb.RWTable[*tables.L2AnnounceEntry]
 	StateDB             *statedb.DB
 	L2ResponderMap      l2respondermap.Map
 	NetLink             linkByNamer
-	JobRegistry         job.Registry
-	Scope               cell.Scope
+	JobGroup            job.Group
+	Health              cell.Health
+	GARPSender          garp.Sender
 }
 
 type linkByNamer interface {
@@ -75,18 +76,12 @@ func NewL2ResponderReconciler(params params) *l2ResponderReconciler {
 		params: params,
 	}
 
-	group := params.JobRegistry.NewGroup(
-		params.Scope,
-		job.WithLogger(params.Logger),
-		job.WithPprofLabels(pprof.Labels("cell", "l2-responder-reconciler")),
-	)
-	params.Lifecycle.Append(group)
-	group.Add(job.OneShot("l2-responder-reconciler", reconciler.run))
+	params.JobGroup.Add(job.OneShot("l2-responder-reconciler", reconciler.run))
 
 	return &reconciler
 }
 
-func (p *l2ResponderReconciler) run(ctx context.Context, health cell.HealthReporter) error {
+func (p *l2ResponderReconciler) run(ctx context.Context, health cell.Health) error {
 	log := p.params.Logger
 
 	// This timer triggers full reconciliation once in a while, in case partial reconciliation
@@ -95,23 +90,21 @@ func (p *l2ResponderReconciler) run(ctx context.Context, health cell.HealthRepor
 
 	tbl := p.params.L2AnnouncementTable
 	txn := p.params.StateDB.WriteTxn(tbl)
-	tracker, err := tbl.DeleteTracker(txn, "l2-responder-reconciler")
+	changes, err := tbl.Changes(txn)
 	if err != nil {
 		txn.Abort()
 		return fmt.Errorf("delete tracker: %w", err)
 	}
 	txn.Commit()
 
-	defer tracker.Close()
-
 	// At startup, do an initial full reconciliation
-	maxRev, err := p.fullReconciliation()
+	err = p.fullReconciliation(p.params.StateDB.ReadTxn())
 	if err != nil {
-		log.WithError(err).Error("Error(s) while reconciling l2 responder map")
+		log.Error("Error(s) while reconciling l2 responder map", logfields.Error, err)
 	}
 
 	for ctx.Err() == nil {
-		maxRev = p.cycle(ctx, tracker, maxRev, ticker.C)
+		p.cycle(ctx, changes, ticker.C)
 	}
 
 	return nil
@@ -119,18 +112,15 @@ func (p *l2ResponderReconciler) run(ctx context.Context, health cell.HealthRepor
 
 func (p *l2ResponderReconciler) cycle(
 	ctx context.Context,
-	tracker *statedb.DeleteTracker[*tables.L2AnnounceEntry],
-	maxRevIn statedb.Revision,
+	changeIter statedb.ChangeIterator[*tables.L2AnnounceEntry],
 	fullReconciliation <-chan time.Time,
-) (maxRev statedb.Revision) {
+) {
 	arMap := p.params.L2ResponderMap
-	rtx := p.params.StateDB.ReadTxn()
 	log := p.params.Logger
 
 	lr := cachingLinkResolver{nl: p.params.NetLink}
 
-	// Partial reconciliation
-	maxRev, invalid, err := tracker.Process(rtx, maxRevIn, func(e *tables.L2AnnounceEntry, deleted bool, rev uint64) error {
+	process := func(e *tables.L2AnnounceEntry, deleted bool) error {
 		// Ignore IPv6 addresses, L2 is IPv4 only
 		if e.IP.Is6() {
 			return nil
@@ -150,7 +140,7 @@ func (p *l2ResponderReconciler) cycle(
 			return nil
 		}
 
-		err = garpOnNewEntry(arMap, e.IP, idx)
+		err = garpOnNewEntry(arMap, p.params.GARPSender, e.IP, idx)
 		if err != nil {
 			return err
 		}
@@ -161,48 +151,48 @@ func (p *l2ResponderReconciler) cycle(
 		}
 
 		return nil
-	})
-	if err != nil {
-		log.WithError(err).Error("error during partial reconciliation")
+	}
+
+	// Partial reconciliation
+	txn := p.params.StateDB.ReadTxn()
+	changes, watch := changeIter.Next(txn)
+	for change := range changes {
+		err := process(change.Object, change.Deleted)
+		if err != nil {
+			log.Error("error during partial reconciliation", logfields.Error, err)
+			break
+		}
 	}
 
 	select {
 	case <-ctx.Done():
 		// Shutdown
-		return 0
+		return
 
-	case <-invalid:
+	case <-watch:
 		// There are pending changes in the table, return from the cycle
-		return maxRev
 
 	case <-fullReconciliation:
 		// Full reconciliation timer fired, perform full reconciliation
 
 		// The existing `iter` is the result of a `All` query, so this will return all
 		// entries in the table for full reconciliation.
-		maxRev, err = p.fullReconciliation()
+		err := p.fullReconciliation(txn)
 		if err != nil {
-			log.WithError(err).Error("Error(s) while full reconciling l2 responder map")
+			log.Error("Error(s) while full reconciling l2 responder map", logfields.Error, err)
 		}
-
-		return maxRev
 	}
 }
 
-func (p *l2ResponderReconciler) fullReconciliation() (maxRev uint64, err error) {
+func (p *l2ResponderReconciler) fullReconciliation(txn statedb.ReadTxn) (err error) {
 	var errs error
 
 	log := p.params.Logger
 	tbl := p.params.L2AnnouncementTable
-	db := p.params.StateDB
 	arMap := p.params.L2ResponderMap
 	lr := cachingLinkResolver{nl: p.params.NetLink}
 
 	log.Debug("l2 announcer table full reconciliation")
-
-	// Get all desired entries in the table
-	rtx := db.ReadTxn()
-	iter, _ := tbl.All(rtx)
 
 	// Prepare index for desired entries based on map key
 	type desiredEntry struct {
@@ -211,16 +201,16 @@ func (p *l2ResponderReconciler) fullReconciliation() (maxRev uint64, err error) 
 	}
 	desiredMap := make(map[l2respondermap.L2ResponderKey]desiredEntry)
 
-	statedb.ProcessEach(iter, func(e *tables.L2AnnounceEntry, _ uint64) error {
+	for e := range tbl.All(txn) {
 		// Ignore IPv6 addresses, L2 is IPv4 only
 		if e.IP.Is6() {
-			return nil
+			continue
 		}
 
 		idx, err := lr.LinkIndex(e.NetworkInterface)
 		if err != nil {
 			errs = errors.Join(errs, err)
-			return nil
+			continue
 		}
 
 		desiredMap[l2respondermap.L2ResponderKey{
@@ -229,9 +219,7 @@ func (p *l2ResponderReconciler) fullReconciliation() (maxRev uint64, err error) 
 		}] = desiredEntry{
 			entry: e,
 		}
-
-		return nil
-	})
+	}
 
 	// Loop over all map values, use the desired entries index to see which we want to delete.
 	var toDelete []*l2respondermap.L2ResponderKey
@@ -257,7 +245,7 @@ func (p *l2ResponderReconciler) fullReconciliation() (maxRev uint64, err error) 
 			continue
 		}
 
-		err = garpOnNewEntry(arMap, netip.AddrFrom4(key.IP), int(key.IfIndex))
+		err = garpOnNewEntry(arMap, p.params.GARPSender, netip.AddrFrom4(key.IP), int(key.IfIndex))
 		if err != nil {
 			errs = errors.Join(errs, err)
 		}
@@ -267,19 +255,24 @@ func (p *l2ResponderReconciler) fullReconciliation() (maxRev uint64, err error) 
 		}
 	}
 
-	return maxRev, errs
+	return errs
 }
 
 // If the given IP and network interface index does not yet exist in the l2 responder map,
 // a failover might have taken place. Therefor we should send out a gARP reply to let
 // the local network know the IP has moved to minimize downtime due to ARP caching.
-func garpOnNewEntry(arMap l2respondermap.Map, ip netip.Addr, ifIndex int) error {
+func garpOnNewEntry(arMap l2respondermap.Map, sender garp.Sender, ip netip.Addr, ifIndex int) error {
 	_, err := arMap.Lookup(ip, uint32(ifIndex))
 	if !errors.Is(err, ebpf.ErrKeyNotExist) {
 		return nil
 	}
 
-	err = garp.SendOnInterfaceIdx(ifIndex, ip)
+	iface, err := sender.InterfaceByIndex(ifIndex)
+	if err != nil {
+		return fmt.Errorf("garp %s@%d: %w", ip, ifIndex, err)
+	}
+
+	err = sender.Send(iface, ip)
 	if err != nil {
 		return fmt.Errorf("garp %s@%d: %w", ip, ifIndex, err)
 	}
@@ -303,7 +296,9 @@ func (clr *cachingLinkResolver) LinkIndex(name string) (int, error) {
 		return idx, nil
 	}
 
-	link, err := clr.nl.LinkByName(name)
+	link, err := safenetlink.WithRetryResult(func() (netlink.Link, error) {
+		return clr.nl.LinkByName(name)
+	})
 	if err != nil {
 		return 0, err
 	}

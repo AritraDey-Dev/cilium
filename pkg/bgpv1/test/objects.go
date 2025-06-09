@@ -6,14 +6,15 @@ package test
 import (
 	"net/netip"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+
 	ipam_types "github.com/cilium/cilium/pkg/ipam/types"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	v2alpha1 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	slim_core_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_meta_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 var (
@@ -44,6 +45,17 @@ func newPolicyObj(conf policyConfig) v2alpha1.CiliumBGPPeeringPolicy {
 	}
 
 	if conf.virtualRouters != nil {
+		// Override ConnectRetryTimeSeconds to 1 for all neighbors
+		// unless it is specified explicitly. Otherwise, the default
+		// value of 120 seconds would timeout the tests when the
+		// initial connect fails.
+		for i, vrouter := range conf.virtualRouters {
+			for j, neigh := range vrouter.Neighbors {
+				if neigh.ConnectRetryTimeSeconds == nil {
+					conf.virtualRouters[i].Neighbors[j].ConnectRetryTimeSeconds = ptr.To[int32](1)
+				}
+			}
+		}
 		policyObj.Spec.VirtualRouters = conf.virtualRouters
 	}
 
@@ -76,6 +88,57 @@ func newLBServiceObj(conf lbSrvConfig) slim_core_v1.Service {
 	return srvObj
 }
 
+// clusterIPSrvConfig contains ClusterIP service configuration data
+type clusterIPSrvConfig struct {
+	name      string
+	clusterIP string
+}
+
+// newClusterIPServiceObj creates slim_core_v1.Service object based on lbSrvConfig
+func newClusterIPServiceObj(conf clusterIPSrvConfig) slim_core_v1.Service {
+	srvObj := slim_core_v1.Service{
+		ObjectMeta: slim_meta_v1.ObjectMeta{
+			Name: conf.name,
+		},
+		Spec: slim_core_v1.ServiceSpec{
+			Type:       slim_core_v1.ServiceTypeClusterIP,
+			ClusterIP:  conf.clusterIP,
+			ClusterIPs: []string{conf.clusterIP},
+		},
+	}
+
+	srvObj.Status = slim_core_v1.ServiceStatus{
+		LoadBalancer: slim_core_v1.LoadBalancerStatus{},
+	}
+
+	return srvObj
+}
+
+// externalIPsSrvConfig contains ExternalIPs service configuration data
+type externalIPsSrvConfig struct {
+	name       string
+	externalIP string
+}
+
+// newExternalIPServiceObj creates slim_core_v1.Service object based on externalIPsSrvConfig
+func newExternalIPServiceObj(conf externalIPsSrvConfig) slim_core_v1.Service {
+	srvObj := slim_core_v1.Service{
+		ObjectMeta: slim_meta_v1.ObjectMeta{
+			Name: conf.name,
+		},
+		Spec: slim_core_v1.ServiceSpec{
+			Type:        slim_core_v1.ServiceTypeClusterIP,
+			ExternalIPs: []string{conf.externalIP},
+		},
+	}
+
+	srvObj.Status = slim_core_v1.ServiceStatus{
+		LoadBalancer: slim_core_v1.LoadBalancerStatus{},
+	}
+
+	return srvObj
+}
+
 // lbSrvConfig contains lb service configuration data
 type lbPoolConfig struct {
 	name   string
@@ -84,8 +147,8 @@ type lbPoolConfig struct {
 }
 
 // newLBPoolObj creates CiliumLoadBalancerIPPool object based on lbSrvConfig
-func newLBPoolObj(conf lbPoolConfig) v2alpha1.CiliumLoadBalancerIPPool {
-	obj := v2alpha1.CiliumLoadBalancerIPPool{
+func newLBPoolObj(conf lbPoolConfig) v2.CiliumLoadBalancerIPPool {
+	obj := v2.CiliumLoadBalancerIPPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              conf.name,
 			UID:               uid,
@@ -97,7 +160,7 @@ func newLBPoolObj(conf lbPoolConfig) v2alpha1.CiliumLoadBalancerIPPool {
 		obj.Labels = conf.labels
 	}
 	for _, cidr := range conf.cidrs {
-		obj.Spec.Cidrs = append(obj.Spec.Cidrs, v2alpha1.CiliumLoadBalancerIPPoolIPBlock{Cidr: v2alpha1.IPv4orIPv6CIDR(cidr)})
+		obj.Spec.Blocks = append(obj.Spec.Blocks, v2.CiliumLoadBalancerIPPoolIPBlock{Cidr: v2.IPv4orIPv6CIDR(cidr)})
 	}
 	return obj
 }

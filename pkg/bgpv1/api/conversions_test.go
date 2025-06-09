@@ -22,7 +22,7 @@ func TestRouteConversions(t *testing.T) {
 				Paths:  []*types.Path{&tt.Path},
 			}
 
-			apiRoutes, err := ToAPIRoutes([]*types.Route{expectedRoute}, testRouterASN)
+			apiRoutes, err := ToAPIRoutes([]*types.Route{expectedRoute}, testRouterASN, "")
 			require.NoError(t, err)
 			require.NotZero(t, apiRoutes)
 
@@ -30,7 +30,7 @@ func TestRouteConversions(t *testing.T) {
 			require.NoError(t, err)
 			require.NotZero(t, agentRoutes)
 
-			require.EqualValues(t, expectedRoute, agentRoutes[0])
+			require.Equal(t, expectedRoute, agentRoutes[0])
 		})
 	}
 }
@@ -46,7 +46,7 @@ func TestRoutePolicyConversions(t *testing.T) {
 			require.NoError(t, err)
 			require.NotZero(t, agentPolicies)
 
-			require.EqualValues(t, tt.Policy, agentPolicies[0])
+			require.Equal(t, tt.Policy, agentPolicies[0])
 		})
 	}
 }

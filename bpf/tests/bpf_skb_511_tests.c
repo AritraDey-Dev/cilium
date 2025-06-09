@@ -12,11 +12,10 @@
 #define IDENTITY_MAX 32767
 #endif
 
-#include "common.h"
-
 #include <bpf/ctx/skb.h>
 #include <lib/overloadable.h>
 #include <lib/clustermesh.h>
+#include "common.h"
 
 #define CLUSTER_LOCAL_IDENTITY 0x5555
 #define TEST_CLUSTER_ID 0x1FFu
@@ -30,7 +29,7 @@ int check_get_identity(struct __ctx_buff *ctx)
 
 	test_init();
 
-	set_identity_mark(ctx, IDENTITY);
+	set_identity_mark(ctx, IDENTITY, MARK_MAGIC_IDENTITY);
 
 	identity = get_identity(ctx);
 	if (identity != IDENTITY)

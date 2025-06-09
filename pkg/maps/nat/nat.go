@@ -4,6 +4,7 @@
 package nat
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -11,15 +12,11 @@ import (
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/bpf"
-	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/timestamp"
+	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/tuple"
-)
-
-var (
-	log = logging.DefaultLogger.WithField(logfields.LogSubsys, "map-nat")
 )
 
 const (
@@ -32,6 +29,14 @@ const (
 	MinPortSnatDefault = 1024
 	// MaxPortSnatDefault represents default max port from range.
 	MaxPortSnatDefault = 65535
+
+	// MapNameSnat4AllocRetries represents the histogram of IPv4 NAT port allocation retries.
+	MapNameSnat4AllocRetries = "cilium_snat_v4_alloc_retries"
+	// MapNameSnat6AllocRetries represents the histogram of IPv6 NAT port allocation retries.
+	MapNameSnat6AllocRetries = "cilium_snat_v6_alloc_retries"
+
+	// SnatCollisionRetries represents the maximum number of port allocation retries.
+	SnatCollisionRetries = 32
 )
 
 // Map represents a NAT map.
@@ -60,18 +65,28 @@ type NatMapRecord struct {
 	Value NatEntry
 }
 
-// NatMap interface represents a NAT map, and can be reused to implement mock
-// maps for unit tests.
-type NatMap interface {
+type commonMap interface {
 	Open() error
 	Close() error
 	Path() (string, error)
+}
+
+// NatMap interface represents a NAT map, and can be reused to implement mock
+// maps for unit tests.
+type NatMap interface {
+	commonMap
 	DumpEntries() (string, error)
 	DumpWithCallback(bpf.DumpCallback) error
 }
 
+type RetriesMap interface {
+	commonMap
+	DumpPerCPUWithCallback(bpf.DumpPerCPUCallback) error
+	ClearAll() error
+}
+
 // NewMap instantiates a Map.
-func NewMap(name string, family IPFamily, entries int) *Map {
+func NewMap(registry *metrics.Registry, name string, family IPFamily, entries int) *Map {
 	var mapKey bpf.MapKey
 	var mapValue bpf.MapValue
 
@@ -93,9 +108,69 @@ func NewMap(name string, family IPFamily, entries int) *Map {
 			0,
 		).WithCache().
 			WithEvents(option.Config.GetEventBufferConfig(name)).
-			WithPressureMetric(),
+			WithPressureMetric(registry),
 		family: family,
 	}
+}
+
+type RetriesKey struct {
+	Key uint32
+}
+
+func (k *RetriesKey) String() string  { return fmt.Sprintf("%d", k.Key) }
+func (k *RetriesKey) New() bpf.MapKey { return &RetriesKey{} }
+
+type RetriesValue struct {
+	Value uint32
+}
+
+type RetriesValues []RetriesValue
+
+func (k *RetriesValue) String() string    { return fmt.Sprintf("%d", k.Value) }
+func (k *RetriesValue) New() bpf.MapValue { return &RetriesValue{} }
+func (k *RetriesValue) NewSlice() any     { return &RetriesValues{} }
+
+type RetriesMapRecord struct {
+	Key   *RetriesKey
+	Value *RetriesValue
+}
+
+func NewRetriesMap(name string) *bpf.Map {
+	return bpf.NewMap(
+		name,
+		ebpf.PerCPUArray,
+		&RetriesKey{},
+		&RetriesValue{},
+		SnatCollisionRetries+1,
+		0,
+	)
+}
+
+// DumpBatch4 uses batch iteration to walk the map and applies fn for each batch of entries.
+func (m *Map) DumpBatch4(fn func(*tuple.TupleKey4, *NatEntry4)) (count int, err error) {
+	if m.family != IPv4 {
+		return 0, fmt.Errorf("not implemented: wrong ip family: %s", m.family)
+	}
+
+	iter := bpf.NewBatchIterator[tuple.TupleKey4, NatEntry4](&m.Map)
+	for key, entry := range iter.IterateAll(context.Background()) {
+		count++
+		fn(key, entry)
+	}
+	return count, nil
+}
+
+// DumpBatch6 uses batch iteration to walk the map and applies fn for each batch of entries.
+func (m *Map) DumpBatch6(fn func(*tuple.TupleKey6, *NatEntry6)) (count int, err error) {
+	if m.family != IPv6 {
+		return 0, fmt.Errorf("not implemented: wrong ip family: %s", m.family)
+	}
+	iter := bpf.NewBatchIterator[tuple.TupleKey6, NatEntry6](&m.Map)
+	for key, entry := range iter.IterateAll(context.Background()) {
+		count++
+		fn(key, entry)
+	}
+	return count, nil
 }
 
 func (m *Map) Delete(k bpf.MapKey) (deleted bool, err error) {
@@ -182,9 +257,12 @@ func statStartGc(m *Map) gcStats {
 func doFlush4(m *Map) gcStats {
 	stats := statStartGc(m)
 	filterCallback := func(key bpf.MapKey, _ bpf.MapValue) {
-		err := (&m.Map).Delete(key)
+		err := (&m.Map).DeleteLocked(key)
 		if err != nil {
-			log.WithError(err).WithField(logfields.Key, key.String()).Error("Unable to delete NAT entry")
+			m.Logger.Error("Unable to delete NAT entry",
+				logfields.Error, err,
+				logfields.Key, key,
+			)
 		} else {
 			stats.deleted++
 		}
@@ -196,9 +274,12 @@ func doFlush4(m *Map) gcStats {
 func doFlush6(m *Map) gcStats {
 	stats := statStartGc(m)
 	filterCallback := func(key bpf.MapKey, _ bpf.MapValue) {
-		err := (&m.Map).Delete(key)
+		err := (&m.Map).DeleteLocked(key)
 		if err != nil {
-			log.WithError(err).WithField(logfields.Key, key.String()).Error("Unable to delete NAT entry")
+			m.Logger.Error("Unable to delete NAT entry",
+				logfields.Error, err,
+				logfields.Key, key,
+			)
 		} else {
 			stats.deleted++
 		}
@@ -216,7 +297,11 @@ func (m *Map) Flush() int {
 	return int(doFlush6(m).deleted)
 }
 
-func DeleteMapping4(m *Map, ctKey *tuple.TupleKey4Global) error {
+func DeleteMapping4(m *Map, tk tuple.TupleKey) error {
+	ctKey, ok := tk.(*tuple.TupleKey4Global)
+	if !ok {
+		return fmt.Errorf("wrong type %T for key", tk)
+	}
 	key := NatKey4{
 		TupleKey4Global: *ctKey,
 	}
@@ -240,7 +325,11 @@ func DeleteMapping4(m *Map, ctKey *tuple.TupleKey4Global) error {
 	return nil
 }
 
-func DeleteMapping6(m *Map, ctKey *tuple.TupleKey6Global) error {
+func DeleteMapping6(m *Map, tk tuple.TupleKey) error {
+	ctKey, ok := tk.(*tuple.TupleKey6Global)
+	if !ok {
+		return fmt.Errorf("wrong type %T for key", tk)
+	}
 	key := NatKey6{
 		TupleKey6Global: *ctKey,
 	}
@@ -265,7 +354,11 @@ func DeleteMapping6(m *Map, ctKey *tuple.TupleKey6Global) error {
 }
 
 // Expects ingress tuple
-func DeleteSwappedMapping4(m *Map, ctKey *tuple.TupleKey4Global) error {
+func DeleteSwappedMapping4(m *Map, tk tuple.TupleKey) error {
+	ctKey, ok := tk.(*tuple.TupleKey4Global)
+	if !ok {
+		return fmt.Errorf("wrong type %T for key", tk)
+	}
 	key := NatKey4{TupleKey4Global: *ctKey}
 	// Because of #5848, we need to reverse only ports
 	port := key.SourcePort
@@ -278,7 +371,11 @@ func DeleteSwappedMapping4(m *Map, ctKey *tuple.TupleKey4Global) error {
 }
 
 // Expects ingress tuple
-func DeleteSwappedMapping6(m *Map, ctKey *tuple.TupleKey6Global) error {
+func DeleteSwappedMapping6(m *Map, tk tuple.TupleKey) error {
+	ctKey, ok := tk.(*tuple.TupleKey6Global)
+	if !ok {
+		return fmt.Errorf("wrong type %T for key", tk)
+	}
 	key := NatKey6{TupleKey6Global: *ctKey}
 	// Because of #5848, we need to reverse only ports
 	port := key.SourcePort
@@ -291,15 +388,15 @@ func DeleteSwappedMapping6(m *Map, ctKey *tuple.TupleKey6Global) error {
 }
 
 // GlobalMaps returns all global NAT maps.
-func GlobalMaps(ipv4, ipv6, nodeport bool) (ipv4Map, ipv6Map *Map) {
+func GlobalMaps(registry *metrics.Registry, ipv4, ipv6, nodeport bool) (ipv4Map, ipv6Map *Map) {
 	if !nodeport {
 		return
 	}
 	if ipv4 {
-		ipv4Map = NewMap(MapNameSnat4Global, IPv4, maxEntries())
+		ipv4Map = NewMap(registry, MapNameSnat4Global, IPv4, maxEntries())
 	}
 	if ipv6 {
-		ipv6Map = NewMap(MapNameSnat6Global, IPv6, maxEntries())
+		ipv6Map = NewMap(registry, MapNameSnat6Global, IPv6, maxEntries())
 	}
 	return
 }
@@ -326,4 +423,34 @@ func maxEntries() int {
 		return option.Config.NATMapEntriesGlobal
 	}
 	return option.LimitTableMax
+}
+
+// RetriesMaps returns the maps that contain the histograms of the number of retries.
+func RetriesMaps(ipv4, ipv6, nodeport bool) (ipv4RetriesMap, ipv6RetriesMap RetriesMap) {
+	if !nodeport {
+		return
+	}
+	if ipv4 {
+		ipv4RetriesMap = NewRetriesMap(MapNameSnat4AllocRetries)
+	}
+	if ipv6 {
+		ipv6RetriesMap = NewRetriesMap(MapNameSnat6AllocRetries)
+	}
+	return
+}
+
+func CreateRetriesMaps(ipv4, ipv6 bool) error {
+	if ipv4 {
+		ipv4Map := NewRetriesMap(MapNameSnat4AllocRetries)
+		if err := ipv4Map.OpenOrCreate(); err != nil {
+			return err
+		}
+	}
+	if ipv6 {
+		ipv6Map := NewRetriesMap(MapNameSnat6AllocRetries)
+		if err := ipv6Map.OpenOrCreate(); err != nil {
+			return err
+		}
+	}
+	return nil
 }

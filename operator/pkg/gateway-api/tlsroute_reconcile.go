@@ -7,12 +7,10 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/sirupsen/logrus"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
@@ -28,10 +26,10 @@ import (
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.12.2/pkg/reconcile
 func (r *tlsRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	scopedLog := log.WithContext(ctx).WithFields(logrus.Fields{
-		logfields.Controller: "tlsRoute",
-		logfields.Resource:   req.NamespacedName,
-	})
+	scopedLog := r.logger.With(
+		logfields.Controller, tlsRoute,
+		logfields.Resource, req.NamespacedName,
+	)
 	scopedLog.Info("Reconciling TLSRoute")
 
 	// Fetch the TLSRoute instance
@@ -40,7 +38,7 @@ func (r *tlsRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		if k8serrors.IsNotFound(err) {
 			return controllerruntime.Success()
 		}
-		scopedLog.WithError(err).Error("Unable to fetch TLSRoute")
+		scopedLog.ErrorContext(ctx, "Unable to fetch TLSRoute", logfields.Error, err)
 		return controllerruntime.Fail(err)
 	}
 
@@ -50,22 +48,17 @@ func (r *tlsRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	tr := original.DeepCopy()
-	defer func() {
-		if err := r.updateStatus(ctx, original, tr); err != nil {
-			scopedLog.WithError(err).Error("Failed to update TLSRoute status")
-		}
-	}()
 
 	// check if this cert is allowed to be used by this gateway
 	grants := &gatewayv1beta1.ReferenceGrantList{}
 	if err := r.Client.List(ctx, grants); err != nil {
-		return controllerruntime.Fail(fmt.Errorf("failed to retrieve reference grants: %w", err))
+		return r.handleReconcileErrorWithStatus(ctx, fmt.Errorf("failed to retrieve reference grants: %w", err), tr, original)
 	}
 
 	// input for the validators
 	i := &routechecks.TLSRouteInput{
 		Ctx:      ctx,
-		Logger:   scopedLog.WithField(logfields.Resource, tr),
+		Logger:   scopedLog.With(logfields.Resource, tr),
 		Client:   r.Client,
 		Grants:   grants,
 		TLSRoute: tr,
@@ -91,16 +84,33 @@ func (r *tlsRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		})
 
 		// run the actual validators
-		for _, fn := range []routechecks.CheckGatewayFunc{
-			routechecks.CheckGatewayAllowedForNamespace,
+		for _, fn := range []routechecks.CheckWithParentFunc{
 			routechecks.CheckGatewayRouteKindAllowed,
 			routechecks.CheckGatewayMatchingPorts,
 			routechecks.CheckGatewayMatchingHostnames,
 			routechecks.CheckGatewayMatchingSection,
+			routechecks.CheckGatewayAllowedForNamespace,
 		} {
 			continueCheck, err := fn(i, parent)
 			if err != nil {
-				return ctrl.Result{}, err
+				return r.handleReconcileErrorWithStatus(ctx, fmt.Errorf("failed to apply route check: %w", err), tr, original)
+			}
+
+			if !continueCheck {
+				break
+			}
+		}
+
+		// backend validators
+		for _, fn := range []routechecks.CheckWithParentFunc{
+			routechecks.CheckAgainstCrossNamespaceBackendReferences,
+			routechecks.CheckBackend,
+			routechecks.CheckHasServiceImportSupport,
+			routechecks.CheckBackendIsExistingService,
+		} {
+			continueCheck, err := fn(i, parent)
+			if err != nil {
+				return r.handleReconcileErrorWithStatus(ctx, fmt.Errorf("failed to apply Gateway check: %w", err), tr, original)
 			}
 
 			if !continueCheck {
@@ -109,29 +119,22 @@ func (r *tlsRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
-	// backend validators
-
-	for _, fn := range []routechecks.CheckRuleFunc{
-		routechecks.CheckAgainstCrossNamespaceBackendReferences,
-		routechecks.CheckBackendIsService,
-		routechecks.CheckBackendIsExistingService,
-	} {
-		if continueCheck, err := fn(i); err != nil || !continueCheck {
-			return ctrl.Result{}, err
-		}
+	if err := r.ensureStatus(ctx, tr, original); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to update TLSRoute status: %w", err)
 	}
 
 	scopedLog.Info("Successfully reconciled TLSRoute")
 	return controllerruntime.Success()
 }
 
-func (r *tlsRouteReconciler) updateStatus(ctx context.Context, original *gatewayv1alpha2.TLSRoute, new *gatewayv1alpha2.TLSRoute) error {
-	oldStatus := original.Status.DeepCopy()
-	newStatus := new.Status.DeepCopy()
+func (r *tlsRouteReconciler) ensureStatus(ctx context.Context, new *gatewayv1alpha2.TLSRoute, original *gatewayv1alpha2.TLSRoute) error {
+	return r.Client.Status().Patch(ctx, new, client.MergeFrom(original))
+}
 
-	opts := cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime")
-	if cmp.Equal(oldStatus, newStatus, opts) {
-		return nil
+func (r *tlsRouteReconciler) handleReconcileErrorWithStatus(ctx context.Context, reconcileErr error, new *gatewayv1alpha2.TLSRoute, original *gatewayv1alpha2.TLSRoute) (ctrl.Result, error) {
+	if err := r.ensureStatus(ctx, new, original); err != nil {
+		return controllerruntime.Fail(fmt.Errorf("failed to update TLSRoute status while handling the reconcile error: %w: %w", reconcileErr, err))
 	}
-	return r.Client.Status().Update(ctx, new)
+
+	return controllerruntime.Fail(reconcileErr)
 }

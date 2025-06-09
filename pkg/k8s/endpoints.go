@@ -5,12 +5,16 @@ package k8s
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
+
+	serviceStore "github.com/cilium/cilium/pkg/clustermesh/store"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_discovery_v1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/discovery/v1"
@@ -18,9 +22,8 @@ import (
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	"github.com/cilium/cilium/pkg/k8s/types"
 	"github.com/cilium/cilium/pkg/loadbalancer"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
-	"github.com/cilium/cilium/pkg/option"
-	serviceStore "github.com/cilium/cilium/pkg/service/store"
 )
 
 // Endpoints is an abstraction for the Kubernetes endpoints object. Endpoints
@@ -94,9 +97,11 @@ func (in *Endpoints) DeepCopy() *Endpoints {
 type Backend struct {
 	Ports         serviceStore.PortConfiguration
 	NodeName      string
+	Hostname      string
 	Terminating   bool
 	HintsForZones []string
 	Preferred     bool
+	Zone          string
 }
 
 // String returns the string representation of an endpoints resource, with
@@ -109,11 +114,15 @@ func (e *Endpoints) String() string {
 	backends := []string{}
 	for addrCluster, be := range e.Backends {
 		for _, port := range be.Ports {
-			backends = append(backends, fmt.Sprintf("%s/%s", net.JoinHostPort(addrCluster.Addr().String(), strconv.Itoa(int(port.Port))), port.Protocol))
+			if be.Zone != "" {
+				backends = append(backends, fmt.Sprintf("%s/%s[%s]", net.JoinHostPort(addrCluster.Addr().String(), strconv.Itoa(int(port.Port))), port.Protocol, be.Zone))
+			} else {
+				backends = append(backends, fmt.Sprintf("%s/%s", net.JoinHostPort(addrCluster.Addr().String(), strconv.Itoa(int(port.Port))), port.Protocol))
+			}
 		}
 	}
 
-	sort.Strings(backends)
+	slices.Sort(backends)
 
 	return strings.Join(backends, ",")
 }
@@ -167,6 +176,7 @@ func ParseEndpoints(ep *slim_corev1.Endpoints) *Endpoints {
 			if addr.NodeName != nil {
 				backend.NodeName = *addr.NodeName
 			}
+			backend.Hostname = addr.Hostname
 
 			for _, port := range sub.Ports {
 				lbPort := loadbalancer.NewL4Addr(loadbalancer.L4Type(port.Protocol), uint16(port.Port))
@@ -220,15 +230,13 @@ func ParseEndpointSliceV1Beta1(ep *slim_discovery_v1beta1.EndpointSlice) *Endpoi
 		// More info: vendor/k8s.io/api/discovery/v1beta1/types.go
 		if sub.Conditions.Ready != nil && !*sub.Conditions.Ready {
 			skipEndpoint = true
-			if option.Config.EnableK8sTerminatingEndpoint {
-				// Terminating indicates that the endpoint is getting terminated. A
-				// nil values indicates an unknown state. Ready is never true when
-				// an endpoint is terminating. Propagate the terminating endpoint
-				// state so that we can gracefully remove those endpoints.
-				// More details : vendor/k8s.io/api/discovery/v1/types.go
-				if sub.Conditions.Terminating != nil && *sub.Conditions.Terminating {
-					skipEndpoint = false
-				}
+			// Terminating indicates that the endpoint is getting terminated. A
+			// nil values indicates an unknown state. Ready is never true when
+			// an endpoint is terminating. Propagate the terminating endpoint
+			// state so that we can gracefully remove those endpoints.
+			// More details : vendor/k8s.io/api/discovery/v1/types.go
+			if sub.Conditions.Terminating != nil && *sub.Conditions.Terminating {
+				skipEndpoint = false
 			}
 		}
 		if skipEndpoint {
@@ -244,14 +252,18 @@ func ParseEndpointSliceV1Beta1(ep *slim_discovery_v1beta1.EndpointSlice) *Endpoi
 			if !ok {
 				backend = &Backend{Ports: serviceStore.PortConfiguration{}}
 				endpoints.Backends[addrCluster] = backend
-				if nodeName, ok := sub.Topology["kubernetes.io/hostname"]; ok {
+				if nodeName, ok := sub.Topology[corev1.LabelHostname]; ok {
 					backend.NodeName = nodeName
 				}
-				if option.Config.EnableK8sTerminatingEndpoint {
-					if sub.Conditions.Terminating != nil && *sub.Conditions.Terminating {
-						backend.Terminating = true
-						metrics.TerminatingEndpointsEvents.Inc()
-					}
+				if sub.Hostname != nil {
+					backend.Hostname = *sub.Hostname
+				}
+				if sub.Conditions.Terminating != nil && *sub.Conditions.Terminating {
+					backend.Terminating = true
+					metrics.TerminatingEndpointsEvents.Inc()
+				}
+				if zoneName, ok := sub.Topology[corev1.LabelTopologyZone]; ok {
+					backend.Zone = zoneName
 				}
 			}
 
@@ -296,7 +308,7 @@ func parseEndpointPortV1Beta1(port slim_discovery_v1beta1.EndpointPort) (string,
 // ParseEndpointSliceV1 parses a Kubernetes EndpointSlice resource.
 // It reads ready and terminating state of endpoints in the EndpointSlice to
 // return an EndpointSlice ID and a filtered list of Endpoints for service load-balancing.
-func ParseEndpointSliceV1(ep *slim_discovery_v1.EndpointSlice) *Endpoints {
+func ParseEndpointSliceV1(logger *slog.Logger, ep *slim_discovery_v1.EndpointSlice) *Endpoints {
 	endpoints := newEndpoints()
 	endpoints.ObjectMeta = ep.ObjectMeta
 	endpoints.EndpointSliceID = ParseEndpointSliceID(ep)
@@ -307,7 +319,10 @@ func ParseEndpointSliceV1(ep *slim_discovery_v1.EndpointSlice) *Endpoints {
 		return endpoints
 	}
 
-	log.Debugf("Processing %d endpoints for EndpointSlice %s", len(ep.Endpoints), ep.Name)
+	logger.Debug("Processing endpoints for EndpointSlice",
+		logfields.LenEndpoints, len(ep.Endpoints),
+		logfields.Name, ep.Name,
+	)
 	for _, sub := range ep.Endpoints {
 		// ready indicates that this endpoint is prepared to receive traffic,
 		// according to whatever system is managing the endpoint. A nil value
@@ -328,16 +343,15 @@ func ParseEndpointSliceV1(ep *slim_discovery_v1.EndpointSlice) *Endpoints {
 		// More info: vendor/k8s.io/api/discovery/v1/types.go
 		isTerminating := sub.Conditions.Terminating != nil && *sub.Conditions.Terminating
 
-		// if is not Ready and EnableK8sTerminatingEndpoint is set
-		// allow endpoints that are Serving and Terminating
+		// if is not Ready allow endpoints that are Serving and Terminating
 		if !isReady {
-			if !option.Config.EnableK8sTerminatingEndpoint {
-				log.Debugf("discarding Endpoint on EndpointSlice %s: not Ready and EnableK8sTerminatingEndpoint %v", ep.Name, option.Config.EnableK8sTerminatingEndpoint)
-				continue
-			}
+
 			// filter not Serving endpoints since those can not receive traffic
 			if !isServing {
-				log.Debugf("discarding Endpoint on EndpointSlice %s: not Serving and EnableK8sTerminatingEndpoint %v", ep.Name, option.Config.EnableK8sTerminatingEndpoint)
+				logger.Debug(
+					"discarding Endpoint on EndpointSlice: not Serving",
+					logfields.Name, ep.Name,
+				)
 				continue
 			}
 		}
@@ -345,7 +359,12 @@ func ParseEndpointSliceV1(ep *slim_discovery_v1.EndpointSlice) *Endpoints {
 		for _, addr := range sub.Addresses {
 			addrCluster, err := cmtypes.ParseAddrCluster(addr)
 			if err != nil {
-				log.WithError(err).Infof("Unable to parse address %s for EndpointSlices %s", addr, ep.Name)
+				logger.Info(
+					"Unable to parse address for EndpointSlices",
+					logfields.Error, err,
+					logfields.Address, addr,
+					logfields.Name, ep.Name,
+				)
 				continue
 			}
 
@@ -356,14 +375,26 @@ func ParseEndpointSliceV1(ep *slim_discovery_v1.EndpointSlice) *Endpoints {
 				if sub.NodeName != nil {
 					backend.NodeName = *sub.NodeName
 				} else {
-					if nodeName, ok := sub.DeprecatedTopology["kubernetes.io/hostname"]; ok {
+					if nodeName, ok := sub.DeprecatedTopology[corev1.LabelHostname]; ok {
 						backend.NodeName = nodeName
 					}
 				}
+				if sub.Hostname != nil {
+					backend.Hostname = *sub.Hostname
+				}
+				if sub.Zone != nil {
+					backend.Zone = *sub.Zone
+				} else if zoneName, ok := sub.DeprecatedTopology[corev1.LabelTopologyZone]; ok {
+					backend.Zone = zoneName
+				}
 				// If is not ready check if is serving and terminating
-				if !isReady && option.Config.EnableK8sTerminatingEndpoint &&
+				if !isReady &&
 					isServing && isTerminating {
-					log.Debugf("Endpoint address %s on EndpointSlice %s is Terminating", addr, ep.Name)
+					logger.Debug(
+						"Endpoint address on EndpointSlice is Terminating",
+						logfields.Address, addr,
+						logfields.Name, ep.Name,
+					)
 					backend.Terminating = true
 					metrics.TerminatingEndpointsEvents.Inc()
 				}
@@ -385,7 +416,11 @@ func ParseEndpointSliceV1(ep *slim_discovery_v1.EndpointSlice) *Endpoints {
 		}
 	}
 
-	log.Debugf("EndpointSlice %s has %d backends", ep.Name, len(endpoints.Backends))
+	logger.Debug(
+		"EndpointSlice has backends",
+		logfields.LenBackends, len(endpoints.Backends),
+		logfields.Name, ep.Name,
+	)
 	return endpoints
 }
 
@@ -427,8 +462,8 @@ type EndpointSlices struct {
 	epSlices map[string]*Endpoints
 }
 
-// newEndpointsSlices returns a new EndpointSlices
-func newEndpointsSlices() *EndpointSlices {
+// NewEndpointsSlices returns a new EndpointSlices
+func NewEndpointsSlices() *EndpointSlices {
 	return &EndpointSlices{
 		epSlices: map[string]*Endpoints{},
 	}
@@ -452,11 +487,9 @@ func (es *EndpointSlices) GetEndpoints() *Endpoints {
 			if !ok {
 				allEps.Backends[backend] = ep.DeepCopy()
 			} else {
-				clone := b.DeepCopy()
 				for k, v := range ep.Ports {
-					clone.Ports[k] = v
+					b.Ports[k] = v.DeepCopy()
 				}
-				allEps.Backends[backend] = clone
 			}
 		}
 	}

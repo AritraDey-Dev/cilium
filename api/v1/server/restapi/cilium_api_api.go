@@ -26,12 +26,10 @@ import (
 	"github.com/cilium/cilium/api/v1/server/restapi/daemon"
 	"github.com/cilium/cilium/api/v1/server/restapi/endpoint"
 	"github.com/cilium/cilium/api/v1/server/restapi/ipam"
-	"github.com/cilium/cilium/api/v1/server/restapi/metrics"
 	"github.com/cilium/cilium/api/v1/server/restapi/policy"
 	"github.com/cilium/cilium/api/v1/server/restapi/prefilter"
 	"github.com/cilium/cilium/api/v1/server/restapi/recorder"
 	"github.com/cilium/cilium/api/v1/server/restapi/service"
-	"github.com/cilium/cilium/api/v1/server/restapi/statedb"
 )
 
 // NewCiliumAPIAPI creates a new CiliumAPI instance
@@ -54,7 +52,6 @@ func NewCiliumAPIAPI(spec *loads.Document) *CiliumAPIAPI {
 
 		JSONConsumer: runtime.JSONConsumer(),
 
-		BinProducer:  runtime.ByteStreamProducer(),
 		JSONProducer: runtime.JSONProducer(),
 
 		EndpointDeleteEndpointHandler: endpoint.DeleteEndpointHandlerFunc(func(params endpoint.DeleteEndpointParams) middleware.Responder {
@@ -77,9 +74,6 @@ func NewCiliumAPIAPI(spec *loads.Document) *CiliumAPIAPI {
 		}),
 		RecorderDeleteRecorderIDHandler: recorder.DeleteRecorderIDHandlerFunc(func(params recorder.DeleteRecorderIDParams) middleware.Responder {
 			return middleware.NotImplemented("operation recorder.DeleteRecorderID has not yet been implemented")
-		}),
-		ServiceDeleteServiceIDHandler: service.DeleteServiceIDHandlerFunc(func(params service.DeleteServiceIDParams) middleware.Responder {
-			return middleware.NotImplemented("operation service.DeleteServiceID has not yet been implemented")
 		}),
 		BgpGetBgpPeersHandler: bgp.GetBgpPeersHandlerFunc(func(params bgp.GetBgpPeersParams) middleware.Responder {
 			return middleware.NotImplemented("operation bgp.GetBgpPeers has not yet been implemented")
@@ -129,9 +123,6 @@ func NewCiliumAPIAPI(spec *loads.Document) *CiliumAPIAPI {
 		PolicyGetFqdnNamesHandler: policy.GetFqdnNamesHandlerFunc(func(params policy.GetFqdnNamesParams) middleware.Responder {
 			return middleware.NotImplemented("operation policy.GetFqdnNames has not yet been implemented")
 		}),
-		DaemonGetHealthHandler: daemon.GetHealthHandlerFunc(func(params daemon.GetHealthParams) middleware.Responder {
-			return middleware.NotImplemented("operation daemon.GetHealth has not yet been implemented")
-		}),
 		DaemonGetHealthzHandler: daemon.GetHealthzHandlerFunc(func(params daemon.GetHealthzParams) middleware.Responder {
 			return middleware.NotImplemented("operation daemon.GetHealthz has not yet been implemented")
 		}),
@@ -159,9 +150,6 @@ func NewCiliumAPIAPI(spec *loads.Document) *CiliumAPIAPI {
 		DaemonGetMapNameEventsHandler: daemon.GetMapNameEventsHandlerFunc(func(params daemon.GetMapNameEventsParams) middleware.Responder {
 			return middleware.NotImplemented("operation daemon.GetMapNameEvents has not yet been implemented")
 		}),
-		MetricsGetMetricsHandler: metrics.GetMetricsHandlerFunc(func(params metrics.GetMetricsParams) middleware.Responder {
-			return middleware.NotImplemented("operation metrics.GetMetrics has not yet been implemented")
-		}),
 		DaemonGetNodeIdsHandler: daemon.GetNodeIdsHandlerFunc(func(params daemon.GetNodeIdsParams) middleware.Responder {
 			return middleware.NotImplemented("operation daemon.GetNodeIds has not yet been implemented")
 		}),
@@ -188,12 +176,6 @@ func NewCiliumAPIAPI(spec *loads.Document) *CiliumAPIAPI {
 		}),
 		ServiceGetServiceIDHandler: service.GetServiceIDHandlerFunc(func(params service.GetServiceIDParams) middleware.Responder {
 			return middleware.NotImplemented("operation service.GetServiceID has not yet been implemented")
-		}),
-		StatedbGetStatedbDumpHandler: statedb.GetStatedbDumpHandlerFunc(func(params statedb.GetStatedbDumpParams) middleware.Responder {
-			return middleware.NotImplemented("operation statedb.GetStatedbDump has not yet been implemented")
-		}),
-		StatedbGetStatedbQueryTableHandler: statedb.GetStatedbQueryTableHandlerFunc(func(params statedb.GetStatedbQueryTableParams) middleware.Responder {
-			return middleware.NotImplemented("operation statedb.GetStatedbQueryTable has not yet been implemented")
 		}),
 		DaemonPatchConfigHandler: daemon.PatchConfigHandlerFunc(func(params daemon.PatchConfigParams) middleware.Responder {
 			return middleware.NotImplemented("operation daemon.PatchConfig has not yet been implemented")
@@ -224,9 +206,6 @@ func NewCiliumAPIAPI(spec *loads.Document) *CiliumAPIAPI {
 		}),
 		RecorderPutRecorderIDHandler: recorder.PutRecorderIDHandlerFunc(func(params recorder.PutRecorderIDParams) middleware.Responder {
 			return middleware.NotImplemented("operation recorder.PutRecorderID has not yet been implemented")
-		}),
-		ServicePutServiceIDHandler: service.PutServiceIDHandlerFunc(func(params service.PutServiceIDParams) middleware.Responder {
-			return middleware.NotImplemented("operation service.PutServiceID has not yet been implemented")
 		}),
 	}
 }
@@ -260,9 +239,6 @@ type CiliumAPIAPI struct {
 	//   - application/json
 	JSONConsumer runtime.Consumer
 
-	// BinProducer registers a producer for the following mime types:
-	//   - application/octet-stream
-	BinProducer runtime.Producer
 	// JSONProducer registers a producer for the following mime types:
 	//   - application/json
 	JSONProducer runtime.Producer
@@ -281,8 +257,6 @@ type CiliumAPIAPI struct {
 	PrefilterDeletePrefilterHandler prefilter.DeletePrefilterHandler
 	// RecorderDeleteRecorderIDHandler sets the operation handler for the delete recorder ID operation
 	RecorderDeleteRecorderIDHandler recorder.DeleteRecorderIDHandler
-	// ServiceDeleteServiceIDHandler sets the operation handler for the delete service ID operation
-	ServiceDeleteServiceIDHandler service.DeleteServiceIDHandler
 	// BgpGetBgpPeersHandler sets the operation handler for the get bgp peers operation
 	BgpGetBgpPeersHandler bgp.GetBgpPeersHandler
 	// BgpGetBgpRoutePoliciesHandler sets the operation handler for the get bgp route policies operation
@@ -315,8 +289,6 @@ type CiliumAPIAPI struct {
 	PolicyGetFqdnCacheIDHandler policy.GetFqdnCacheIDHandler
 	// PolicyGetFqdnNamesHandler sets the operation handler for the get fqdn names operation
 	PolicyGetFqdnNamesHandler policy.GetFqdnNamesHandler
-	// DaemonGetHealthHandler sets the operation handler for the get health operation
-	DaemonGetHealthHandler daemon.GetHealthHandler
 	// DaemonGetHealthzHandler sets the operation handler for the get healthz operation
 	DaemonGetHealthzHandler daemon.GetHealthzHandler
 	// PolicyGetIPHandler sets the operation handler for the get IP operation
@@ -335,8 +307,6 @@ type CiliumAPIAPI struct {
 	DaemonGetMapNameHandler daemon.GetMapNameHandler
 	// DaemonGetMapNameEventsHandler sets the operation handler for the get map name events operation
 	DaemonGetMapNameEventsHandler daemon.GetMapNameEventsHandler
-	// MetricsGetMetricsHandler sets the operation handler for the get metrics operation
-	MetricsGetMetricsHandler metrics.GetMetricsHandler
 	// DaemonGetNodeIdsHandler sets the operation handler for the get node ids operation
 	DaemonGetNodeIdsHandler daemon.GetNodeIdsHandler
 	// PolicyGetPolicyHandler sets the operation handler for the get policy operation
@@ -355,10 +325,6 @@ type CiliumAPIAPI struct {
 	ServiceGetServiceHandler service.GetServiceHandler
 	// ServiceGetServiceIDHandler sets the operation handler for the get service ID operation
 	ServiceGetServiceIDHandler service.GetServiceIDHandler
-	// StatedbGetStatedbDumpHandler sets the operation handler for the get statedb dump operation
-	StatedbGetStatedbDumpHandler statedb.GetStatedbDumpHandler
-	// StatedbGetStatedbQueryTableHandler sets the operation handler for the get statedb query table operation
-	StatedbGetStatedbQueryTableHandler statedb.GetStatedbQueryTableHandler
 	// DaemonPatchConfigHandler sets the operation handler for the patch config operation
 	DaemonPatchConfigHandler daemon.PatchConfigHandler
 	// EndpointPatchEndpointIDHandler sets the operation handler for the patch endpoint ID operation
@@ -379,8 +345,6 @@ type CiliumAPIAPI struct {
 	PolicyPutPolicyHandler policy.PutPolicyHandler
 	// RecorderPutRecorderIDHandler sets the operation handler for the put recorder ID operation
 	RecorderPutRecorderIDHandler recorder.PutRecorderIDHandler
-	// ServicePutServiceIDHandler sets the operation handler for the put service ID operation
-	ServicePutServiceIDHandler service.PutServiceIDHandler
 
 	// ServeError is called when an error is received, there is a default handler
 	// but you can set your own with this
@@ -454,9 +418,6 @@ func (o *CiliumAPIAPI) Validate() error {
 		unregistered = append(unregistered, "JSONConsumer")
 	}
 
-	if o.BinProducer == nil {
-		unregistered = append(unregistered, "BinProducer")
-	}
 	if o.JSONProducer == nil {
 		unregistered = append(unregistered, "JSONProducer")
 	}
@@ -481,9 +442,6 @@ func (o *CiliumAPIAPI) Validate() error {
 	}
 	if o.RecorderDeleteRecorderIDHandler == nil {
 		unregistered = append(unregistered, "recorder.DeleteRecorderIDHandler")
-	}
-	if o.ServiceDeleteServiceIDHandler == nil {
-		unregistered = append(unregistered, "service.DeleteServiceIDHandler")
 	}
 	if o.BgpGetBgpPeersHandler == nil {
 		unregistered = append(unregistered, "bgp.GetBgpPeersHandler")
@@ -533,9 +491,6 @@ func (o *CiliumAPIAPI) Validate() error {
 	if o.PolicyGetFqdnNamesHandler == nil {
 		unregistered = append(unregistered, "policy.GetFqdnNamesHandler")
 	}
-	if o.DaemonGetHealthHandler == nil {
-		unregistered = append(unregistered, "daemon.GetHealthHandler")
-	}
 	if o.DaemonGetHealthzHandler == nil {
 		unregistered = append(unregistered, "daemon.GetHealthzHandler")
 	}
@@ -563,9 +518,6 @@ func (o *CiliumAPIAPI) Validate() error {
 	if o.DaemonGetMapNameEventsHandler == nil {
 		unregistered = append(unregistered, "daemon.GetMapNameEventsHandler")
 	}
-	if o.MetricsGetMetricsHandler == nil {
-		unregistered = append(unregistered, "metrics.GetMetricsHandler")
-	}
 	if o.DaemonGetNodeIdsHandler == nil {
 		unregistered = append(unregistered, "daemon.GetNodeIdsHandler")
 	}
@@ -592,12 +544,6 @@ func (o *CiliumAPIAPI) Validate() error {
 	}
 	if o.ServiceGetServiceIDHandler == nil {
 		unregistered = append(unregistered, "service.GetServiceIDHandler")
-	}
-	if o.StatedbGetStatedbDumpHandler == nil {
-		unregistered = append(unregistered, "statedb.GetStatedbDumpHandler")
-	}
-	if o.StatedbGetStatedbQueryTableHandler == nil {
-		unregistered = append(unregistered, "statedb.GetStatedbQueryTableHandler")
 	}
 	if o.DaemonPatchConfigHandler == nil {
 		unregistered = append(unregistered, "daemon.PatchConfigHandler")
@@ -628,9 +574,6 @@ func (o *CiliumAPIAPI) Validate() error {
 	}
 	if o.RecorderPutRecorderIDHandler == nil {
 		unregistered = append(unregistered, "recorder.PutRecorderIDHandler")
-	}
-	if o.ServicePutServiceIDHandler == nil {
-		unregistered = append(unregistered, "service.PutServiceIDHandler")
 	}
 
 	if len(unregistered) > 0 {
@@ -678,8 +621,6 @@ func (o *CiliumAPIAPI) ProducersFor(mediaTypes []string) map[string]runtime.Prod
 	result := make(map[string]runtime.Producer, len(mediaTypes))
 	for _, mt := range mediaTypes {
 		switch mt {
-		case "application/octet-stream":
-			result["application/octet-stream"] = o.BinProducer
 		case "application/json":
 			result["application/json"] = o.JSONProducer
 		}
@@ -750,10 +691,6 @@ func (o *CiliumAPIAPI) initHandlerCache() {
 		o.handlers["DELETE"] = make(map[string]http.Handler)
 	}
 	o.handlers["DELETE"]["/recorder/{id}"] = recorder.NewDeleteRecorderID(o.context, o.RecorderDeleteRecorderIDHandler)
-	if o.handlers["DELETE"] == nil {
-		o.handlers["DELETE"] = make(map[string]http.Handler)
-	}
-	o.handlers["DELETE"]["/service/{id}"] = service.NewDeleteServiceID(o.context, o.ServiceDeleteServiceIDHandler)
 	if o.handlers["GET"] == nil {
 		o.handlers["GET"] = make(map[string]http.Handler)
 	}
@@ -821,10 +758,6 @@ func (o *CiliumAPIAPI) initHandlerCache() {
 	if o.handlers["GET"] == nil {
 		o.handlers["GET"] = make(map[string]http.Handler)
 	}
-	o.handlers["GET"]["/health"] = daemon.NewGetHealth(o.context, o.DaemonGetHealthHandler)
-	if o.handlers["GET"] == nil {
-		o.handlers["GET"] = make(map[string]http.Handler)
-	}
 	o.handlers["GET"]["/healthz"] = daemon.NewGetHealthz(o.context, o.DaemonGetHealthzHandler)
 	if o.handlers["GET"] == nil {
 		o.handlers["GET"] = make(map[string]http.Handler)
@@ -861,10 +794,6 @@ func (o *CiliumAPIAPI) initHandlerCache() {
 	if o.handlers["GET"] == nil {
 		o.handlers["GET"] = make(map[string]http.Handler)
 	}
-	o.handlers["GET"]["/metrics"] = metrics.NewGetMetrics(o.context, o.MetricsGetMetricsHandler)
-	if o.handlers["GET"] == nil {
-		o.handlers["GET"] = make(map[string]http.Handler)
-	}
 	o.handlers["GET"]["/node/ids"] = daemon.NewGetNodeIds(o.context, o.DaemonGetNodeIdsHandler)
 	if o.handlers["GET"] == nil {
 		o.handlers["GET"] = make(map[string]http.Handler)
@@ -898,14 +827,6 @@ func (o *CiliumAPIAPI) initHandlerCache() {
 		o.handlers["GET"] = make(map[string]http.Handler)
 	}
 	o.handlers["GET"]["/service/{id}"] = service.NewGetServiceID(o.context, o.ServiceGetServiceIDHandler)
-	if o.handlers["GET"] == nil {
-		o.handlers["GET"] = make(map[string]http.Handler)
-	}
-	o.handlers["GET"]["/statedb/dump"] = statedb.NewGetStatedbDump(o.context, o.StatedbGetStatedbDumpHandler)
-	if o.handlers["GET"] == nil {
-		o.handlers["GET"] = make(map[string]http.Handler)
-	}
-	o.handlers["GET"]["/statedb/query/{table}"] = statedb.NewGetStatedbQueryTable(o.context, o.StatedbGetStatedbQueryTableHandler)
 	if o.handlers["PATCH"] == nil {
 		o.handlers["PATCH"] = make(map[string]http.Handler)
 	}
@@ -946,10 +867,6 @@ func (o *CiliumAPIAPI) initHandlerCache() {
 		o.handlers["PUT"] = make(map[string]http.Handler)
 	}
 	o.handlers["PUT"]["/recorder/{id}"] = recorder.NewPutRecorderID(o.context, o.RecorderPutRecorderIDHandler)
-	if o.handlers["PUT"] == nil {
-		o.handlers["PUT"] = make(map[string]http.Handler)
-	}
-	o.handlers["PUT"]["/service/{id}"] = service.NewPutServiceID(o.context, o.ServicePutServiceIDHandler)
 }
 
 // Serve creates a http handler to serve the API over HTTP
@@ -991,6 +908,6 @@ func (o *CiliumAPIAPI) AddMiddlewareFor(method, path string, builder middleware.
 	}
 	o.Init()
 	if h, ok := o.handlers[um][path]; ok {
-		o.handlers[method][path] = builder(h)
+		o.handlers[um][path] = builder(h)
 	}
 }

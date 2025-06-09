@@ -7,10 +7,10 @@ import (
 	"context"
 	"encoding/pem"
 	"fmt"
+	"net"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,14 +20,18 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+	mcsapiv1alpha1 "sigs.k8s.io/mcs-api/pkg/apis/v1alpha1"
 
 	controllerruntime "github.com/cilium/cilium/operator/pkg/controller-runtime"
 	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
+	"github.com/cilium/cilium/operator/pkg/gateway-api/routechecks"
 	"github.com/cilium/cilium/operator/pkg/model"
 	"github.com/cilium/cilium/operator/pkg/model/ingestion"
-	translation "github.com/cilium/cilium/operator/pkg/model/translation/gateway-api"
+	"github.com/cilium/cilium/pkg/annotation"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/shortener"
 )
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -36,10 +40,10 @@ import (
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.12.2/pkg/reconcile
 func (r *gatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	scopedLog := log.WithContext(ctx).WithFields(logrus.Fields{
-		logfields.Controller: gateway,
-		logfields.Resource:   req.NamespacedName,
-	})
+	scopedLog := r.logger.With(
+		logfields.Controller, gateway,
+		logfields.Resource, req.NamespacedName,
+	)
 	scopedLog.Info("Reconciling Gateway")
 
 	// Step 1: Retrieve the Gateway
@@ -48,7 +52,7 @@ func (r *gatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if k8serrors.IsNotFound(err) {
 			return controllerruntime.Success()
 		}
-		scopedLog.WithError(err).Error("Unable to get Gateway")
+		scopedLog.ErrorContext(ctx, "Unable to get Gateway", logfields.Error, err)
 		return controllerruntime.Fail(err)
 	}
 
@@ -60,108 +64,141 @@ func (r *gatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	gw := original.DeepCopy()
-	defer func() {
-		if err := r.updateStatus(ctx, original, gw); err != nil {
-			scopedLog.WithError(err).Error("Unable to update Gateway status")
-		}
-	}()
 
 	// Step 2: Gather all required information for the ingestion model
 	gwc := &gatewayv1.GatewayClass{}
 	if err := r.Client.Get(ctx, client.ObjectKey{Name: string(gw.Spec.GatewayClassName)}, gwc); err != nil {
-		scopedLog.WithField(gatewayClass, gw.Spec.GatewayClassName).
-			WithError(err).
-			Error("Unable to get GatewayClass")
-		if k8serrors.IsNotFound(err) {
-			setGatewayAccepted(gw, false, "GatewayClass does not exist")
-			return controllerruntime.Fail(err)
-		}
-		setGatewayAccepted(gw, false, "Unable to get GatewayClass")
-		return controllerruntime.Fail(err)
+		scopedLog.ErrorContext(ctx, "Unable to get GatewayClass",
+			gatewayClass, gw.Spec.GatewayClassName,
+			logfields.Error, err)
+		// Doing nothing till the GatewayClass is available and matching controller name
+		return controllerruntime.Success()
+	}
+
+	if string(gwc.Spec.ControllerName) != controllerName {
+		scopedLog.Debug("GatewayClass does not have matching controller name, doing nothing")
+		return controllerruntime.Success()
 	}
 
 	httpRouteList := &gatewayv1.HTTPRouteList{}
 	if err := r.Client.List(ctx, httpRouteList); err != nil {
-		scopedLog.WithError(err).Error("Unable to list HTTPRoutes")
-		return controllerruntime.Fail(err)
+		scopedLog.ErrorContext(ctx, "Unable to list HTTPRoutes", logfields.Error, err)
+		return r.handleReconcileErrorWithStatus(ctx, err, original, gw)
 	}
 
-	grpcRouteList := &gatewayv1alpha2.GRPCRouteList{}
+	grpcRouteList := &gatewayv1.GRPCRouteList{}
 	if err := r.Client.List(ctx, grpcRouteList); err != nil {
-		scopedLog.WithError(err).Error("Unable to list GRPCRoutes")
-		return controllerruntime.Fail(err)
+		scopedLog.ErrorContext(ctx, "Unable to list GRPCRoutes", logfields.Error, err)
+		return r.handleReconcileErrorWithStatus(ctx, err, original, gw)
 	}
 
 	tlsRouteList := &gatewayv1alpha2.TLSRouteList{}
-	if err := r.Client.List(ctx, tlsRouteList); err != nil {
-		scopedLog.WithError(err).Error("Unable to list TLSRoutes")
-		return controllerruntime.Fail(err)
+	if helpers.HasTLSRouteSupport(r.Client.Scheme()) {
+		if err := r.Client.List(ctx, tlsRouteList); err != nil {
+			scopedLog.ErrorContext(ctx, "Unable to list TLSRoutes", logfields.Error, err)
+			return r.handleReconcileErrorWithStatus(ctx, err, original, gw)
+		}
 	}
 
-	// TODO(tam): Only list the services used by accepted Routes
+	// TODO(tam): Only list the services / ServiceImports used by accepted Routes
 	servicesList := &corev1.ServiceList{}
 	if err := r.Client.List(ctx, servicesList); err != nil {
-		scopedLog.WithError(err).Error("Unable to list Services")
-		return controllerruntime.Fail(err)
+		scopedLog.ErrorContext(ctx, "Unable to list Services", logfields.Error, err)
+		return r.handleReconcileErrorWithStatus(ctx, err, original, gw)
+	}
+
+	serviceImportsList := &mcsapiv1alpha1.ServiceImportList{}
+	if helpers.HasServiceImportSupport(r.Client.Scheme()) {
+		if err := r.Client.List(ctx, serviceImportsList); err != nil {
+			scopedLog.ErrorContext(ctx, "Unable to list ServiceImports", logfields.Error, err)
+			return controllerruntime.Fail(err)
+		}
 	}
 
 	grants := &gatewayv1beta1.ReferenceGrantList{}
 	if err := r.Client.List(ctx, grants); err != nil {
-		scopedLog.WithError(err).Error("Unable to list ReferenceGrants")
-		return controllerruntime.Fail(err)
+		scopedLog.ErrorContext(ctx, "Unable to list ReferenceGrants", logfields.Error, err)
+		return r.handleReconcileErrorWithStatus(ctx, err, original, gw)
+	}
+	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.Annotations[annotation.LBIPAMIPKeyAlias] != "" {
+		scopedLog.WarnContext(ctx, fmt.Sprintf("DEPRECATED: The Gateway <%s/%s> is setting an IP address using the infrastructure annotations <%s>."+
+			" These should be set using the spec.addresses field in Gateway objects instead."+
+			" At a future date this annotation will be removed if no spec.addresses are set.", gw.GetNamespace(), gw.GetName(), annotation.LBIPAMIPKeyAlias))
 	}
 
-	httpListeners, tlsListeners := ingestion.GatewayAPI(ingestion.Input{
-		GatewayClass:    *gwc,
-		Gateway:         *gw,
-		HTTPRoutes:      r.filterHTTPRoutesByGateway(ctx, gw, httpRouteList.Items),
-		TLSRoutes:       r.filterTLSRoutesByGateway(ctx, gw, tlsRouteList.Items),
-		GRPCRoutes:      r.filterGRPCRoutesByGateway(ctx, gw, grpcRouteList.Items),
-		Services:        servicesList.Items,
-		ReferenceGrants: grants.Items,
+	httpRoutes := r.filterHTTPRoutesByGateway(ctx, gw, httpRouteList.Items)
+	tlsRoutes := r.filterTLSRoutesByGateway(ctx, gw, tlsRouteList.Items)
+	grpcRoutes := r.filterGRPCRoutesByGateway(ctx, gw, grpcRouteList.Items)
+
+	httpListeners, tlsPassthroughListeners := ingestion.GatewayAPI(ingestion.Input{
+		GatewayClass:       *gwc,
+		GatewayClassConfig: r.getGatewayClassConfig(ctx, gwc),
+		Gateway:            *gw,
+		HTTPRoutes:         httpRoutes,
+		TLSRoutes:          tlsRoutes,
+		GRPCRoutes:         grpcRoutes,
+		Services:           servicesList.Items,
+		ServiceImports:     serviceImportsList.Items,
+		ReferenceGrants:    grants.Items,
 	})
 
 	if err := r.setListenerStatus(ctx, gw, httpRouteList, tlsRouteList); err != nil {
-		scopedLog.WithError(err).Error("Unable to set listener status")
-		setGatewayAccepted(gw, false, "Unable to set listener status")
-		return controllerruntime.Fail(err)
+		scopedLog.ErrorContext(ctx, "Unable to set listener status", logfields.Error, err)
+		setGatewayAccepted(gw, false, "Unable to set listener status", gatewayv1.GatewayReasonNoResources)
+		return r.handleReconcileErrorWithStatus(ctx, err, original, gw)
 	}
-	setGatewayAccepted(gw, true, "Gateway successfully scheduled")
+	setGatewayAccepted(gw, true, "Gateway successfully scheduled", gatewayv1.GatewayReasonAccepted)
 
 	// Step 3: Translate the listeners into Cilium model
-	cec, svc, ep, err := translation.NewTranslator(r.SecretsNamespace, r.IdleTimeoutSeconds).Translate(&model.Model{HTTP: httpListeners, TLS: tlsListeners})
+	cec, svc, ep, err := r.translator.Translate(&model.Model{HTTP: httpListeners, TLSPassthrough: tlsPassthroughListeners})
 	if err != nil {
-		scopedLog.WithError(err).Error("Unable to translate resources")
-		setGatewayAccepted(gw, false, "Unable to translate resources")
-		return controllerruntime.Fail(err)
-	}
+		scopedLog.ErrorContext(ctx, "Unable to translate resources", logfields.Error, err)
+		setGatewayAccepted(gw, false, "Unable to translate resources", gatewayv1.GatewayReasonNoResources)
 
+		return r.handleReconcileErrorWithStatus(ctx, err, original, gw)
+	}
+	if err = r.verifyGatewayStaticAddresses(gw); err != nil {
+		scopedLog.ErrorContext(ctx, "The gateway static address is not yet supported", logfields.Error, err)
+		setGatewayAccepted(gw, false, "The gateway static address is not yet supported", gatewayv1.GatewayReasonUnsupportedAddress)
+		setGatewayProgrammed(gw, false, "Address is not ready", gatewayv1.GatewayReasonListenersNotReady)
+		return r.handleReconcileErrorWithStatus(ctx, err, original, gw)
+	}
 	if err = r.ensureService(ctx, svc); err != nil {
-		scopedLog.WithError(err).Error("Unable to create Service")
-		setGatewayAccepted(gw, false, "Unable to create Service resource")
-		return controllerruntime.Fail(err)
+		scopedLog.ErrorContext(ctx, "Unable to create Service", logfields.Error, err)
+		setGatewayAccepted(gw, false, "Unable to create Service resource", gatewayv1.GatewayReasonNoResources)
+		return r.handleReconcileErrorWithStatus(ctx, err, original, gw)
 	}
 
 	if err = r.ensureEndpoints(ctx, ep); err != nil {
-		scopedLog.WithError(err).Error("Unable to ensure Endpoints")
-		setGatewayAccepted(gw, false, "Unable to ensure Endpoints resource")
-		return controllerruntime.Fail(err)
+		scopedLog.ErrorContext(ctx, "Unable to ensure Endpoints", logfields.Error, err)
+		setGatewayAccepted(gw, false, "Unable to ensure Endpoints resource", gatewayv1.GatewayReasonNoResources)
+		return r.handleReconcileErrorWithStatus(ctx, err, original, gw)
 	}
 
 	if err = r.ensureEnvoyConfig(ctx, cec); err != nil {
-		scopedLog.WithError(err).Error("Unable to ensure CiliumEnvoyConfig")
-		setGatewayAccepted(gw, false, "Unable to ensure CEC resource")
-		return controllerruntime.Fail(err)
+		scopedLog.ErrorContext(ctx, "Unable to ensure CiliumEnvoyConfig", logfields.Error, err)
+		setGatewayAccepted(gw, false, "Unable to ensure CEC resource", gatewayv1.GatewayReasonNoResources)
+		return r.handleReconcileErrorWithStatus(ctx, err, original, gw)
 	}
 
 	// Step 4: Update the status of the Gateway
 	if err = r.setAddressStatus(ctx, gw); err != nil {
-		scopedLog.WithError(err).Error("Address is not ready")
-		setGatewayProgrammed(gw, false, "Address is not ready")
-		return controllerruntime.Fail(err)
+		scopedLog.ErrorContext(ctx, "Address is not ready", logfields.Error, err)
+		setGatewayProgrammed(gw, false, "Address is not ready", gatewayv1.GatewayReasonListenersNotReady)
+		return r.handleReconcileErrorWithStatus(ctx, err, original, gw)
 	}
 
-	setGatewayProgrammed(gw, true, "Gateway successfully reconciled")
+	if err = r.setStaticAddressStatus(ctx, gw); err != nil {
+		scopedLog.ErrorContext(ctx, "StaticAddress can't be used", logfields.Error, err)
+		setGatewayProgrammed(gw, false, "StaticAddress can't be used", gatewayv1.GatewayReasonAddressNotUsable)
+		return r.handleReconcileErrorWithStatus(ctx, err, original, gw)
+	}
+
+	setGatewayProgrammed(gw, true, "Gateway successfully reconciled", gatewayv1.GatewayReasonProgrammed)
+	if err := r.updateStatus(ctx, original, gw); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to update Gateway status: %w", err)
+	}
+
 	scopedLog.Info("Successfully reconciled Gateway")
 	return controllerruntime.Success()
 }
@@ -172,7 +209,6 @@ func (r *gatewayReconciler) ensureService(ctx context.Context, desired *corev1.S
 		// Save and restore loadBalancerClass
 		// e.g. if a mutating webhook writes this field
 		lbClass := svc.Spec.LoadBalancerClass
-
 		svc.Spec = desired.Spec
 		svc.OwnerReferences = desired.OwnerReferences
 		setMergedLabelsAndAnnotations(svc, desired)
@@ -217,18 +253,21 @@ func (r *gatewayReconciler) updateStatus(ctx context.Context, original *gatewayv
 
 func (r *gatewayReconciler) filterHTTPRoutesByGateway(ctx context.Context, gw *gatewayv1.Gateway, routes []gatewayv1.HTTPRoute) []gatewayv1.HTTPRoute {
 	var filtered []gatewayv1.HTTPRoute
+	allListenerHostNames := routechecks.GetAllListenerHostNames(gw.Spec.Listeners)
 	for _, route := range routes {
-		if isAttachable(ctx, gw, &route, route.Status.Parents) && isAllowed(ctx, r.Client, gw, &route) && len(computeHosts(gw, route.Spec.Hostnames)) > 0 {
+		if isAttachable(ctx, gw, &route, route.Status.Parents) && isAllowed(ctx, r.Client, gw, &route, r.logger) && len(computeHosts(gw, route.Spec.Hostnames, allListenerHostNames)) > 0 {
 			filtered = append(filtered, route)
 		}
 	}
 	return filtered
 }
 
-func (r *gatewayReconciler) filterGRPCRoutesByGateway(ctx context.Context, gw *gatewayv1.Gateway, routes []gatewayv1alpha2.GRPCRoute) []gatewayv1alpha2.GRPCRoute {
-	var filtered []gatewayv1alpha2.GRPCRoute
+func (r *gatewayReconciler) filterGRPCRoutesByGateway(ctx context.Context, gw *gatewayv1.Gateway, routes []gatewayv1.GRPCRoute) []gatewayv1.GRPCRoute {
+	var filtered []gatewayv1.GRPCRoute
+	allListenerHostNames := routechecks.GetAllListenerHostNames(gw.Spec.Listeners)
+
 	for _, route := range routes {
-		if isAttachable(ctx, gw, &route, route.Status.Parents) && isAllowed(ctx, r.Client, gw, &route) && len(computeHosts(gw, route.Spec.Hostnames)) > 0 {
+		if isAttachable(ctx, gw, &route, route.Status.Parents) && isAllowed(ctx, r.Client, gw, &route, r.logger) && len(computeHosts(gw, route.Spec.Hostnames, allListenerHostNames)) > 0 {
 			filtered = append(filtered, route)
 		}
 	}
@@ -239,8 +278,8 @@ func (r *gatewayReconciler) filterHTTPRoutesByListener(ctx context.Context, gw *
 	var filtered []gatewayv1.HTTPRoute
 	for _, route := range routes {
 		if isAttachable(ctx, gw, &route, route.Status.Parents) &&
-			isAllowed(ctx, r.Client, gw, &route) &&
-			len(computeHostsForListener(listener, route.Spec.Hostnames)) > 0 &&
+			isAllowed(ctx, r.Client, gw, &route, r.logger) &&
+			len(computeHostsForListener(listener, route.Spec.Hostnames, nil)) > 0 &&
 			parentRefMatched(gw, listener, route.GetNamespace(), route.Spec.ParentRefs) {
 			filtered = append(filtered, route)
 		}
@@ -248,8 +287,32 @@ func (r *gatewayReconciler) filterHTTPRoutesByListener(ctx context.Context, gw *
 	return filtered
 }
 
+// getGatewayClassConfig returns the CiliumGatewayClassConfig referenced by the GatewayClass.
+// If the GatewayClass does not reference a CiliumGatewayClassConfig, it returns nil.
+func (r *gatewayReconciler) getGatewayClassConfig(ctx context.Context, gwc *gatewayv1.GatewayClass) *v2alpha1.CiliumGatewayClassConfig {
+	if gwc.Spec.ParametersRef == nil ||
+		gwc.Spec.ParametersRef.Group != v2alpha1.CustomResourceDefinitionGroup ||
+		gwc.Spec.ParametersRef.Kind != v2alpha1.CGCCKindDefinition {
+		return nil
+	}
+
+	res := &v2alpha1.CiliumGatewayClassConfig{}
+	if err := r.Client.Get(ctx, client.ObjectKey{
+		Namespace: string(*gwc.Spec.ParametersRef.Namespace),
+		Name:      gwc.Spec.ParametersRef.Name,
+	}, res); err != nil {
+		return nil
+	}
+	return res
+}
+
 func parentRefMatched(gw *gatewayv1.Gateway, listener *gatewayv1.Listener, routeNamespace string, refs []gatewayv1.ParentReference) bool {
 	for _, ref := range refs {
+		// Check if the parentRef is a Gateway before checking name and namespace
+		if !helpers.IsGateway(ref) {
+			continue
+		}
+
 		if string(ref.Name) == gw.GetName() && gw.GetNamespace() == helpers.NamespaceDerefOr(ref.Namespace, routeNamespace) {
 			if ref.SectionName == nil && ref.Port == nil {
 				return true
@@ -267,7 +330,8 @@ func parentRefMatched(gw *gatewayv1.Gateway, listener *gatewayv1.Listener, route
 func (r *gatewayReconciler) filterTLSRoutesByGateway(ctx context.Context, gw *gatewayv1.Gateway, routes []gatewayv1alpha2.TLSRoute) []gatewayv1alpha2.TLSRoute {
 	var filtered []gatewayv1alpha2.TLSRoute
 	for _, route := range routes {
-		if isAttachable(ctx, gw, &route, route.Status.Parents) && isAllowed(ctx, r.Client, gw, &route) && len(computeHosts(gw, route.Spec.Hostnames)) > 0 {
+		if isAttachable(ctx, gw, &route, route.Status.Parents) && isAllowed(ctx, r.Client, gw, &route, r.logger) &&
+			len(computeHosts(gw, route.Spec.Hostnames, nil)) > 0 {
 			filtered = append(filtered, route)
 		}
 	}
@@ -278,8 +342,8 @@ func (r *gatewayReconciler) filterTLSRoutesByListener(ctx context.Context, gw *g
 	var filtered []gatewayv1alpha2.TLSRoute
 	for _, route := range routes {
 		if isAttachable(ctx, gw, &route, route.Status.Parents) &&
-			isAllowed(ctx, r.Client, gw, &route) &&
-			len(computeHostsForListener(listener, route.Spec.Hostnames)) > 0 &&
+			isAllowed(ctx, r.Client, gw, &route, r.logger) &&
+			len(computeHostsForListener(listener, route.Spec.Hostnames, nil)) > 0 &&
 			parentRefMatched(gw, listener, route.GetNamespace(), route.Spec.ParentRefs) {
 			filtered = append(filtered, route)
 		}
@@ -310,8 +374,8 @@ func isAttachable(_ context.Context, gw *gatewayv1.Gateway, route metav1.Object,
 func (r *gatewayReconciler) setAddressStatus(ctx context.Context, gw *gatewayv1.Gateway) error {
 	svcList := &corev1.ServiceList{}
 	if err := r.Client.List(ctx, svcList, client.MatchingLabels{
-		owningGatewayLabel: gw.GetName(),
-	}); err != nil {
+		owningGatewayLabel: shortener.ShortenK8sResourceName(gw.GetName()),
+	}, client.InNamespace(gw.GetNamespace())); err != nil {
 		return err
 	}
 
@@ -321,7 +385,9 @@ func (r *gatewayReconciler) setAddressStatus(ctx context.Context, gw *gatewayv1.
 
 	svc := svcList.Items[0]
 	if len(svc.Status.LoadBalancer.Ingress) == 0 {
-		return fmt.Errorf("load balancer status is not ready")
+		// Potential loadbalancer service isn't ready yet. No need to report as an error, because
+		// reconciliation should be triggered when the loadbalancer services gets updated.
+		return nil
 	}
 
 	var addresses []gatewayv1.GatewayStatusAddress
@@ -341,6 +407,41 @@ func (r *gatewayReconciler) setAddressStatus(ctx context.Context, gw *gatewayv1.
 	}
 
 	gw.Status.Addresses = addresses
+	return nil
+}
+
+func (r *gatewayReconciler) setStaticAddressStatus(ctx context.Context, gw *gatewayv1.Gateway) error {
+	if len(gw.Spec.Addresses) == 0 {
+		return nil
+	}
+	svcList := &corev1.ServiceList{}
+	if err := r.Client.List(ctx, svcList, client.MatchingLabels{
+		owningGatewayLabel: shortener.ShortenK8sResourceName(gw.GetName()),
+	}, client.InNamespace(gw.GetNamespace())); err != nil {
+		return err
+	}
+
+	if len(svcList.Items) == 0 {
+		return fmt.Errorf("no service found")
+	}
+
+	svc := svcList.Items[0]
+	if len(svc.Status.LoadBalancer.Ingress) == 0 {
+		// Potential loadbalancer service isn't ready yet. No need to report as an error, because
+		// reconciliation should be triggered when the loadbalancer services gets updated.
+		return nil
+	}
+	addresses := make(map[string]struct{})
+	for _, addr := range svc.Status.LoadBalancer.Ingress {
+		addresses[addr.IP] = struct{}{}
+	}
+
+	for _, addr := range gw.Spec.Addresses {
+		if _, ok := addresses[addr.Value]; !ok {
+			return fmt.Errorf("static address %q can't be used", addr.Value)
+		}
+	}
+
 	return nil
 }
 
@@ -515,4 +616,31 @@ func isValidPemFormat(b []byte) bool {
 		return true
 	}
 	return isValidPemFormat(rest)
+}
+
+func (r *gatewayReconciler) handleReconcileErrorWithStatus(ctx context.Context, reconcileErr error, original *gatewayv1.Gateway, modified *gatewayv1.Gateway) (ctrl.Result, error) {
+	if err := r.updateStatus(ctx, original, modified); err != nil {
+		return controllerruntime.Fail(fmt.Errorf("failed to update Gateway status while handling the reconcile error: %w: %w", reconcileErr, err))
+	}
+
+	return controllerruntime.Fail(reconcileErr)
+}
+
+func (r *gatewayReconciler) verifyGatewayStaticAddresses(gw *gatewayv1.Gateway) error {
+	if len(gw.Spec.Addresses) == 0 {
+		return nil
+	}
+	for _, address := range gw.Spec.Addresses {
+		if address.Type != nil && *address.Type != gatewayv1.IPAddressType {
+			return fmt.Errorf("address type is not supported")
+		}
+		if address.Value == "" {
+			return fmt.Errorf("address value is not set")
+		}
+		ip := net.ParseIP(address.Value)
+		if ip == nil {
+			return fmt.Errorf("invalid ip address")
+		}
+	}
+	return nil
 }

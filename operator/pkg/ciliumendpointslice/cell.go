@@ -4,9 +4,10 @@
 package ciliumendpointslice
 
 import (
+	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
 
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/metrics"
 )
 
 const (
@@ -17,15 +18,8 @@ const (
 	// CESSlicingMode instructs how CEPs are grouped in a CES.
 	CESSlicingMode = "ces-slice-mode"
 
-	// CESWriteQPSLimit is the rate limit per second for the CES work queue to
-	// process  CES events that result in CES write (Create, Update, Delete)
-	// requests to the kube-apiserver.
-	CESWriteQPSLimit = "ces-write-qps-limit"
-
-	// CESWriteQPSBurst is the burst rate per second used with CESWriteQPSLimit
-	// for the CES work queue to process CES events that result in CES write
-	// (Create, Update, Delete) requests to the kube-apiserver.
-	CESWriteQPSBurst = "ces-write-qps-burst"
+	// CESRateLimits can be used to configure a custom, stepped dynamic rate limit based on cluster size.
+	CESRateLimits = "ces-rate-limits"
 )
 
 // Cell is a cell that implements a Cilium Endpoint Slice Controller.
@@ -36,28 +30,27 @@ var Cell = cell.Module(
 	"Cilium Endpoint Slice Controller",
 	cell.Config(defaultConfig),
 	cell.Invoke(registerController),
-	cell.Metric(NewMetrics),
+	metrics.Metric(NewMetrics),
 )
 
 type Config struct {
-	CESMaxCEPsInCES  int     `mapstructure:"ces-max-ciliumendpoints-per-ces"`
-	CESSlicingMode   string  `mapstructure:"ces-slice-mode"`
-	CESWriteQPSLimit float64 `mapstructure:"ces-write-qps-limit"`
-	CESWriteQPSBurst int     `mapstructure:"ces-write-qps-burst"`
+	CESMaxCEPsInCES           int    `mapstructure:"ces-max-ciliumendpoints-per-ces"`
+	CESSlicingMode            string `mapstructure:"ces-slice-mode"`
+	CESDynamicRateLimitConfig string `mapstructure:"ces-rate-limits"`
 }
 
 var defaultConfig = Config{
-	CESMaxCEPsInCES:  100,
-	CESSlicingMode:   "cesSliceModeIdentity",
-	CESWriteQPSLimit: 10,
-	CESWriteQPSBurst: 20,
+	CESMaxCEPsInCES:           100,
+	CESSlicingMode:            fcfsMode,
+	CESDynamicRateLimitConfig: "[{\"nodes\":0,\"limit\":10,\"burst\":20}]",
 }
 
 func (def Config) Flags(flags *pflag.FlagSet) {
 	flags.Int(CESMaxCEPsInCES, def.CESMaxCEPsInCES, "Maximum number of CiliumEndpoints allowed in a CES")
-	flags.String(CESSlicingMode, def.CESSlicingMode, "Slicing mode define how ceps are grouped into a CES")
-	flags.Float64(CESWriteQPSLimit, def.CESWriteQPSLimit, "CES work queue rate limit")
-	flags.Int(CESWriteQPSBurst, def.CESWriteQPSBurst, "CES work queue burst rate")
+	flags.String(CESSlicingMode, def.CESSlicingMode, "Slicing mode defines how CiliumEndpoints are grouped into CES: either batched by their Identity (\"identity\") or batched on a \"First Come, First Served\" basis (\"fcfs\")")
+	flags.MarkDeprecated(CESSlicingMode, "Slicing mode defaults to the FCFS mode and is now deprecated option. It does not have a functional effect")
+
+	flags.String(CESRateLimits, def.CESDynamicRateLimitConfig, "Configure rate limits for the CES controller. Accepts a list of rate limit configurations, must be a JSON formatted string.")
 }
 
 // SharedConfig contains the configuration that is shared between

@@ -5,17 +5,18 @@ package metrics
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"regexp"
 
+	"github.com/cilium/hive/cell"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/logging"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/metrics/metric"
 	"github.com/cilium/cilium/pkg/option"
@@ -39,7 +40,7 @@ func (def MetricsConfig) Flags(flags *pflag.FlagSet) {
 }
 
 type metricsManager struct {
-	logger   logrus.FieldLogger
+	logger   *slog.Logger
 	registry *prometheus.Registry
 	server   http.Server
 
@@ -48,13 +49,13 @@ type metricsManager struct {
 
 type params struct {
 	cell.In
-	Logger logrus.FieldLogger
+	Logger *slog.Logger
 
 	MetricsConfig
 	Metrics []metric.WithMetadata `group:"hive-metrics"`
 }
 
-func registerMetricsManager(lc hive.Lifecycle, params params) error {
+func registerMetricsManager(lc cell.Lifecycle, params params) error {
 	manager := metricsManager{
 		logger:   params.Logger,
 		registry: prometheus.NewPedanticRegistry(),
@@ -71,7 +72,7 @@ func registerMetricsManager(lc hive.Lifecycle, params params) error {
 	return nil
 }
 
-func (mm *metricsManager) Start(hive.HookContext) error {
+func (mm *metricsManager) Start(cell.HookContext) error {
 	mm.logger.Info("Registering metrics")
 
 	mm.registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
@@ -104,20 +105,23 @@ func (mm *metricsManager) Start(hive.HookContext) error {
 	mm.server.Handler = mux
 
 	go func() {
-		mm.logger.WithField("address", mm.server.Addr).Info("Starting metrics server")
+		mm.logger.Info(
+			"Starting metrics server",
+			logfields.Address, mm.server.Addr,
+		)
 		if err := mm.server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-			mm.logger.WithError(err).Fatal("Unable to start metrics server")
+			logging.Fatal(mm.logger, "Unable to start metrics server", logfields.Error, err)
 		}
 	}()
 
 	return nil
 }
 
-func (mm *metricsManager) Stop(ctx hive.HookContext) error {
+func (mm *metricsManager) Stop(ctx cell.HookContext) error {
 	mm.logger.Info("Stopping metrics server")
 
 	if err := mm.server.Shutdown(ctx); err != nil {
-		mm.logger.WithError(err).Error("Shutdown metrics server failed")
+		mm.logger.Error("Shutdown metrics server failed", logfields.Error, err)
 		return err
 	}
 

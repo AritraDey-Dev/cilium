@@ -11,21 +11,20 @@ import (
 	"strings"
 	"time"
 
-	envoy_config_core_v3 "github.com/cilium/proxy/go/envoy/config/core/v3"
-	envoy_config_route_v3 "github.com/cilium/proxy/go/envoy/config/route/v3"
-	envoy_type_matcher_v3 "github.com/cilium/proxy/go/envoy/type/matcher/v3"
-	envoy_type_v3 "github.com/cilium/proxy/go/envoy/type/v3"
+	envoy_config_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	envoy_config_route_v3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	envoy_type_matcher_v3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	envoy_type_v3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+	"k8s.io/utils/ptr"
 
 	"github.com/cilium/cilium/operator/pkg/model"
-	"github.com/cilium/cilium/pkg/math"
 )
 
 const (
 	wildCard       = "*"
 	envoyAuthority = ":authority"
-	slash          = "/"
 	dot            = "."
 	starDot        = "*."
 	dotRegex       = "[.]"
@@ -42,6 +41,7 @@ type VirtualHostMutator func(*envoy_config_route_v3.VirtualHost) *envoy_config_r
 //   - Exact Match length
 //   - Regex Match length
 //   - Prefix match length
+//   - Method match
 //   - Number of header matches
 //   - Number of query parameter matches
 //
@@ -69,8 +69,8 @@ func (s SortableRoute) Less(i, j int) bool {
 	}
 
 	// There are two types of prefix match, so get whichever one is bigger
-	prefixMatch1 := math.IntMax(len(s[i].Match.GetPathSeparatedPrefix()), len(s[i].Match.GetPrefix()))
-	prefixMatch2 := math.IntMax(len(s[j].Match.GetPathSeparatedPrefix()), len(s[j].Match.GetPrefix()))
+	prefixMatch1 := max(len(s[i].Match.GetPathSeparatedPrefix()), len(s[i].Match.GetPrefix()))
+	prefixMatch2 := max(len(s[j].Match.GetPathSeparatedPrefix()), len(s[j].Match.GetPrefix()))
 	headerMatch1 := len(s[i].Match.GetHeaders())
 	headerMatch2 := len(s[j].Match.GetHeaders())
 	queryMatch1 := len(s[i].Match.GetQueryParameters())
@@ -79,6 +79,20 @@ func (s SortableRoute) Less(i, j int) bool {
 	// Next up, sort by prefix match length
 	if prefixMatch1 != prefixMatch2 {
 		return prefixMatch1 > prefixMatch2
+	}
+
+	// Next up, sort by method based on :method header
+	// Give higher priority for the route having method specified
+	method1 := getMethod(s[i].Match.GetHeaders())
+	method2 := getMethod(s[j].Match.GetHeaders())
+	if method1 == nil && method2 != nil {
+		return false
+	}
+	if method1 != nil && method2 == nil {
+		return true
+	}
+	if method1 != nil && *method1 != *method2 {
+		return *method1 < *method2
 	}
 
 	// If that's the same, then sort by header length
@@ -90,33 +104,34 @@ func (s SortableRoute) Less(i, j int) bool {
 	return queryMatch1 > queryMatch2
 }
 
+func getMethod(headers []*envoy_config_route_v3.HeaderMatcher) *string {
+	for _, h := range headers {
+		if h.Name == ":method" {
+			return ptr.To(h.GetStringMatch().GetExact())
+		}
+	}
+	return nil
+}
+
 func (s SortableRoute) Swap(i, j int) {
 	s[i], s[j] = s[j], s[i]
 }
 
 // VirtualHostParameter is the parameter for NewVirtualHost
 type VirtualHostParameter struct {
-	HostNames           []string
-	HTTPSRedirect       bool
-	HostNameSuffixMatch bool
-	ListenerPort        uint32
+	HostNames     []string
+	HTTPSRedirect bool
+	ListenerPort  uint32
 }
 
-// NewVirtualHostWithDefaults is same as NewVirtualHost but with a few
-// default mutator function. If there are multiple http routes having
-// the same path matching (e.g. exact, prefix or regex), the incoming
-// request will be load-balanced to multiple backends equally.
-func NewVirtualHostWithDefaults(httpRoutes []model.HTTPRoute, param VirtualHostParameter, mutators ...VirtualHostMutator) (*envoy_config_route_v3.VirtualHost, error) {
-	return NewVirtualHost(httpRoutes, param, mutators...)
-}
-
-// NewVirtualHost creates a new VirtualHost with the given host and routes.
-func NewVirtualHost(httpRoutes []model.HTTPRoute, param VirtualHostParameter, mutators ...VirtualHostMutator) (*envoy_config_route_v3.VirtualHost, error) {
+// desiredVirtualHost creates a new VirtualHost with the given HTTP routes, set of pre-defined params as well mutator
+// based on global configuration.
+func (i *cecTranslator) desiredVirtualHost(httpRoutes []model.HTTPRoute, param VirtualHostParameter, mutators ...VirtualHostMutator) *envoy_config_route_v3.VirtualHost {
 	var routes SortableRoute
 	if param.HTTPSRedirect {
-		routes = envoyHTTPSRoutes(httpRoutes, param.HostNames, param.HostNameSuffixMatch)
+		routes = envoyHTTPSRoutes(httpRoutes, param.HostNames, i.Config.RouteConfig.HostNameSuffixMatch)
 	} else {
-		routes = envoyHTTPRoutes(httpRoutes, param.HostNames, param.HostNameSuffixMatch, param.ListenerPort)
+		routes = envoyHTTPRoutes(httpRoutes, param.HostNames, i.Config.RouteConfig.HostNameSuffixMatch, param.ListenerPort)
 	}
 
 	// This is to make sure that the Exact match is always having higher priority.
@@ -148,7 +163,7 @@ func NewVirtualHost(httpRoutes []model.HTTPRoute, param VirtualHostParameter, mu
 		res = fn(res)
 	}
 
-	return res, nil
+	return res
 }
 
 func envoyHTTPSRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameSuffixMatch bool) []*envoy_config_route_v3.Route {
@@ -224,7 +239,16 @@ func envoyHTTPRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameS
 		if hRoutes[0].RequestRedirect != nil {
 			route.Action = getRouteRedirect(hRoutes[0].RequestRedirect, listenerPort)
 		} else {
-			route.Action = getRouteAction(&r, backends, r.Rewrite, r.RequestMirrors)
+			route.Action = getRouteAction(&r, backends, r.BackendHTTPFilters, r.Rewrite, r.RequestMirrors)
+		}
+		// If there is only one backend, we can add the header filter to the route
+		if len(backends) == 1 {
+			for _, fn := range hRoutes[0].BackendHTTPFilters {
+				route.RequestHeadersToAdd = append(route.RequestHeadersToAdd, getHeadersToAdd(fn.RequestHeaderFilter)...)
+				route.RequestHeadersToRemove = append(route.RequestHeadersToRemove, getHeadersToRemove(fn.RequestHeaderFilter)...)
+				route.ResponseHeadersToAdd = append(route.ResponseHeadersToAdd, getHeadersToAdd(fn.ResponseHeaderModifier)...)
+				route.ResponseHeadersToRemove = append(route.ResponseHeadersToRemove, getHeadersToRemove(fn.ResponseHeaderModifier)...)
+			}
 		}
 		routes = append(routes, &route)
 		delete(matchBackendMap, r.GetMatchKey())
@@ -298,7 +322,9 @@ func requestMirrorMutation(mirrors []*model.HTTPRequestMirror) routeActionMutati
 				Cluster: fmt.Sprintf("%s:%s:%s", m.Backend.Namespace, m.Backend.Name, m.Backend.Port.GetPort()),
 				RuntimeFraction: &envoy_config_core_v3.RuntimeFractionalPercent{
 					DefaultValue: &envoy_type_v3.FractionalPercent{
-						Numerator: 100,
+						Numerator: uint32(m.Numerator * 100 / m.Denominator),
+						// Normalized to HUNDRED
+						Denominator: envoy_type_v3.FractionalPercent_HUNDRED,
 					},
 				},
 			})
@@ -308,9 +334,43 @@ func requestMirrorMutation(mirrors []*model.HTTPRequestMirror) routeActionMutati
 	}
 }
 
+func retryMutation(retry *model.HTTPRetry) routeActionMutation {
+	return func(route *envoy_config_route_v3.Route_Route) *envoy_config_route_v3.Route_Route {
+		if retry == nil {
+			return route
+		}
+
+		rp := &envoy_config_route_v3.RetryPolicy{
+			RetriableStatusCodes: retry.Codes,
+		}
+
+		if retry.Attempts != nil {
+			rp.NumRetries = wrapperspb.UInt32(uint32(*retry.Attempts))
+		}
+
+		if retry.Backoff != nil {
+			baseInterval := *retry.Backoff
+			rp.RetryBackOff = &envoy_config_route_v3.RetryPolicy_RetryBackOff{
+				BaseInterval: durationpb.New(baseInterval),
+				// By default, the maximum interval is 10 times the base interval, which is
+				// too high for most use cases. Reduce it to 2 times the base interval.
+				MaxInterval: durationpb.New(2 * baseInterval),
+			}
+		}
+
+		route.Route.RetryPolicy = rp
+		return route
+	}
+}
+
 func timeoutMutation(backend *time.Duration, request *time.Duration) routeActionMutation {
 	return func(route *envoy_config_route_v3.Route_Route) *envoy_config_route_v3.Route_Route {
 		if backend == nil && request == nil {
+			route.Route.MaxStreamDuration = &envoy_config_route_v3.RouteAction_MaxStreamDuration{
+				MaxStreamDuration: &durationpb.Duration{
+					Seconds: 0,
+				},
+			}
 			return route
 		}
 		minTimeout := backend
@@ -322,7 +382,7 @@ func timeoutMutation(backend *time.Duration, request *time.Duration) routeAction
 	}
 }
 
-func getRouteAction(route *model.HTTPRoute, backends []model.Backend, rewrite *model.HTTPURLRewriteFilter, mirrors []*model.HTTPRequestMirror) *envoy_config_route_v3.Route_Route {
+func getRouteAction(route *model.HTTPRoute, backends []model.Backend, backendHTTPFilter []*model.BackendHTTPFilter, rewrite *model.HTTPURLRewriteFilter, mirrors []*model.HTTPRequestMirror) *envoy_config_route_v3.Route_Route {
 	var routeAction *envoy_config_route_v3.Route_Route
 
 	mutators := []routeActionMutation{
@@ -331,6 +391,7 @@ func getRouteAction(route *model.HTTPRoute, backends []model.Backend, rewrite *m
 		pathFullReplaceMutation(rewrite),
 		requestMirrorMutation(mirrors),
 		timeoutMutation(route.Timeout.Backend, route.Timeout.Request),
+		retryMutation(route.Retry),
 	}
 
 	if len(backends) == 1 {
@@ -347,17 +408,28 @@ func getRouteAction(route *model.HTTPRoute, backends []model.Backend, rewrite *m
 		}
 		return r
 	}
-
+	backendFilter := make(map[string]*model.BackendHTTPFilter)
+	for _, f := range backendHTTPFilter {
+		backendFilter[f.Name] = f
+	}
 	weightedClusters := make([]*envoy_config_route_v3.WeightedCluster_ClusterWeight, 0, len(backends))
 	for _, be := range backends {
 		var weight int32 = 1
 		if be.Weight != nil {
 			weight = *be.Weight
 		}
-		weightedClusters = append(weightedClusters, &envoy_config_route_v3.WeightedCluster_ClusterWeight{
+		clusterWeight := &envoy_config_route_v3.WeightedCluster_ClusterWeight{
 			Name:   getClusterName(be.Namespace, be.Name, be.Port.GetPort()),
 			Weight: wrapperspb.UInt32(uint32(weight)),
-		})
+		}
+		// If their two or more backends, we need to add the header filter to the clusterWeight level.
+		if fn, ok := backendFilter[getClusterName(be.Namespace, be.Name, be.Port.GetPort())]; ok {
+			clusterWeight.RequestHeadersToAdd = append(clusterWeight.RequestHeadersToAdd, getHeadersToAdd(fn.RequestHeaderFilter)...)
+			clusterWeight.RequestHeadersToRemove = append(clusterWeight.RequestHeadersToRemove, getHeadersToRemove(fn.RequestHeaderFilter)...)
+			clusterWeight.ResponseHeadersToAdd = append(clusterWeight.ResponseHeadersToAdd, getHeadersToAdd(fn.ResponseHeaderModifier)...)
+			clusterWeight.ResponseHeadersToRemove = append(clusterWeight.ResponseHeadersToRemove, getHeadersToRemove(fn.ResponseHeaderModifier)...)
+		}
+		weightedClusters = append(weightedClusters, clusterWeight)
 	}
 	routeAction = &envoy_config_route_v3.Route_Route{
 		Route: &envoy_config_route_v3.RouteAction{

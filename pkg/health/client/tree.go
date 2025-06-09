@@ -7,8 +7,12 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/cilium/cilium/pkg/hive/health/types"
 )
 
 const (
@@ -29,17 +33,19 @@ type node struct {
 	val, meta string
 	parent    *node
 	nodes     []*node
+	report    *types.Status
 }
 
-func (n *node) addNode(v string) *node {
-	return n.addNodeWithMeta(v, "")
+func (n *node) addNode(v string, r *types.Status) *node {
+	return n.addNodeWithMeta(v, "", r)
 }
 
-func (n *node) addNodeWithMeta(v, m string) *node {
+func (n *node) addNodeWithMeta(v, m string, r *types.Status) *node {
 	node := node{
 		parent: n,
 		val:    v,
 		meta:   m,
+		report: r,
 	}
 	n.nodes = append(n.nodes, &node)
 
@@ -133,6 +139,10 @@ func computeMaxLevel(level int, n *node) int {
 }
 
 func dumpNodes(w io.Writer, level, maxLevel int, levelsEnded []int, nodes []*node) {
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].val < nodes[j].val
+	})
+
 	for i, node := range nodes {
 		edge := mid
 		if i == len(nodes)-1 {
@@ -147,7 +157,7 @@ func dumpNodes(w io.Writer, level, maxLevel int, levelsEnded []int, nodes []*nod
 }
 
 func dumpVals(w io.Writer, level, maxLevel int, levelsEnded []int, edge decoration, node *node) {
-	for i := 0; i < level; i++ {
+	for i := range level {
 		if isEnded(levelsEnded, i) {
 			fmt.Fprint(w, strings.Repeat(" ", indentSize+1))
 			continue
@@ -157,10 +167,7 @@ func dumpVals(w io.Writer, level, maxLevel int, levelsEnded []int, edge decorati
 
 	val := dumpVal(level, node)
 	if node.meta != "" {
-		c := maxLevel - level
-		if c < 0 {
-			c = 0
-		}
+		c := max(maxLevel-level, 0)
 		fmt.Fprintf(w, "%s %-"+strconv.Itoa(leafMaxWidth+c*2)+"s%s%s\n", edge, val, strings.Repeat("  ", c), node.meta)
 		return
 	}
@@ -168,13 +175,7 @@ func dumpVals(w io.Writer, level, maxLevel int, levelsEnded []int, edge decorati
 }
 
 func isEnded(levelsEnded []int, level int) bool {
-	for _, l := range levelsEnded {
-		if l == level {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(levelsEnded, level)
 }
 
 func dumpVal(level int, node *node) string {

@@ -6,17 +6,19 @@ package cmd
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
 	"github.com/cilium/cilium/pkg/fqdn/re"
+	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/policy/api"
 	"github.com/cilium/cilium/pkg/safeio"
@@ -43,7 +45,7 @@ func init() {
 	//
 	// It's not necessary to pass a useful size here because it's not
 	// necessary to cache regexes in a short-lived binary (CLI).
-	re.InitRegexCompileLRU(1)
+	re.InitRegexCompileLRU(logging.DefaultSlogLogger, 1)
 }
 
 func getContext(content []byte, offset int64) (int, string, int) {
@@ -73,9 +75,9 @@ func getContext(content []byte, offset int64) (int, string, int) {
 }
 
 func handleUnmarshalError(f string, content []byte, err error) error {
-	switch e := err.(type) {
-	case *json.SyntaxError:
-		line, ctx, off := getContext(content, e.Offset)
+	syntaxError := &json.SyntaxError{}
+	if errors.As(err, &syntaxError) {
+		line, ctx, off := getContext(content, syntaxError.Offset)
 
 		if off <= 1 {
 			return fmt.Errorf("malformed policy, not JSON?")
@@ -92,21 +94,20 @@ func handleUnmarshalError(f string, content []byte, err error) error {
 
 		return fmt.Errorf("%s:%d: syntax error at offset %d:\n%s\n%s^",
 			path.Base(f), line, off, ctx, pre)
-	case *json.UnmarshalTypeError:
-		line, ctx, off := getContext(content, e.Offset)
-		return fmt.Errorf("%s:%d: unable to assign value '%s' to type '%v':\n%s\n%*c",
-			path.Base(f), line, e.Value, e.Type, ctx, off, '^')
-	default:
-		return fmt.Errorf("%s: unknown error:%s", path.Base(f), err)
 	}
+	unmarshalTypeError := &json.UnmarshalTypeError{}
+	if errors.As(err, &unmarshalTypeError) {
+		line, ctx, off := getContext(content, unmarshalTypeError.Offset)
+		return fmt.Errorf("%s:%d: unable to assign value '%s' to type '%v':\n%s\n%*c",
+			path.Base(f), line, unmarshalTypeError.Value, unmarshalTypeError.Type, ctx, off, '^')
+	}
+	return fmt.Errorf("%s: unknown error: %w", path.Base(f), err)
 }
 
 func ignoredFile(name string) bool {
-	for _, n := range ignoredFileNames {
-		if name == n {
-			logrus.WithField(logfields.Path, name).Debug("Ignoring file")
-			return true
-		}
+	if slices.Contains(ignoredFileNames, name) {
+		log.Debug("Ignoring file", logfields.Path, name)
+		return true
 	}
 
 	return false
@@ -116,7 +117,7 @@ func loadPolicyFile(path string) (api.Rules, error) {
 	var content []byte
 	var err error
 	var r io.Reader
-	logrus.WithField(logfields.Path, path).Debug("Loading file")
+	log.Debug("Loading file", logfields.Path, path)
 
 	if path == "-" {
 		r = bufio.NewReader(os.Stdin)
@@ -143,7 +144,7 @@ func loadPolicyFile(path string) (api.Rules, error) {
 }
 
 func loadPolicy(name string) (api.Rules, error) {
-	logrus.WithField(logfields.Path, name).Debug("Entering directory")
+	log.Debug("Entering directory", logfields.Path, name)
 
 	if name == "-" {
 		return loadPolicyFile(name)
@@ -175,7 +176,7 @@ func loadPolicy(name string) (api.Rules, error) {
 	}
 	result = append(result, ruleList...)
 
-	logrus.WithField(logfields.Path, name).Debug("Leaving directory")
+	log.Debug("Leaving directory", logfields.Path, name)
 
 	return result, nil
 }

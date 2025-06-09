@@ -4,9 +4,11 @@
 package ipcache
 
 import (
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/hive/cell"
+
 	"github.com/cilium/cilium/pkg/ipcache"
 	ipcacheMap "github.com/cilium/cilium/pkg/maps/ipcache"
+	"github.com/cilium/cilium/pkg/metrics"
 	monitorAgent "github.com/cilium/cilium/pkg/monitor/agent"
 )
 
@@ -18,7 +20,7 @@ var Cell = cell.Module(
 
 	cell.Provide(NewListener),
 	cell.ProvidePrivate(
-		func() Map { return ipcacheMap.IPCacheMap() },
+		func(reg *metrics.Registry) Map { return ipcacheMap.IPCacheMap(reg) },
 		func(agent monitorAgent.Agent) monitorNotify { return agent },
 	),
 

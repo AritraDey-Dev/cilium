@@ -21,12 +21,18 @@ on:
     branches:
       - main
       - ft/main/**
+      - 'renovate/main-**'
     paths-ignore:
       - 'Documentation/**'
+  # Run every 8 hours
+  schedule:
+    - cron:  '0 3/8 * * *'
 
 # By specifying the access of one of the scopes, all of those that are not
 # specified are set to 'none'.
 permissions:
+  # To read actions state with catchpoint/workflow-telemetry-action
+  actions: read
   # To be able to access the repository with actions/checkout
   contents: read
   # To allow retrieving information from the PR API
@@ -55,27 +61,35 @@ concurrency:
 
 env:
   # renovate: datasource=golang-version depName=go
-  go-version: 1.21.5
+  go-version: 1.24.3
 
 jobs:
+  echo-inputs:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    name: Echo Workflow Dispatch Inputs
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Echo Workflow Dispatch Inputs
+        run: |
+          echo '${{ tojson(inputs) }}'
+
   commit-status-start:
-    if: ${{ github.event_name != 'push' }}
     name: Commit Status Start
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Set initial commit status
-        uses: myrotvorets/set-commit-status-action@38f3f27c7d52fb381273e95542f07f0fba301307 # v2.0.0
+        uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
         with:
           sha: ${{ inputs.SHA || github.sha }}
 
   # Pre-build the ginkgo binary so that we don't have to build it for all
   # runners.
   build-ginkgo-binary:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     name: Build Ginkgo Runtime
     steps:
       - name: Checkout context ref (trusted)
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.context-ref || github.sha }}
           persist-credentials: false
@@ -97,7 +111,7 @@ jobs:
       # Warning: since this is a privileged workflow, subsequent workflow job
       # steps must take care not to execute untrusted code.
       - name: Checkout pull request branch (NOT TRUSTED)
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ steps.vars.outputs.sha }}
           persist-credentials: false
@@ -107,7 +121,7 @@ jobs:
 
       # Load Ginkgo build from GitHub
       - name: Load ginkgo runtime from GH cache
-        uses: actions/cache@704facf57e6136b1bc63b828d79edcd491f0ee84 # v3.3.2
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         id: cache
         with:
           path: /tmp/.ginkgo-build/
@@ -115,10 +129,10 @@ jobs:
 
       - name: Install Go
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
-        uses: actions/setup-go@93397bea11091df50f3d7e59dc26a7711a8bcfbe # v4.1.0
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           # renovate: datasource=golang-version depName=go
-          go-version: 1.21.5
+          go-version: 1.24.3
 
       - name: Build Ginkgo
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
@@ -156,8 +170,7 @@ jobs:
 
   setup-and-test:
     needs: build-ginkgo-binary
-    runs-on:
-      group: ginkgo-runners
+    runs-on: ${{ vars.GH_RUNNER_EXTRA_POWER_UBUNTU_LATEST || 'ubuntu-24.04' }}
     name: "Runtime Test (${{matrix.focus}})"
     env:
       # GitHub doesn't provide a way to retrieve the name of a job, so we have
@@ -174,26 +187,11 @@ jobs:
 
         include:
           ###
-          # RuntimeAgentChaos Cilium agent Checking for file-descriptor leak
-          # RuntimeAgentChaos Cilium agent removing leftover Cilium interfaces
-          # RuntimeAgentChaos Connectivity over restarts Checking that during restart no traffic is dropped using Egress + Ingress Traffic
-          # RuntimeAgentChaos Endpoint Endpoint recovery on restart
-          # RuntimeAgentChaos KVStore Delete event on KVStore with CIDR identities
-          # RuntimeAgentChaos KVStore Validate that delete events on KVStore do not release in use identities
           # RuntimeAgentFQDNPolicies Can update L7 DNS policy rules
-          # RuntimeAgentFQDNPolicies CNAME follow
           # RuntimeAgentFQDNPolicies DNS proxy policy works if Cilium stops
-          # RuntimeAgentFQDNPolicies Enforces L3 policy even when no IPs are inserted
-          # RuntimeAgentFQDNPolicies Enforces ToFQDNs policy
-          # RuntimeAgentFQDNPolicies Implements matchPattern: *
           # RuntimeAgentFQDNPolicies Interaction with other ToCIDR rules
-          # RuntimeAgentFQDNPolicies Roundrobin DNS
-          # RuntimeAgentFQDNPolicies toFQDNs populates toCIDRSet (data from proxy) L3-dependent L7/HTTP with toFQDN updates proxy policy
           # RuntimeAgentFQDNPolicies toFQDNs populates toCIDRSet (data from proxy) Policy addition after DNS lookup
           # RuntimeAgentFQDNPolicies Validate dns-proxy monitor information
-          # RuntimeAgentFQDNPolicies With verbose policy logs Validates DNSSEC responses
-          # RuntimeAgentKVStoreTest KVStore tests Consul KVStore
-          # RuntimeAgentKVStoreTest KVStore tests Etcd KVStore
           # RuntimeAgentPolicies Init Policy Default Drop Test tests egress
           # RuntimeAgentPolicies Init Policy Default Drop Test tests ingress
           # RuntimeAgentPolicies Init Policy Default Drop Test With PolicyAuditMode tests egress
@@ -206,12 +204,10 @@ jobs:
           # RuntimeAgentPolicies TestsEgressToHost Tests egress with CIDR+L7 policy
           # RuntimeAgentPolicies Tests Endpoint Connectivity Functions After Daemon Configuration Is Updated
           # RuntimeAgentPolicies Tests EntityNone as a deny-all
-          # RuntimeSSHTests Should fail when context times out
           - focus: "agent"
-            cliFocus: "RuntimeAgent|RuntimeSSHTests"
+            cliFocus: "RuntimeAgent"
 
           ###
-          # RuntimeDatapathConntrackInVethModeTest Conntrack-related configuration options for endpoints
           # RuntimeDatapathMonitorTest With Sample Containers checks container ids match monitor output
           # RuntimeDatapathMonitorTest With Sample Containers cilium-dbg monitor check --from
           # RuntimeDatapathMonitorTest With Sample Containers cilium-dbg monitor check --related-to
@@ -219,17 +215,17 @@ jobs:
           # RuntimeDatapathMonitorTest With Sample Containers Cilium monitor event types
           # RuntimeDatapathMonitorTest With Sample Containers delivers the same information to multiple monitors
           - focus: "datapath"
-            cliFocus: "RuntimeDatapathConntrackInVethModeTest|RuntimeDatapathMonitorTest"
+            cliFocus: "RuntimeDatapathMonitorTest"
 
-          ###
-          # RuntimeDatapathPrivilegedUnitTests Run Tests
-          - focus: "privileged"
-            cliFocus: "RuntimeDatapathPrivilegedUnitTests"
-
-    timeout-minutes: 40
+    timeout-minutes: 50
     steps:
+      - name: Collect Workflow Telemetry
+        uses: catchpoint/workflow-telemetry-action@94c3c3d9567a0205de6da68a76c428ce4e769af1 # v2.0.0
+        with:
+          comment_on_pr: false
+
       - name: Checkout context ref (trusted)
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.context-ref || github.sha }}
           persist-credentials: false
@@ -251,25 +247,28 @@ jobs:
       # Warning: since this is a privileged workflow, subsequent workflow job
       # steps must take care not to execute untrusted code.
       - name: Checkout pull request branch (NOT TRUSTED)
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ steps.vars.outputs.sha }}
           persist-credentials: false
 
       - name: Provision LVH VMs
-        uses: cilium/little-vm-helper@8410a93e544b7e180a2365e5fdab0724a39bc02a # v0.0.13
+        uses: cilium/little-vm-helper@e87948476ca97050b1f149ab2aec379d0de19b84 # v0.0.23
         with:
           test-name: runtime-tests
           install-dependencies: true
           # renovate: datasource=docker depName=quay.io/lvh-images/kind
-          image-version: "bpf-next-20231205.012941@sha256:46e5dba0eac147b15b22fa45e0a712d243e098323658f8a13baf332ebbc64942"
+          image-version: "6.12-20241218.004849"
           host-mount: ./
+          images-folder-parent: "/tmp"
           cpu: 4
+          # renovate: datasource=github-tags depName=cilium/little-vm-helper
+          lvh-version: "v0.0.23"
           mem: 12G
 
       # Load Ginkgo build from GitHub
-      - name: Load ${{ matrix.name }} Ginkgo build from GitHub
-        uses: actions/cache/restore@704facf57e6136b1bc63b828d79edcd491f0ee84 # v3.3.2
+      - name: Load ${{ matrix.focus }} Ginkgo build from GitHub
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         id: cache
         with:
           path: /tmp/.ginkgo-build/
@@ -277,10 +276,10 @@ jobs:
 
       - name: Install Go
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
-        uses: actions/setup-go@93397bea11091df50f3d7e59dc26a7711a8bcfbe # v4.1.0
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           # renovate: datasource=golang-version depName=go
-          go-version: 1.21.5
+          go-version: 1.24.3
 
       - name: Build Ginkgo
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
@@ -316,7 +315,7 @@ jobs:
 
       - name: Setup runtime
         timeout-minutes: 10
-        uses: cilium/little-vm-helper@8410a93e544b7e180a2365e5fdab0724a39bc02a # v0.0.13
+        uses: cilium/little-vm-helper@e87948476ca97050b1f149ab2aec379d0de19b84 # v0.0.23
         with:
           provision: 'false'
           cmd: |
@@ -332,7 +331,7 @@ jobs:
             export VMUSER=root
             echo '127.0.0.1 localhost' >> /etc/hosts
             echo '::1 localhost' >> /etc/hosts
-            /tmp/provision/runtime_install.sh
+            /tmp/provision/runtime_install.sh ${{ env.CILIUM_RUNTIME_EXTRA_ARGS }}
             service docker restart
 
       - name: Runtime tests
@@ -365,12 +364,13 @@ jobs:
           -cilium.hubble-relay-image=quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/hubble-relay-ci \
           -cilium.hubble-relay-tag=${{ steps.vars.outputs.sha }} \
           -cilium.operator-suffix=-ci \
-          -cilium.SSHConfig="cat ./cilium-ssh-config.txt"
+          -cilium.SSHConfig="cat ./cilium-ssh-config.txt" \
+          -cilium.extra-opts="${{ env.CILIUM_RUNTIME_EXTRA_ARGS }}"
 
       - name: Runtime privileged tests
         if: ${{ matrix.focus == 'privileged' }}
-        timeout-minutes: 30
-        uses: cilium/little-vm-helper@8410a93e544b7e180a2365e5fdab0724a39bc02a # v0.0.13
+        timeout-minutes: 40
+        uses: cilium/little-vm-helper@e87948476ca97050b1f149ab2aec379d0de19b84 # v0.0.23
         with:
           provision: 'false'
           cmd: |
@@ -379,18 +379,29 @@ jobs:
             # install the same Go toolchain version as current HEAD.
             go install golang.org/dl/go${{ env.go-version }}@latest
             go${{ env.go-version }} download
-            # Install go-junit-report to generate junit files for the
-            # privileged tests.
-            go${{ env.go-version}} install github.com/jstemmer/go-junit-report/v2@7fde4641acef5b92f397a8baf8309d1a45d608cc
-            export GOTEST_FORMATTER="/root/go/bin/go-junit-report -set-exit-code -iocopy -out test/runtime.xml"
-            make tests-privileged NO_COLOR=1 GO=go${{ env.go-version }}
+            # renovate: datasource=github-releases depName=mfridman/tparse
+            go${{ env.go-version}} install github.com/mfridman/tparse@baf229e8494613f134bc0e1f4cb9dc9b12f66442
+            # renovate: datasource=github-releases depName=cilium/go-junit-report/v2/cmd/go-junit-report
+            go${{ env.go-version}} install github.com/cilium/go-junit-report/v2/cmd/go-junit-report@cc2d3acf69eeefab6f9a23ad61b175cd1d570623 # v2.3.0
+            make SKIP_COVERAGE=1 LOG_CODEOWNERS=1 JUNIT_PATH="test/${{ env.job_name }}.xml" tests-privileged GO=go${{ env.go-version }}
+
+      - name: Copy tested features
+        if: ${{ matrix.focus == 'agent' || matrix.focus == 'datapath' }}
+        uses: cilium/little-vm-helper@e87948476ca97050b1f149ab2aec379d0de19b84 # v0.0.23
+        with:
+          provision: 'false'
+          cmd: |
+            docker create --name cilium-dbg quay.io/${{ env.QUAY_ORGANIZATION_DEV }}/cilium-ci:${{ steps.vars.outputs.sha }}
+            docker cp cilium-dbg:/usr/bin/cilium-dbg /usr/local/bin/cilium-dbg
+            docker rm cilium-dbg
+            cilium-dbg metrics list -p cilium_feature -o json > '/host/${{ env.job_name }} (${{ matrix.focus }}).json'
 
       - name: Debug failure on VM
         # Only debug the failure on the LVH that have Cilium running as a service,
         # which is 'agent' and 'datapath' focus.
         if:  ${{ !success() && (matrix.focus == 'agent' || matrix.focus == 'datapath') }}
         timeout-minutes: 10
-        uses: cilium/little-vm-helper@8410a93e544b7e180a2365e5fdab0724a39bc02a # v0.0.13
+        uses: cilium/little-vm-helper@e87948476ca97050b1f149ab2aec379d0de19b84 # v0.0.23
         with:
           provision: 'false'
           cmd: |
@@ -401,19 +412,21 @@ jobs:
         if: ${{ !success() && (matrix.focus == 'agent' || matrix.focus == 'datapath') }}
         shell: bash
         run: |
-          tar -zcf test_results-${{ join(matrix.*, '-') }}.tar.gz ./test/test_results
+          if [ -e ./test/test_results ];then
+            tar -zcf 'test_results-${{ matrix.focus }}.tar.gz' ./test/test_results
+          else
+            echo "::warning::test results directory is not exist!"
+          fi
 
       - name: Upload artifacts
         if: ${{ !success() && (matrix.focus == 'agent' || matrix.focus == 'datapath') }}
-        uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3.1.3
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: cilium-sysdumps
+          name: cilium-sysdumps-${{ matrix.focus }}
           path: |
             test_results-*.tar.gz
-          retention-days: 5
 
       - name: Fetch JUnits
-        if: ${{ always() }}
         shell: bash
         run: |
           mkdir -p cilium-junits
@@ -426,27 +439,61 @@ jobs:
           for filename in *.xml; do cp "${filename}" "../cilium-junits/${junit_filename}"; done;
 
       - name: Upload JUnits [junit]
-        if: ${{ always() }}
-        uses: actions/upload-artifact@a8a3f3ad30e3422c9c7b888a15615d19a852ae32 # v3.1.3
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: cilium-junits
+          name: cilium-junits-${{ matrix.focus }}
           path: cilium-junits/*.xml
-          retention-days: 5
+
+      - name: Upload features tested
+        if: ${{ always() && (matrix.focus == 'agent' || matrix.focus == 'datapath') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: features-tested-${{ matrix.focus }}
+          path: ${{ env.job_name }}*.json
 
       - name: Publish Test Results As GitHub Summary
-        if: ${{ always() }}
         uses: aanm/junit2md@332ebf0fddd34e91b03a832cfafaa826306558f9 # v0.0.3
         with:
           junit-directory: "cilium-junits"
 
+  merge-upload:
+    if: ${{ always() }}
+    name: Merge and Upload Artifacts
+    runs-on: ubuntu-24.04
+    needs: setup-and-test
+    steps:
+      - name: Checkout context ref (trusted)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.context-ref || github.sha }}
+          persist-credentials: false
+      - name: Merge Sysdumps
+        uses: ./.github/actions/merge-artifacts
+        with:
+          name: cilium-sysdumps
+          pattern: cilium-sysdumps-*
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Merge JUnits
+        uses: ./.github/actions/merge-artifacts
+        with:
+          name: cilium-junits
+          pattern: cilium-junits-*
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Merge Features tested
+        uses: ./.github/actions/merge-artifacts
+        with:
+          name: features-tested
+          pattern: features-tested-*
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   commit-status-final:
-    if: ${{ always() && github.event_name != 'push' }}
+    if: ${{ always() }}
     name: Commit Status Final
     needs: setup-and-test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Set final commit status
-        uses: myrotvorets/set-commit-status-action@38f3f27c7d52fb381273e95542f07f0fba301307 # v2.0.0
+        uses: myrotvorets/set-commit-status-action@3730c0a348a2ace3c110851bed53331bc6406e9f # v2.0.1
         with:
           sha: ${{ inputs.SHA || github.sha }}
           status: ${{ needs.setup-and-test.result }}

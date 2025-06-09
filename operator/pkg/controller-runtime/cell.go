@@ -6,10 +6,10 @@ package controllerruntime
 import (
 	"context"
 	"fmt"
-	"runtime/pprof"
+	"log/slog"
 
-	"github.com/bombsimon/logrusr/v4"
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
 	"google.golang.org/protobuf/proto"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -17,9 +17,6 @@ import (
 	ctrlRuntime "sigs.k8s.io/controller-runtime"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/hive/job"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/client"
 )
@@ -52,10 +49,10 @@ func newScheme() (*runtime.Scheme, error) {
 type managerParams struct {
 	cell.In
 
-	Logger      logrus.FieldLogger
-	Lifecycle   hive.Lifecycle
-	JobRegistry job.Registry
-	Scope       cell.Scope
+	Logger    *slog.Logger
+	Lifecycle cell.Lifecycle
+	JobGroup  job.Group
+	Health    cell.Health
 
 	K8sClient client.Clientset
 	Scheme    *runtime.Scheme
@@ -72,7 +69,7 @@ func newManager(params managerParams) (ctrlRuntime.Manager, error) {
 		return proto.Equal(xdsResource1.Any, xdsResource2.Any)
 	})
 
-	ctrlRuntime.SetLogger(logrusr.New(params.Logger))
+	ctrlRuntime.SetLogger(newLogrFromSlog(params.Logger))
 
 	mgr, err := ctrlRuntime.NewManager(params.K8sClient.RestConfig(), ctrlRuntime.Options{
 		Scheme: params.Scheme,
@@ -80,23 +77,14 @@ func newManager(params managerParams) (ctrlRuntime.Manager, error) {
 		Metrics: metricsserver.Options{
 			BindAddress: "0",
 		},
-		Logger: logrusr.New(params.Logger),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create new controller-runtime manager: %w", err)
 	}
 
-	jobGroup := params.JobRegistry.NewGroup(
-		params.Scope,
-		job.WithLogger(params.Logger),
-		job.WithPprofLabels(pprof.Labels("cell", "controller-runtime")),
-	)
-
-	jobGroup.Add(job.OneShot("manager", func(ctx context.Context, health cell.HealthReporter) error {
+	params.JobGroup.Add(job.OneShot("manager", func(ctx context.Context, health cell.Health) error {
 		return mgr.Start(ctx)
 	}))
-
-	params.Lifecycle.Append(jobGroup)
 
 	return mgr, nil
 }

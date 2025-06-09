@@ -7,22 +7,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/go-openapi/strfmt"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/clustermesh/types"
-	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	cmutils "github.com/cilium/cilium/pkg/clustermesh/utils"
 	"github.com/cilium/cilium/pkg/controller"
-	"github.com/cilium/cilium/pkg/k8s"
+	"github.com/cilium/cilium/pkg/dial"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
 )
@@ -35,15 +35,16 @@ var (
 type RemoteCluster interface {
 	// Run implements the actual business logic once the connection to the remote cluster has been established.
 	// The ready channel shall be closed when the initialization tasks completed, possibly returning an error.
-	Run(ctx context.Context, backend kvstore.BackendOperations, config *types.CiliumClusterConfig, ready chan<- error)
-
-	// ClusterConfigRequired returns whether the CiliumClusterConfig is always
-	// expected to be exposed by remote clusters.
-	ClusterConfigRequired() bool
+	Run(ctx context.Context, backend kvstore.BackendOperations, config types.CiliumClusterConfig, ready chan<- error)
 
 	Stop()
-	Remove()
+	Remove(ctx context.Context)
 }
+
+// backendFactoryFn is the type of the function to create the etcd client.
+type backendFactoryFn func(ctx context.Context, logger *slog.Logger,
+	backend string, opts map[string]string,
+	options *kvstore.ExtraOptions) (kvstore.BackendOperations, chan error)
 
 // remoteCluster represents another cluster other than the cluster the agent is
 // running in
@@ -60,12 +61,8 @@ type remoteCluster struct {
 	// clusterSizeDependantInterval allows to calculate intervals based on cluster size.
 	clusterSizeDependantInterval kvstore.ClusterSizeDependantIntervalFunc
 
-	// serviceIPGetter, if not nil, is used to create a custom dialer for service resolution.
-	serviceIPGetter k8s.ServiceIPGetter
-
-	// changed receives an event when the remote cluster configuration has
-	// changed and is closed when the configuration file was removed
-	changed chan bool
+	// resolvers are the set of resolvers used to create the custom dialer.
+	resolvers []dial.Resolver
 
 	controllers *controller.Manager
 
@@ -80,6 +77,7 @@ type remoteCluster struct {
 	// mutex protects the following variables
 	// - backend
 	// - config
+	// - etcdClusterID
 	// - failures
 	// - lastFailure
 	mutex lock.RWMutex
@@ -90,23 +88,30 @@ type remoteCluster struct {
 	// config contains the information about the cluster config for status reporting
 	config *models.RemoteClusterConfig
 
+	// etcdClusterID contains the information about the etcd cluster ID for status
+	// reporting. It is used to distinguish which instance of the clustermesh-apiserver
+	// we are connected to when running in HA mode.
+	etcdClusterID string
+
 	// failures is the number of observed failures
 	failures int
 
 	// lastFailure is the timestamp of the last failure
 	lastFailure time.Time
 
-	logger logrus.FieldLogger
+	logger *slog.Logger
+
+	// backendFactory allows to override the function to create the etcd client
+	// for testing purposes.
+	backendFactory backendFactoryFn
+	// clusterLockFactory allows to override the function to create the clusterLock
+	// for testing purposes.
+	clusterLockFactory func() *clusterLock
 
 	metricLastFailureTimestamp prometheus.Gauge
 	metricReadinessStatus      prometheus.Gauge
 	metricTotalFailures        prometheus.Gauge
 }
-
-var (
-	// skipKvstoreConnection skips the etcd connection, used for testing
-	skipKvstoreConnection bool
-)
 
 // releaseOldConnection releases the etcd connection to a remote cluster
 func (rc *remoteCluster) releaseOldConnection() {
@@ -119,16 +124,12 @@ func (rc *remoteCluster) releaseOldConnection() {
 	backend := rc.backend
 	rc.backend = nil
 	rc.config = nil
+	rc.etcdClusterID = ""
 	rc.mutex.Unlock()
 
-	// Release resources asynchronously in the background. Many of these
-	// operations may time out if the connection was closed due to an error
-	// condition.
-	go func() {
-		if backend != nil {
-			backend.Close(context.Background())
-		}
-	}()
+	if backend != nil {
+		backend.Close()
+	}
 }
 
 func (rc *remoteCluster) restartRemoteConnection() {
@@ -139,46 +140,82 @@ func (rc *remoteCluster) restartRemoteConnection() {
 			DoFunc: func(ctx context.Context) error {
 				rc.releaseOldConnection()
 
-				extraOpts := rc.makeExtraOpts()
-
-				backend, errChan := kvstore.NewClient(ctx, kvstore.EtcdBackendName,
-					rc.makeEtcdOpts(), &extraOpts)
+				clusterLock := rc.clusterLockFactory()
+				extraOpts := rc.makeExtraOpts(clusterLock)
+				backend, errChan := rc.backendFactory(ctx, rc.logger, kvstore.EtcdBackendName, rc.makeEtcdOpts(), &extraOpts)
 
 				// Block until either an error is returned or
 				// the channel is closed due to success of the
 				// connection
-				rc.logger.Debugf("Waiting for connection to be established")
-				err, isErr := <-errChan
-				if isErr {
+				rc.logger.Debug("Waiting for connection to be established")
+
+				var err error
+				select {
+				case err = <-errChan:
+				case err = <-clusterLock.errors:
+				}
+
+				if err != nil {
 					if backend != nil {
-						backend.Close(ctx)
+						backend.Close()
 					}
-					rc.logger.WithError(err).Warning("Unable to establish etcd connection to remote cluster")
+
+					select {
+					case <-ctx.Done():
+					default:
+						rc.logger.Warn("Unable to establish etcd connection to remote cluster", logfields.Error, err)
+					}
 					return err
 				}
+
+				etcdClusterID := fmt.Sprintf("%x", clusterLock.etcdClusterID.Load())
 
 				rc.mutex.Lock()
 				rc.backend = backend
+				rc.etcdClusterID = etcdClusterID
 				rc.mutex.Unlock()
-
-				rc.logger.Info("Connection to remote cluster established")
-
-				config, err := rc.getClusterConfig(ctx, backend, rc.ClusterConfigRequired())
-				if err == nil && config == nil {
-					rc.logger.Warning("Remote cluster doesn't have cluster configuration, falling back to the old behavior. This is expected when connecting to the old cluster running Cilium without cluster configuration feature.")
-				} else if err == nil {
-					rc.logger.Info("Found remote cluster configuration")
-				} else {
-					rc.logger.WithError(err).Warning("Unable to get remote cluster configuration")
-					return err
-				}
 
 				ctx, cancel := context.WithCancel(ctx)
 				rc.wg.Add(1)
 				go func() {
-					rc.watchdog(ctx, backend)
+					rc.watchdog(ctx, backend, clusterLock)
+					cancel()
 					rc.wg.Done()
 				}()
+
+				rc.logger.Info(
+					"Connection to remote cluster established",
+					logfields.EtcdClusterID, etcdClusterID,
+				)
+
+				config, err := rc.getClusterConfig(ctx, backend)
+				if err != nil {
+					// Return immediately if the context has been canceled, to
+					// avoid emitting a spurious warning in case the failure is
+					// expected, and has already been logged elsewhere (or we
+					// are terminating).
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					default:
+					}
+
+					if errors.Is(err, cmutils.ErrClusterConfigNotFound) {
+						rc.logger.Warn("Unable to get remote cluster configuration",
+							logfields.Error, err,
+							logfields.Hint, "If KVStoreMesh is enabled, check whether it is connected to the target cluster."+
+								" Additionally, ensure that the cluster name is correct.",
+						)
+					} else {
+						rc.logger.Warn("Unable to get remote cluster configuration",
+							logfields.Error, err,
+						)
+					}
+
+					cancel()
+					return err
+				}
+				rc.logger.Info("Found remote cluster configuration")
 
 				ready := make(chan error)
 
@@ -194,7 +231,13 @@ func (rc *remoteCluster) restartRemoteConnection() {
 				}()
 
 				if err := <-ready; err != nil {
-					rc.logger.WithError(err).Warning("Connection to remote cluster failed")
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					default:
+						rc.logger.Warn("Connection to remote cluster failed", logfields.Error, err)
+					}
+
 					return err
 				}
 
@@ -211,50 +254,49 @@ func (rc *remoteCluster) restartRemoteConnection() {
 	)
 }
 
-func (rc *remoteCluster) watchdog(ctx context.Context, backend kvstore.BackendOperations) {
+func (rc *remoteCluster) watchdog(ctx context.Context, backend kvstore.BackendOperations, clusterLock *clusterLock) {
+	handleErr := func(err error) {
+		rc.logger.Warn("Error observed on etcd connection, reconnecting etcd", logfields.Error, err)
+		rc.mutex.Lock()
+		rc.failures++
+		rc.lastFailure = time.Now()
+		rc.metricLastFailureTimestamp.SetToCurrentTime()
+		rc.metricTotalFailures.Set(float64(rc.failures))
+		rc.metricReadinessStatus.Set(metrics.BoolToFloat64(rc.isReadyLocked()))
+		rc.mutex.Unlock()
+
+		rc.restartRemoteConnection()
+	}
+
 	select {
 	case err, ok := <-backend.StatusCheckErrors():
 		if ok && err != nil {
-			rc.logger.WithError(err).Warning("Error observed on etcd connection, reconnecting etcd")
-			rc.mutex.Lock()
-			rc.failures++
-			rc.lastFailure = time.Now()
-			rc.metricLastFailureTimestamp.SetToCurrentTime()
-			rc.metricTotalFailures.Set(float64(rc.failures))
-			rc.metricReadinessStatus.Set(metrics.BoolToFloat64(rc.isReadyLocked()))
-			rc.mutex.Unlock()
-
-			rc.restartRemoteConnection()
+			handleErr(err)
 		}
-
+	case err, ok := <-clusterLock.errors:
+		if ok && err != nil {
+			handleErr(err)
+		}
 	case <-ctx.Done():
 		return
 	}
 }
 
-func (rc *remoteCluster) getClusterConfig(ctx context.Context, backend kvstore.BackendOperations, forceRequired bool) (*cmtypes.CiliumClusterConfig, error) {
+func (rc *remoteCluster) getClusterConfig(ctx context.Context, backend kvstore.BackendOperations) (types.CiliumClusterConfig, error) {
 	var (
-		err                           error
-		requireConfig                 = forceRequired
 		clusterConfigRetrievalTimeout = 3 * time.Minute
+		lastError                     = context.Canceled
+		lastErrorLock                 lock.Mutex
 	)
 
 	ctx, cancel := context.WithTimeout(ctx, clusterConfigRetrievalTimeout)
 	defer cancel()
 
-	if !requireConfig {
-		// Let's check whether the kvstore states that the cluster configuration should be always present.
-		requireConfig, err = cmutils.IsClusterConfigRequired(ctx, backend)
-		if err != nil {
-			return nil, fmt.Errorf("failed to detect whether the cluster configuration is required: %w", err)
-		}
-	}
-
 	rc.mutex.Lock()
-	rc.config = &models.RemoteClusterConfig{Required: requireConfig}
+	rc.config = &models.RemoteClusterConfig{Required: true}
 	rc.mutex.Unlock()
 
-	cfgch := make(chan *types.CiliumClusterConfig)
+	cfgch := make(chan types.CiliumClusterConfig, 1)
 	defer close(cfgch)
 
 	// We retry here rather than simply returning an error and relying on the external
@@ -269,15 +311,12 @@ func (rc *remoteCluster) getClusterConfig(ctx context.Context, backend kvstore.B
 			rc.logger.Debug("Retrieving cluster configuration from remote kvstore")
 			config, err := cmutils.GetClusterConfig(ctx, rc.name, backend)
 			if err != nil {
+				lastErrorLock.Lock()
+				lastError = err
+				lastErrorLock.Unlock()
 				return err
 			}
 
-			if config == nil && requireConfig {
-				return errors.New("cluster configuration expected to be present but not found")
-			}
-
-			// We should stop retrying in case we either successfully retrieved the cluster
-			// configuration, or we are not required to wait for it.
 			cfgch <- config
 			return nil
 		},
@@ -288,18 +327,19 @@ func (rc *remoteCluster) getClusterConfig(ctx context.Context, backend kvstore.B
 	// Wait until either the configuration is retrieved, or the context expires
 	select {
 	case config := <-cfgch:
-		if config != nil {
-			rc.mutex.Lock()
-			rc.config.Retrieved = true
-			rc.config.ClusterID = int64(config.ID)
-			rc.config.Kvstoremesh = config.Capabilities.Cached
-			rc.config.SyncCanaries = config.Capabilities.SyncedCanaries
-			rc.mutex.Unlock()
-		}
+		rc.mutex.Lock()
+		rc.config.Retrieved = true
+		rc.config.ClusterID = int64(config.ID)
+		rc.config.Kvstoremesh = config.Capabilities.Cached
+		rc.config.SyncCanaries = config.Capabilities.SyncedCanaries
+		rc.config.ServiceExportsEnabled = config.Capabilities.ServiceExportsEnabled
+		rc.mutex.Unlock()
 
 		return config, nil
 	case <-ctx.Done():
-		return nil, fmt.Errorf("failed to retrieve cluster configuration")
+		lastErrorLock.Lock()
+		defer lastErrorLock.Unlock()
+		return types.CiliumClusterConfig{}, fmt.Errorf("failed to retrieve cluster configuration: %w", lastError)
 	}
 }
 
@@ -319,52 +359,34 @@ func (rc *remoteCluster) makeEtcdOpts() map[string]string {
 	return opts
 }
 
-func (rc *remoteCluster) makeExtraOpts() kvstore.ExtraOptions {
+func (rc *remoteCluster) makeExtraOpts(clusterLock *clusterLock) kvstore.ExtraOptions {
 	var dialOpts []grpc.DialOption
-	if rc.serviceIPGetter != nil {
-		// Allow to resolve service names without depending on the DNS. This prevents the need
-		// for setting the DNSPolicy to ClusterFirstWithHostNet when running in host network.
-		dialOpts = append(dialOpts, grpc.WithContextDialer(k8s.CreateCustomDialer(rc.serviceIPGetter, rc.logger, false)))
-	}
+
+	dialOpts = append(dialOpts, grpc.WithStreamInterceptor(newStreamInterceptor(clusterLock)), grpc.WithUnaryInterceptor(newUnaryInterceptor(clusterLock)))
+
+	// Allow to resolve service names without depending on the DNS. This prevents the need
+	// for setting the DNSPolicy to ClusterFirstWithHostNet when running in host network.
+	dialOpts = append(dialOpts, grpc.WithContextDialer(dial.NewContextDialer(rc.logger, rc.resolvers...)))
 
 	return kvstore.ExtraOptions{
 		NoLockQuorumCheck:            true,
 		ClusterName:                  rc.name,
 		ClusterSizeDependantInterval: rc.clusterSizeDependantInterval,
 		DialOption:                   dialOpts,
+		NoEndpointStatusChecks:       true,
 	}
 }
 
-func (rc *remoteCluster) onInsert() {
-	rc.logger.Info("New remote cluster configuration")
-
-	if skipKvstoreConnection {
-		return
-	}
-
-	rc.remoteConnectionControllerName = fmt.Sprintf("remote-etcd-%s", rc.name)
+func (rc *remoteCluster) connect() {
+	rc.logger.Info("Connecting to remote cluster")
 	rc.restartRemoteConnection()
-
-	go func() {
-		for {
-			val := <-rc.changed
-			if val {
-				rc.logger.Info("etcd configuration has changed, re-creating connection")
-				rc.restartRemoteConnection()
-			} else {
-				rc.logger.Info("Closing connection to remote etcd")
-				return
-			}
-		}
-	}()
 }
 
 // onStop is executed when the clustermesh subsystem is being stopped.
 // In this case, we don't want to drain the known entries, otherwise
 // we would break existing connections when the agent gets restarted.
 func (rc *remoteCluster) onStop() {
-	rc.controllers.RemoveAllAndWait()
-	close(rc.changed)
+	_ = rc.controllers.RemoveControllerAndWait(rc.remoteConnectionControllerName)
 	rc.Stop()
 }
 
@@ -372,9 +394,9 @@ func (rc *remoteCluster) onStop() {
 // (i.e., its configuration is removed). In this case, we need to drain
 // all known entries, to properly cleanup the status without requiring to
 // restart the agent.
-func (rc *remoteCluster) onRemove() {
+func (rc *remoteCluster) onRemove(ctx context.Context) {
 	rc.onStop()
-	rc.Remove()
+	rc.Remove(ctx)
 
 	rc.logger.Info("Remote cluster disconnected")
 }
@@ -398,10 +420,9 @@ func (rc *remoteCluster) status() *models.RemoteCluster {
 	// for the first connection to succeed.
 	var backendStatus = "Waiting for initial connection to be established"
 	if rc.backend != nil {
-		var backendError error
-		backendStatus, backendError = rc.backend.Status()
-		if backendError != nil {
-			backendStatus = backendError.Error()
+		backendStatus = rc.backend.Status().Msg
+		if rc.etcdClusterID != "" {
+			backendStatus += ", ID: " + rc.etcdClusterID
 		}
 	}
 

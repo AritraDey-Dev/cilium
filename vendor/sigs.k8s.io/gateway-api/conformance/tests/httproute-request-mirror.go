@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/gateway-api/conformance/utils/http"
 	"sigs.k8s.io/gateway-api/conformance/utils/kubernetes"
 	"sigs.k8s.io/gateway-api/conformance/utils/suite"
+	"sigs.k8s.io/gateway-api/pkg/features"
 )
 
 func init() {
@@ -34,10 +35,10 @@ var HTTPRouteRequestMirror = suite.ConformanceTest{
 	ShortName:   "HTTPRouteRequestMirror",
 	Description: "An HTTPRoute with request mirror filter",
 	Manifests:   []string{"tests/httproute-request-mirror.yaml"},
-	Features: []suite.SupportedFeature{
-		suite.SupportGateway,
-		suite.SupportHTTPRoute,
-		suite.SupportHTTPRouteRequestMirror,
+	Features: []features.FeatureName{
+		features.SupportGateway,
+		features.SupportHTTPRoute,
+		features.SupportHTTPRouteRequestMirror,
 	},
 	Test: func(t *testing.T, suite *suite.ConformanceTestSuite) {
 		ns := "gateway-conformance-infra"
@@ -56,10 +57,14 @@ var HTTPRouteRequestMirror = suite.ConformanceTest{
 					},
 				},
 				Backend: "infra-backend-v1",
-				MirroredTo: []http.BackendRef{{
-					Name:      "infra-backend-v2",
-					Namespace: ns,
-				}},
+				MirroredTo: []http.MirroredBackend{
+					{
+						BackendRef: http.BackendRef{
+							Name:      "infra-backend-v2",
+							Namespace: ns,
+						},
+					},
+				},
 				Namespace: ns,
 			},
 			{
@@ -83,10 +88,14 @@ var HTTPRouteRequestMirror = suite.ConformanceTest{
 				},
 				Namespace: ns,
 				Backend:   "infra-backend-v1",
-				MirroredTo: []http.BackendRef{{
-					Name:      "infra-backend-v2",
-					Namespace: ns,
-				}},
+				MirroredTo: []http.MirroredBackend{
+					{
+						BackendRef: http.BackendRef{
+							Name:      "infra-backend-v2",
+							Namespace: ns,
+						},
+					},
+				},
 			},
 		}
 		for i := range testCases {

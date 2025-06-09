@@ -27,7 +27,6 @@ DeleteIPAMIP          -
 DeletePolicy          -
 DeletePrefilter       -
 DeleteRecorderID      -
-DeleteServiceID       -
 GetBGPPeers           Retrieves current operational state of BGP peers created by
                       Cilium BGP virtual router. This includes session state,
                       uptime, information per address family, etc.
@@ -54,8 +53,6 @@ GetFqdnCacheID        Retrieves the list of DNS lookups intercepted from the
                       name, CIDR IP range or source.
 GetFqdnNames          Retrieves the list of DNS-related fields (names to poll,
                       selectors and their corresponding regexes).
-GetHealth             Returns modules health and status information of the Cilium
-                      daemon.
 GetHealthz            Returns health and status information of the Cilium daemon
                       and related components such as the local container runtime,
                       connected datastore, Kubernetes integration and Hubble.
@@ -72,7 +69,6 @@ GetLRP                -
 GetMap                -
 GetMapName            -
 GetMapNameEvents      -
-GetMetrics            -
 GetNodeIds            Retrieves a list of node IDs allocated by the agent and
                       their associated node IP addresses.
 GetPolicy             Returns the entire policy tree with all children.
@@ -83,8 +79,6 @@ GetRecorderID         -
 GetRecorderMasks      -
 GetService            -
 GetServiceID          -
-GetStatedbDump        -
-GetStatedbQueryTable  -
 PatchConfig           Updates the daemon configuration by applying the provided
                       ConfigurationMap and regenerates & recompiles all required
                       datapath components.
@@ -100,7 +94,6 @@ PostIPAMIP            -
 PutEndpointID         Creates a new endpoint
 PutPolicy             -
 PutRecorderID         -
-PutServiceID          -
 ===================== ====================
 
 Cilium Agent Clusterwide Health API
@@ -130,7 +123,7 @@ The following API flags are compatible with the ``cilium-operator`` flag
 ===================== ====================
 Flag Name             Description
 ===================== ====================
-GetHealthz            This path will return the status of cilium operator
-                      instance.
-GetMetrics            -
+GetCluster            Returns the list of remote clusters and their status.
+GetHealthz            Returns the status of cilium operator instance.
+GetMetrics            Returns the metrics exposed by the Cilium operator.
 ===================== ====================

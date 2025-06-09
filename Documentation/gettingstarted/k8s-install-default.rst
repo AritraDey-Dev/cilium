@@ -77,7 +77,8 @@ to create a Kubernetes cluster locally or using a managed Kubernetes service:
            az aks create \
              --resource-group "${AZURE_RESOURCE_GROUP}" \
              --name "${NAME}" \
-             --network-plugin none
+             --network-plugin none \
+             --generate-ssh-keys
 
            # Get the credentials to access the cluster with kubectl
            az aks get-credentials --resource-group "${AZURE_RESOURCE_GROUP}" --name "${NAME}"
@@ -157,7 +158,7 @@ to create a Kubernetes cluster locally or using a managed Kubernetes service:
        Install Rancher Desktop >= v1.1.0 as per Rancher Desktop documentation:
        `Install Rancher Desktop <https://docs.rancherdesktop.io/getting-started/installation>`_.
 
-       Next you need to configure Rancher Desktop so to disable the builtin CNI so you can install Cilium.
+       Next you need to configure Rancher Desktop to disable the built-in CNI so you can install Cilium.
 
        .. include:: ../installation/rancher-desktop-configure.rst
 
@@ -228,7 +229,9 @@ You can install Cilium on any Kubernetes cluster. Pick one of the options below:
            cilium install |CHART_VERSION|
 
     .. group-tab:: AKS
-
+       
+       .. include:: ../installation/requirements-aks.rst
+   
        **Install Cilium:**
 
        Install Cilium into the AKS cluster:
@@ -236,23 +239,7 @@ You can install Cilium on any Kubernetes cluster. Pick one of the options below:
        .. parsed-literal::
 
            cilium install |CHART_VERSION| --set azure.resourceGroup="${AZURE_RESOURCE_GROUP}"
-
-       The Cilium CLI will automatically install Cilium using one of the
-       following installation modes based on the ``--network-plugin``
-       configuration detected from the AKS cluster:
-
-       .. include:: ../installation/requirements-aks.rst
-
-       .. tabs::
-
-          .. tab:: BYOCNI
-
-             .. include:: ../installation/requirements-aks-byocni.rst
-
-          .. tab:: Legacy Azure IPAM
-
-             .. include:: ../installation/requirements-aks-azure-ipam.rst
-
+           
     .. group-tab:: EKS
 
        .. include:: ../installation/requirements-eks.rst

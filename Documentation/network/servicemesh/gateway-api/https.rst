@@ -15,6 +15,7 @@ termination for two HTTP routes. For simplicity, the second route to ``productpa
 is omitted.
 
 .. literalinclude:: ../../../../examples/kubernetes/gateway/basic-https.yaml
+     :language: yaml
 
 .. include:: ../tls-cert.rst
 
@@ -33,7 +34,7 @@ The Gateway configuration for this demo provides the similar routing to the
 
             $ kubectl apply -f \ |SCM_WEB|\/examples/kubernetes/gateway/basic-https.yaml
 
-    .. group-tab:: Cert Manager
+    .. group-tab:: cert-manager
 
         .. parsed-literal::
 
@@ -100,7 +101,7 @@ Make HTTPS Requests
         Specifying -v on the curl request, you can see that the TLS handshake took
         place successfully.
 
-    .. group-tab:: Cert Manager
+    .. group-tab:: cert-manager
 
         .. code-block:: shell-session
 

@@ -141,12 +141,12 @@ func getSystemdContainerPathCommon(subPaths []string, podId string, containerId 
 	podIdStr := fmt.Sprintf("pod%s", podId)
 	if qos == v1.PodQOSGuaranteed {
 		if path, err = toSystemd(append(subPaths, podIdStr)); err != nil {
-			return "", fmt.Errorf("unable to construct cgroup path %w", err)
+			return "", fmt.Errorf("unable to construct cgroup path: %w", err)
 		}
 	} else {
 		qosStr := strings.ToLower(string(qos))
 		if path, err = toSystemd(append(subPaths, qosStr, podIdStr)); err != nil {
-			return "", fmt.Errorf("unable to construct cgroup path %w", err)
+			return "", fmt.Errorf("unable to construct cgroup path: %w", err)
 		}
 	}
 	// construct and append container sub path with container id
@@ -211,7 +211,7 @@ func toSystemd(cgroupName []string) (string, error) {
 
 	result, err := expandSlice(strings.Join(newparts, "-") + systemdSuffix)
 	if err != nil {
-		return "", fmt.Errorf("error converting cgroup name [%v] to systemd format: %v", cgroupName, err)
+		return "", fmt.Errorf("error converting cgroup name [%v] to systemd format: %w", cgroupName, err)
 	}
 	return result, nil
 }
@@ -241,7 +241,7 @@ func expandSlice(slice string) (string, error) {
 	if sliceName == "-" {
 		return "/", nil
 	}
-	for _, component := range strings.Split(sliceName, "-") {
+	for component := range strings.SplitSeq(sliceName, "-") {
 		// test--a.slice isn't permitted, nor is -test.slice.
 		if component == "" {
 			return "", fmt.Errorf("invalid slice name: %s", slice)

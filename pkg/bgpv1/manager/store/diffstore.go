@@ -5,25 +5,44 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/job"
+	k8sRuntime "k8s.io/apimachinery/pkg/runtime"
+
 	"github.com/cilium/cilium/pkg/bgpv1/agent/signaler"
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/k8s/resource"
 	"github.com/cilium/cilium/pkg/lock"
-
-	k8sRuntime "k8s.io/apimachinery/pkg/runtime"
+	"github.com/cilium/cilium/pkg/time"
 )
 
-// DiffStore is a super set of the resource.Store. The diffStore tracks all changes made to it since the
+var (
+	ErrStoreUninitialized = errors.New("the store has not initialized yet")
+	ErrDiffUninitialized  = errors.New("diff not initialized for caller")
+)
+
+// DiffStore is a wrapper around the resource.Store. The diffStore tracks all changes made to it since the
 // last time the user synced up. This allows a user to get a list of just the changed objects while still being able
 // to query the full store for a full sync.
 type DiffStore[T k8sRuntime.Object] interface {
-	resource.Store[T]
+	// InitDiff initializes tracking io items to Diff for the given callerID.
+	InitDiff(callerID string)
 
-	// Diff returns a list of items that have been upserted(updated or inserted) and deleted since the last call to Diff.
-	Diff() (upserted []T, deleted []resource.Key, err error)
+	// Diff returns a list of items that have been upserted (updated or inserted) and deleted
+	// since InitDiff or the last call to Diff with the same callerID.
+	// Init(callerID) has to be called before Diff(callerID).
+	Diff(callerID string) (upserted []T, deleted []T, err error)
+
+	// CleanupDiff cleans up all caller-specific diff state.
+	CleanupDiff(callerID string)
+
+	// GetByKey returns the latest version of the object with given key.
+	GetByKey(key resource.Key) (item T, exists bool, err error)
+
+	// List returns all items currently in the store.
+	List() (items []T, err error)
 }
 
 var _ DiffStore[*k8sRuntime.Unknown] = (*diffStore[*k8sRuntime.Unknown])(nil)
@@ -31,28 +50,30 @@ var _ DiffStore[*k8sRuntime.Unknown] = (*diffStore[*k8sRuntime.Unknown])(nil)
 type diffStoreParams[T k8sRuntime.Object] struct {
 	cell.In
 
-	Lifecycle hive.Lifecycle
+	Lifecycle cell.Lifecycle
+	Health    cell.Health
+	JobGroup  job.Group
 	Resource  resource.Resource[T]
 	Signaler  *signaler.BGPCPSignaler
 }
+
+// updatedKeysMap is a map of updated resource keys since the last diff against the map.
+type updatedKeysMap map[resource.Key]bool
 
 // diffStore takes a resource.Resource[T] and watches for events, it stores all of the keys that have been changed.
 // diffStore can still be used as a normal store, but adds the Diff function to get a Diff of all changes.
 // The diffStore also takes in Signaler which it will signal after the initial sync and every update thereafter.
 type diffStore[T k8sRuntime.Object] struct {
-	resource.Store[T]
+	store resource.Store[T]
 
 	resource resource.Resource[T]
 	signaler *signaler.BGPCPSignaler
 
-	ctx      context.Context
-	cancel   context.CancelFunc
-	doneChan chan struct{}
-
 	initialSync bool
 
-	mu          lock.Mutex
-	updatedKeys map[resource.Key]bool
+	mu                lock.Mutex
+	callerUpdatedKeys map[string]updatedKeysMap     // updated keys per caller ID
+	callerDeletedObjs map[string]map[resource.Key]T // deleted objects per caller ID
 }
 
 func NewDiffStore[T k8sRuntime.Object](params diffStoreParams[T]) DiffStore[T] {
@@ -64,56 +85,50 @@ func NewDiffStore[T k8sRuntime.Object](params diffStoreParams[T]) DiffStore[T] {
 		resource: params.Resource,
 		signaler: params.Signaler,
 
-		updatedKeys: make(map[resource.Key]bool),
-		doneChan:    make(chan struct{}),
+		callerUpdatedKeys: make(map[string]updatedKeysMap),
+		callerDeletedObjs: make(map[string]map[resource.Key]T),
 	}
-	ds.ctx, ds.cancel = context.WithCancel(context.Background())
 
-	params.Lifecycle.Append(ds)
+	params.JobGroup.Add(
+		job.OneShot("diffstore-events",
+			func(ctx context.Context, health cell.Health) (err error) {
+				ds.mu.Lock()
+				ds.store, err = ds.resource.Store(ctx)
+				ds.mu.Unlock()
+				if err != nil {
+					return fmt.Errorf("error creating resource store: %w", err)
+				}
+				for event := range ds.resource.Events(ctx) {
+					ds.handleEvent(event)
+				}
+				return nil
+			},
+			job.WithRetry(3, &job.ExponentialBackoff{Min: 100 * time.Millisecond, Max: time.Second}),
+			job.WithShutdown()),
+	)
 
 	return ds
-}
-
-// Start implements hive.HookInterface
-func (ds *diffStore[T]) Start(ctx hive.HookContext) error {
-	var err error
-	ds.Store, err = ds.resource.Store(ctx)
-	if err != nil {
-		return fmt.Errorf("resource.Store(): %w", err)
-	}
-
-	go ds.run()
-	return nil
-}
-
-// Stop implements hive.HookInterface
-func (ds *diffStore[T]) Stop(stopCtx hive.HookContext) error {
-	ds.cancel()
-
-	select {
-	case <-ds.doneChan:
-	case <-stopCtx.Done():
-		return stopCtx.Err()
-	}
-
-	return nil
-}
-
-func (ds *diffStore[T]) run() {
-	defer close(ds.doneChan)
-
-	for event := range ds.resource.Events(ds.ctx) {
-		ds.handleEvent(event)
-	}
 }
 
 func (ds *diffStore[T]) handleEvent(event resource.Event[T]) {
 	update := func(k resource.Key) {
 		ds.mu.Lock()
-		ds.updatedKeys[k] = true
+		for _, updatedKeys := range ds.callerUpdatedKeys {
+			updatedKeys[k] = true
+		}
 		ds.mu.Unlock()
 
-		// Start triggering the signaler after initialization to reduce reconciliation load.
+		if ds.initialSync {
+			ds.signaler.Event(struct{}{})
+		}
+	}
+	delete := func(k resource.Key, o T) {
+		ds.mu.Lock()
+		for _, deletedObjs := range ds.callerDeletedObjs {
+			deletedObjs[k] = o
+		}
+		ds.mu.Unlock()
+
 		if ds.initialSync {
 			ds.signaler.Event(struct{}{})
 		}
@@ -123,44 +138,110 @@ func (ds *diffStore[T]) handleEvent(event resource.Event[T]) {
 	case resource.Sync:
 		ds.initialSync = true
 		ds.signaler.Event(struct{}{})
-	case resource.Upsert, resource.Delete:
+	case resource.Upsert:
 		update(event.Key)
+	case resource.Delete:
+		delete(event.Key, event.Object)
 	}
 
 	event.Done(nil)
 }
 
-// Diff returns a list of items that have been upserted(updated or inserted) and deleted since the last call to Diff.
-func (sd *diffStore[T]) Diff() (upserted []T, deleted []resource.Key, err error) {
-	sd.mu.Lock()
-	defer sd.mu.Unlock()
+// InitDiff initializes tracking io items to Diff for the given callerID.
+func (ds *diffStore[T]) InitDiff(callerID string) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
 
+	ds.callerUpdatedKeys[callerID] = make(updatedKeysMap)
+	ds.callerDeletedObjs[callerID] = make(map[resource.Key]T)
+}
+
+// Diff returns a list of items that have been upserted (updated or inserted) and deleted
+// since InitDiff or the last call to Diff with the same callerID.
+// Init(callerID) has to be called before Diff(callerID).
+func (ds *diffStore[T]) Diff(callerID string) (upserted []T, deleted []T, err error) {
 	// Deleting keys doesn't shrink the memory size. So if the size of updateKeys ever reaches above this threshold
 	// we should re-create it to reduce memory usage. Below the threshold, don't bother to avoid unnecessary allocation.
 	// Note: this value is arbitrary, can be changed to tune CPU/Memory tradeoff
 	const shrinkThreshold = 64
-	shrink := len(sd.updatedKeys) > shrinkThreshold
 
-	for k := range sd.updatedKeys {
-		item, found, err := sd.GetByKey(k)
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+
+	if ds.store == nil {
+		return nil, nil, ErrStoreUninitialized
+	}
+
+	updatedKeys, ok := ds.callerUpdatedKeys[callerID]
+	if !ok {
+		return nil, nil, ErrDiffUninitialized
+	}
+	shrink := len(updatedKeys) > shrinkThreshold
+	for k := range updatedKeys {
+		item, found, err := ds.store.GetByKey(k)
 		if err != nil {
 			return nil, nil, err
 		}
 
 		if found {
 			upserted = append(upserted, item)
-		} else {
-			deleted = append(deleted, k)
 		}
-
 		if !shrink {
-			delete(sd.updatedKeys, k)
+			delete(updatedKeys, k)
 		}
 	}
-
 	if shrink {
-		sd.updatedKeys = make(map[resource.Key]bool, shrinkThreshold)
+		ds.callerUpdatedKeys[callerID] = make(updatedKeysMap, shrinkThreshold)
+	}
+
+	deletedObjs, ok := ds.callerDeletedObjs[callerID]
+	if !ok {
+		return nil, nil, ErrDiffUninitialized
+	}
+	shrink = len(deletedObjs) > shrinkThreshold
+	for k, o := range deletedObjs {
+		deleted = append(deleted, o)
+		if !shrink {
+			delete(deletedObjs, k)
+		}
+	}
+	if shrink {
+		ds.callerDeletedObjs[callerID] = make(map[resource.Key]T, shrinkThreshold)
 	}
 
 	return upserted, deleted, err
+}
+
+// CleanupDiff cleans up all caller-specific diff state.
+func (ds *diffStore[T]) CleanupDiff(callerID string) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+
+	delete(ds.callerUpdatedKeys, callerID)
+	delete(ds.callerDeletedObjs, callerID)
+}
+
+// GetByKey returns the latest version of the object with given key.
+func (ds *diffStore[T]) GetByKey(key resource.Key) (item T, exists bool, err error) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+
+	if ds.store == nil {
+		var empty T
+		return empty, false, ErrStoreUninitialized
+	}
+
+	return ds.store.GetByKey(key)
+}
+
+// List returns all items currently in the store.
+func (ds *diffStore[T]) List() (items []T, err error) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+
+	if ds.store == nil {
+		return nil, ErrStoreUninitialized
+	}
+
+	return ds.store.List(), nil
 }

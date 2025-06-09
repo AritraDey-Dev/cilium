@@ -5,24 +5,27 @@ package connector
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 
-	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/vishvananda/netlink"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/datapath/link"
+	"github.com/cilium/cilium/pkg/datapath/linux/safenetlink"
+	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/mac"
+	"github.com/cilium/cilium/pkg/netns"
 )
 
 // SetupVethRemoteNs renames the netdevice in the target namespace to the
 // provided dstIfName.
-func SetupVethRemoteNs(netNs ns.NetNS, srcIfName, dstIfName string) error {
-	return netNs.Do(func(_ ns.NetNS) error {
+func SetupVethRemoteNs(ns *netns.NetNS, srcIfName, dstIfName string) error {
+	return ns.Do(func() error {
 		err := link.Rename(srcIfName, dstIfName)
 		if err != nil {
-			return fmt.Errorf("failed to rename veth from %q to %q: %s", srcIfName, dstIfName, err)
+			return fmt.Errorf("failed to rename veth from %q to %q: %w", srcIfName, dstIfName, err)
 		}
 		return nil
 	})
@@ -32,7 +35,7 @@ func SetupVethRemoteNs(netNs ns.NetNS, srcIfName, dstIfName string) error {
 // fields such as mac, NodeMac, ifIndex and ifName. Returns a pointer for the created
 // veth, a pointer for the temporary link, the name of the temporary link and error if
 // something fails.
-func SetupVeth(id string, mtu, groIPv6MaxSize, gsoIPv6MaxSize, groIPv4MaxSize, gsoIPv4MaxSize int, ep *models.EndpointChangeRequest) (*netlink.Veth, netlink.Link, string, error) {
+func SetupVeth(defaultLogger *slog.Logger, id string, mtu, groIPv6MaxSize, gsoIPv6MaxSize, groIPv4MaxSize, gsoIPv4MaxSize int, ep *models.EndpointChangeRequest, sysctl sysctl.Sysctl) (*netlink.Veth, netlink.Link, string, error) {
 	if id == "" {
 		return nil, nil, "", fmt.Errorf("invalid: empty ID")
 	}
@@ -40,15 +43,16 @@ func SetupVeth(id string, mtu, groIPv6MaxSize, gsoIPv6MaxSize, groIPv4MaxSize, g
 	lxcIfName := Endpoint2IfName(id)
 	tmpIfName := Endpoint2TempIfName(id)
 
-	veth, link, err := SetupVethWithNames(lxcIfName, tmpIfName, mtu,
-		groIPv6MaxSize, gsoIPv6MaxSize, groIPv4MaxSize, gsoIPv4MaxSize, ep)
+	veth, link, err := SetupVethWithNames(defaultLogger, lxcIfName, tmpIfName, mtu,
+		groIPv6MaxSize, gsoIPv6MaxSize, groIPv4MaxSize, gsoIPv4MaxSize, ep, sysctl)
 	return veth, link, tmpIfName, err
 }
 
 // SetupVethWithNames sets up the net interface, the peer interface and fills up some endpoint
 // fields such as mac, NodeMac, ifIndex and ifName. Returns a pointer for the created
 // veth, a pointer for the peer link and error if something fails.
-func SetupVethWithNames(lxcIfName, peerIfName string, mtu, groIPv6MaxSize, gsoIPv6MaxSize, groIPv4MaxSize, gsoIPv4MaxSize int, ep *models.EndpointChangeRequest) (*netlink.Veth, netlink.Link, error) {
+func SetupVethWithNames(defaultLogger *slog.Logger, lxcIfName, peerIfName string, mtu, groIPv6MaxSize, gsoIPv6MaxSize, groIPv4MaxSize, gsoIPv4MaxSize int, ep *models.EndpointChangeRequest, sysctl sysctl.Sysctl) (*netlink.Veth, netlink.Link, error) {
+	logger := defaultLogger.With(logfields.LogSubsys, "endpoint-connector")
 	// systemd 242+ tries to set a "persistent" MAC addr for any virtual device
 	// by default (controlled by MACAddressPolicy). As setting happens
 	// asynchronously after a device has been created, ep.Mac and ep.HostMac
@@ -59,11 +63,11 @@ func SetupVethWithNames(lxcIfName, peerIfName string, mtu, groIPv6MaxSize, gsoIP
 	// the addrs.
 	epHostMAC, err := mac.GenerateRandMAC()
 	if err != nil {
-		return nil, nil, fmt.Errorf("unable to generate rnd mac addr: %s", err)
+		return nil, nil, fmt.Errorf("unable to generate rnd mac addr: %w", err)
 	}
 	epLXCMAC, err := mac.GenerateRandMAC()
 	if err != nil {
-		return nil, nil, fmt.Errorf("unable to generate rnd mac addr: %s", err)
+		return nil, nil, fmt.Errorf("unable to generate rnd mac addr: %w", err)
 	}
 
 	veth := &netlink.Veth{
@@ -77,46 +81,51 @@ func SetupVethWithNames(lxcIfName, peerIfName string, mtu, groIPv6MaxSize, gsoIP
 	}
 
 	if err := netlink.LinkAdd(veth); err != nil {
-		return nil, nil, fmt.Errorf("unable to create veth pair: %s", err)
+		return nil, nil, fmt.Errorf("unable to create veth pair: %w", err)
 	}
 	defer func() {
 		if err != nil {
 			if err = netlink.LinkDel(veth); err != nil {
-				log.WithError(err).WithField(logfields.Veth, veth.Name).Warn("failed to clean up veth")
+				logger.Warn("failed to clean up veth",
+					logfields.Error, err,
+					logfields.Veth, veth.Name,
+				)
 			}
 		}
 	}()
 
-	log.WithField(logfields.VethPair, []string{veth.PeerName, lxcIfName}).Debug("Created veth pair")
+	logger.Debug("Created veth pair",
+		logfields.VethPair, []string{veth.PeerName, lxcIfName},
+	)
 
 	// Disable reverse path filter on the host side veth peer to allow
 	// container addresses to be used as source address when the linux
 	// stack performs routing.
-	err = DisableRpFilter(lxcIfName)
+	err = DisableRpFilter(sysctl, lxcIfName)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	peer, err := netlink.LinkByName(peerIfName)
+	peer, err := safenetlink.LinkByName(peerIfName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("unable to lookup veth peer just created: %s", err)
+		return nil, nil, fmt.Errorf("unable to lookup veth peer just created: %w", err)
 	}
 
 	if err = netlink.LinkSetMTU(peer, mtu); err != nil {
-		return nil, nil, fmt.Errorf("unable to set MTU to %q: %s", peerIfName, err)
+		return nil, nil, fmt.Errorf("unable to set MTU to %q: %w", peerIfName, err)
 	}
 
-	hostVeth, err := netlink.LinkByName(lxcIfName)
+	hostVeth, err := safenetlink.LinkByName(lxcIfName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("unable to lookup veth just created: %s", err)
+		return nil, nil, fmt.Errorf("unable to lookup veth just created: %w", err)
 	}
 
 	if err = netlink.LinkSetMTU(hostVeth, mtu); err != nil {
-		return nil, nil, fmt.Errorf("unable to set MTU to %q: %s", lxcIfName, err)
+		return nil, nil, fmt.Errorf("unable to set MTU to %q: %w", lxcIfName, err)
 	}
 
 	if err = netlink.LinkSetUp(veth); err != nil {
-		return nil, nil, fmt.Errorf("unable to bring up veth pair: %s", err)
+		return nil, nil, fmt.Errorf("unable to bring up veth pair: %w", err)
 	}
 
 	if groIPv6MaxSize > 0 {

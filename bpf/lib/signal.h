@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_SIGNAL_H_
-#define __LIB_SIGNAL_H_
+#pragma once
 
 #include <bpf/api.h>
 #include <lib/common.h>
@@ -12,8 +11,7 @@ struct {
 	__uint(key_size, sizeof(__u32));
 	__uint(value_size, sizeof(__u32));
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
-	__uint(max_entries, __NR_CPUS__);
-} SIGNAL_MAP __section_maps_btf;
+} cilium_signals __section_maps_btf;
 
 enum {
 	SIGNAL_NAT_FILL_UP = 0,
@@ -47,7 +45,7 @@ struct signal_msg {
 		.signal_nr	= (SIGNAL),				\
 		.MEMBER		= (VALUE),				\
 	};								\
-	ctx_event_output((CTX), &SIGNAL_MAP, BPF_F_CURRENT_CPU, &msg,	\
+	ctx_event_output((CTX), &cilium_signals, BPF_F_CURRENT_CPU, &msg,	\
 			 sizeof(msg.signal_nr) + sizeof(msg.MEMBER));	\
   }
 
@@ -68,5 +66,3 @@ static __always_inline void send_signal_auth_required(struct __ctx_buff *ctx,
 {
 	SEND_SIGNAL(ctx, SIGNAL_AUTH_REQUIRED, auth, *auth);
 }
-
-#endif /* __LIB_SIGNAL_H_ */

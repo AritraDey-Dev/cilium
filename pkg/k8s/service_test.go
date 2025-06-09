@@ -5,134 +5,153 @@ package k8s
 
 import (
 	"net"
+	"net/netip"
 	"reflect"
 	"testing"
 
-	check "github.com/cilium/checkmate"
+	"github.com/cilium/hive/hivetest"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/cilium/cilium/pkg/checker"
+	"github.com/cilium/cilium/pkg/annotation"
 	"github.com/cilium/cilium/pkg/cidr"
+	serviceStore "github.com/cilium/cilium/pkg/clustermesh/store"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
-	fakeDatapath "github.com/cilium/cilium/pkg/datapath/fake"
+	fakeTypes "github.com/cilium/cilium/pkg/datapath/fake/types"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	"github.com/cilium/cilium/pkg/loadbalancer"
+	"github.com/cilium/cilium/pkg/node"
+	"github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
-	serviceStore "github.com/cilium/cilium/pkg/service/store"
 )
 
-func (s *K8sSuite) TestGetAnnotationIncludeExternal(c *check.C) {
-	svc := &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
-		Name: "foo",
+func TestGetTopologyAware(t *testing.T) {
+	tests := []struct {
+		name                string
+		annotations         map[string]string
+		trafficDistribution string
+		expectTopologyAware bool
+	}{{
+		name: "hints annotation == auto",
+		annotations: map[string]string{
+			corev1.DeprecatedAnnotationTopologyAwareHints: "auto",
+		},
+		expectTopologyAware: true,
+	}, {
+		name: "hints annotation == Auto",
+		annotations: map[string]string{
+			corev1.DeprecatedAnnotationTopologyAwareHints: "Auto",
+		},
+		expectTopologyAware: true,
+	}, {
+		name: "hints annotation == Disabled",
+		annotations: map[string]string{
+			corev1.DeprecatedAnnotationTopologyAwareHints: "Disabled",
+		},
+		expectTopologyAware: false,
+	}, {
+		name: "mode annotation == auto",
+		annotations: map[string]string{
+			corev1.AnnotationTopologyMode: "auto",
+		},
+		expectTopologyAware: true,
+	}, {
+		name: "mode annotation == Auto",
+		annotations: map[string]string{
+			corev1.AnnotationTopologyMode: "Auto",
+		},
+		expectTopologyAware: true,
+	}, {
+		name: "mode annotation == Disabled",
+		annotations: map[string]string{
+			corev1.AnnotationTopologyMode: "Disabled",
+		},
+		expectTopologyAware: false,
+	}, {
+		name: "mode annotation == example.com/custom",
+		annotations: map[string]string{
+			corev1.AnnotationTopologyMode: "example.com/custom",
+		},
+		expectTopologyAware: true,
+	}, {
+		name:                "trafficDistribution == PreferClose",
+		trafficDistribution: corev1.ServiceTrafficDistributionPreferClose,
+		expectTopologyAware: true,
+	}, {
+		name:                "trafficDistribution == SomethingElse",
+		trafficDistribution: "SomethingElse",
+		expectTopologyAware: false,
+	}, {
+		name: "mode annotation == Disabled, trafficDistribution == PreferClose",
+		annotations: map[string]string{
+			corev1.AnnotationTopologyMode: "Disabled",
+		},
+		trafficDistribution: corev1.ServiceTrafficDistributionPreferClose,
+		expectTopologyAware: true,
+	}, {
+		name: "hints annotation == Disabled, trafficDistribution == PreferClose",
+		annotations: map[string]string{
+			corev1.DeprecatedAnnotationTopologyAwareHints: "Disabled",
+		},
+		trafficDistribution: corev1.ServiceTrafficDistributionPreferClose,
+		expectTopologyAware: true,
 	}}
-	c.Assert(getAnnotationIncludeExternal(svc), check.Equals, false)
 
-	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
-		Annotations: map[string]string{"service.cilium.io/global": "True"},
-	}}
-	c.Assert(getAnnotationIncludeExternal(svc), check.Equals, true)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &slim_corev1.Service{
+				ObjectMeta: slim_metav1.ObjectMeta{
+					Annotations: map[string]string{},
+				},
+				Spec: slim_corev1.ServiceSpec{},
+			}
+			if tc.annotations != nil {
+				svc.Annotations = tc.annotations
+			}
+			if tc.trafficDistribution != "" {
+				svc.Spec.TrafficDistribution = &tc.trafficDistribution
+			}
 
-	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
-		Annotations: map[string]string{"service.cilium.io/global": "false"},
-	}}
-	c.Assert(getAnnotationIncludeExternal(svc), check.Equals, false)
-
-	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
-		Annotations: map[string]string{"service.cilium.io/global": ""},
-	}}
-	c.Assert(getAnnotationIncludeExternal(svc), check.Equals, false)
-
-	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
-		Annotations: map[string]string{"io.cilium/global-service": "True"},
-	}}
-	c.Assert(getAnnotationIncludeExternal(svc), check.Equals, true)
+			require.Equal(t, tc.expectTopologyAware, getTopologyAware(svc))
+		})
+	}
 }
 
-func (s *K8sSuite) TestGetAnnotationShared(c *check.C) {
+func TestGetAnnotationTopologyAwareHints(t *testing.T) {
 	svc := &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
-		Name: "foo",
-	}}
-	c.Assert(getAnnotationShared(svc), check.Equals, false)
-	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
-		Annotations: map[string]string{"service.cilium.io/global": "true"},
-	}}
-	c.Assert(getAnnotationShared(svc), check.Equals, true)
-
-	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
-		Annotations: map[string]string{"service.cilium.io/shared": "true"},
-	}}
-	c.Assert(getAnnotationShared(svc), check.Equals, false)
-
-	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
-		Annotations: map[string]string{"service.cilium.io/global": "true", "service.cilium.io/shared": "True"},
-	}}
-	c.Assert(getAnnotationShared(svc), check.Equals, true)
-
-	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
-		Annotations: map[string]string{"service.cilium.io/global": "true", "service.cilium.io/shared": "false"},
-	}}
-	c.Assert(getAnnotationShared(svc), check.Equals, false)
-
-	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
-		Annotations: map[string]string{"service.cilium.io/global": "true", "io.cilium/shared-service": "false"},
-	}}
-	c.Assert(getAnnotationShared(svc), check.Equals, false)
-}
-
-func (s *K8sSuite) TestGetAnnotationServiceAffinity(c *check.C) {
-	svc := &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
-		Annotations: map[string]string{"service.cilium.io/global": "true", "service.cilium.io/affinity": "local"},
-	}}
-	c.Assert(getAnnotationServiceAffinity(svc), check.Equals, serviceAffinityLocal)
-
-	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
-		Annotations: map[string]string{"service.cilium.io/global": "true", "service.cilium.io/affinity": "remote"},
-	}}
-	c.Assert(getAnnotationServiceAffinity(svc), check.Equals, serviceAffinityRemote)
-
-	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
-		Annotations: map[string]string{"service.cilium.io/global": "true", "io.cilium/service-affinity": "local"},
-	}}
-	c.Assert(getAnnotationServiceAffinity(svc), check.Equals, serviceAffinityLocal)
-
-	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
-		Annotations: map[string]string{"service.cilium.io/affinity": "remote"},
-	}}
-	c.Assert(getAnnotationServiceAffinity(svc), check.Equals, serviceAffinityNone)
-
-	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
 		Annotations: map[string]string{},
 	}}
-	c.Assert(getAnnotationServiceAffinity(svc), check.Equals, serviceAffinityNone)
-}
-
-func (s *K8sSuite) TestGetAnnotationTopologyAwareHints(c *check.C) {
-	svc := &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
-		Annotations: map[string]string{},
-	}}
-	c.Assert(getAnnotationTopologyAwareHints(svc), check.Equals, false)
+	require.False(t, getAnnotationTopologyAwareHints(svc))
 
 	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
 		Annotations: map[string]string{
 			corev1.DeprecatedAnnotationTopologyAwareHints: "auto",
 		},
 	}}
-	c.Assert(getAnnotationTopologyAwareHints(svc), check.Equals, true)
+	require.True(t, getAnnotationTopologyAwareHints(svc))
 
 	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
 		Annotations: map[string]string{
 			corev1.DeprecatedAnnotationTopologyAwareHints: "Auto",
 		},
 	}}
-	c.Assert(getAnnotationTopologyAwareHints(svc), check.Equals, true)
+	require.True(t, getAnnotationTopologyAwareHints(svc))
 
 	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
 		Annotations: map[string]string{
 			corev1.AnnotationTopologyMode: "auto",
 		},
 	}}
-	c.Assert(getAnnotationTopologyAwareHints(svc), check.Equals, true)
+	require.True(t, getAnnotationTopologyAwareHints(svc))
+
+	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
+		Annotations: map[string]string{
+			corev1.AnnotationTopologyMode: "PreferZone",
+		},
+	}}
+	require.True(t, getAnnotationTopologyAwareHints(svc))
 
 	// v1.DeprecatedAnnotationTopologyAwareHints has precedence over v1.AnnotationTopologyMode.
 	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
@@ -141,7 +160,7 @@ func (s *K8sSuite) TestGetAnnotationTopologyAwareHints(c *check.C) {
 			corev1.AnnotationTopologyMode:                 "auto",
 		},
 	}}
-	c.Assert(getAnnotationTopologyAwareHints(svc), check.Equals, false)
+	require.False(t, getAnnotationTopologyAwareHints(svc))
 
 	svc = &slim_corev1.Service{ObjectMeta: slim_metav1.ObjectMeta{
 		Annotations: map[string]string{
@@ -149,11 +168,10 @@ func (s *K8sSuite) TestGetAnnotationTopologyAwareHints(c *check.C) {
 			corev1.AnnotationTopologyMode:                 "deprecated",
 		},
 	}}
-	c.Assert(getAnnotationTopologyAwareHints(svc), check.Equals, true)
-
+	require.True(t, getAnnotationTopologyAwareHints(svc))
 }
 
-func (s *K8sSuite) TestParseServiceID(c *check.C) {
+func TestParseServiceID(t *testing.T) {
 	svc := &slim_corev1.Service{
 		ObjectMeta: slim_metav1.ObjectMeta{
 			Name:      "foo",
@@ -161,10 +179,101 @@ func (s *K8sSuite) TestParseServiceID(c *check.C) {
 		},
 	}
 
-	c.Assert(ParseServiceID(svc), checker.DeepEquals, ServiceID{Namespace: "bar", Name: "foo"})
+	require.Equal(t, ServiceID{Namespace: "bar", Name: "foo"}, ParseServiceID(svc))
 }
 
-func (s *K8sSuite) TestParseService(c *check.C) {
+func TestParseServiceWithServiceTypeExposure(t *testing.T) {
+	objMeta := slim_metav1.ObjectMeta{
+		Name:      "foo",
+		Namespace: "bar",
+		Labels: map[string]string{
+			"foo": "bar",
+		},
+		Annotations: map[string]string{},
+	}
+
+	k8sSvc := &slim_corev1.Service{
+		ObjectMeta: objMeta,
+		Spec: slim_corev1.ServiceSpec{
+			ClusterIP: "10.96.0.1",
+			Type:      slim_corev1.ServiceTypeLoadBalancer,
+			Ports: []slim_corev1.ServicePort{
+				{
+					Name:     "http",
+					Port:     80,
+					NodePort: 31111,
+					Protocol: slim_corev1.ProtocolTCP,
+				},
+			},
+		},
+		Status: slim_corev1.ServiceStatus{
+			LoadBalancer: slim_corev1.LoadBalancerStatus{
+				Ingress: []slim_corev1.LoadBalancerIngress{
+					{IP: "3.3.3.3"},
+				},
+			},
+		},
+	}
+
+	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4InternalAddress)
+	addrs := []netip.Addr{
+		ipv4InternalAddrCluster.Addr(),
+	}
+
+	oldNodePort := option.Config.EnableNodePort
+	option.Config.EnableNodePort = true
+	defer func() {
+		option.Config.EnableNodePort = oldNodePort
+	}()
+
+	lbcfg := loadbalancer.DefaultConfig
+
+	_, svc := ParseService(hivetest.Logger(t), lbcfg, k8sSvc, addrs)
+	require.Len(t, svc.FrontendIPs, 1)
+	require.Len(t, svc.NodePorts, 1)
+	require.Len(t, svc.LoadBalancerIPs, 1)
+
+	// Expose only ClusterIP
+
+	k8sSvc.Annotations[annotation.ServiceTypeExposure] = "ClusterIP"
+	_, svc = ParseService(hivetest.Logger(t), lbcfg, k8sSvc, addrs)
+	require.Len(t, svc.FrontendIPs, 1)
+	require.Empty(t, svc.NodePorts)
+	require.Empty(t, svc.LoadBalancerIPs)
+	require.Len(t, svc.Ports, 1)
+
+	// Expose only NodePort
+
+	k8sSvc.Annotations[annotation.ServiceTypeExposure] = "NodePort"
+	_, svc = ParseService(hivetest.Logger(t), lbcfg, k8sSvc, addrs)
+	require.Empty(t, svc.FrontendIPs)
+	require.Len(t, svc.NodePorts, 1)
+	require.Empty(t, svc.LoadBalancerIPs)
+	require.Len(t, svc.Ports, 1)
+
+	// Expose only LoadBalancer
+
+	k8sSvc.Annotations[annotation.ServiceTypeExposure] = "LoadBalancer"
+	_, svc = ParseService(hivetest.Logger(t), lbcfg, k8sSvc, addrs)
+	require.Empty(t, svc.FrontendIPs)
+	require.Empty(t, svc.NodePorts)
+	require.Len(t, svc.LoadBalancerIPs, 1)
+	require.Len(t, svc.Ports, 1)
+
+	// Expose all
+
+	delete(k8sSvc.Annotations, annotation.ServiceTypeExposure)
+	_, svc = ParseService(hivetest.Logger(t), lbcfg, k8sSvc, addrs)
+	require.Len(t, svc.FrontendIPs, 1)
+	require.Len(t, svc.NodePorts, 1)
+	require.Len(t, svc.LoadBalancerIPs, 1)
+	require.Len(t, svc.Ports, 1)
+}
+
+func TestParseService(t *testing.T) {
+	lbcfg := loadbalancer.DefaultConfig
+	lbcfg.LBMode = loadbalancer.LBModeSNAT
+
 	objMeta := slim_metav1.ObjectMeta{
 		Name:      "foo",
 		Namespace: "bar",
@@ -184,9 +293,9 @@ func (s *K8sSuite) TestParseService(c *check.C) {
 		},
 	}
 
-	id, svc := ParseService(k8sSvc, fakeDatapath.NewNodeAddressing())
-	c.Assert(id, checker.DeepEquals, ServiceID{Namespace: "bar", Name: "foo"})
-	c.Assert(svc, checker.DeepEquals, &Service{
+	id, svc := ParseService(hivetest.Logger(t), lbcfg, k8sSvc, nil)
+	require.Equal(t, ServiceID{Namespace: "bar", Name: "foo"}, id)
+	require.Equal(t, &Service{
 		ExtTrafficPolicy:         loadbalancer.SVCTrafficPolicyCluster,
 		IntTrafficPolicy:         loadbalancer.SVCTrafficPolicyCluster,
 		FrontendIPs:              []net.IP{net.ParseIP("127.0.0.1")},
@@ -195,8 +304,12 @@ func (s *K8sSuite) TestParseService(c *check.C) {
 		Ports:                    map[loadbalancer.FEPortName]*loadbalancer.L4Addr{},
 		NodePorts:                map[loadbalancer.FEPortName]NodePortToFrontend{},
 		LoadBalancerSourceRanges: map[string]*cidr.CIDR{},
+		SourceRangesPolicy:       loadbalancer.SVCSourceRangesPolicyAllow,
+		ProxyDelegation:          loadbalancer.SVCProxyDelegationNone,
 		Type:                     loadbalancer.SVCTypeClusterIP,
-	})
+		ForwardingMode:           loadbalancer.SVCForwardingModeSNAT,
+		LoadBalancerAlgorithm:    loadbalancer.SVCLoadBalancingAlgorithmRandom,
+	}, svc)
 
 	k8sSvc = &slim_corev1.Service{
 		ObjectMeta: objMeta,
@@ -206,9 +319,9 @@ func (s *K8sSuite) TestParseService(c *check.C) {
 		},
 	}
 
-	id, svc = ParseService(k8sSvc, fakeDatapath.NewNodeAddressing())
-	c.Assert(id, checker.DeepEquals, ServiceID{Namespace: "bar", Name: "foo"})
-	c.Assert(svc, checker.DeepEquals, &Service{
+	id, svc = ParseService(hivetest.Logger(t), lbcfg, k8sSvc, nil)
+	require.Equal(t, ServiceID{Namespace: "bar", Name: "foo"}, id)
+	require.Equal(t, &Service{
 		IsHeadless:               true,
 		ExtTrafficPolicy:         loadbalancer.SVCTrafficPolicyCluster,
 		IntTrafficPolicy:         loadbalancer.SVCTrafficPolicyCluster,
@@ -216,8 +329,39 @@ func (s *K8sSuite) TestParseService(c *check.C) {
 		Ports:                    map[loadbalancer.FEPortName]*loadbalancer.L4Addr{},
 		NodePorts:                map[loadbalancer.FEPortName]NodePortToFrontend{},
 		LoadBalancerSourceRanges: map[string]*cidr.CIDR{},
+		SourceRangesPolicy:       loadbalancer.SVCSourceRangesPolicyAllow,
+		ProxyDelegation:          loadbalancer.SVCProxyDelegationNone,
 		Type:                     loadbalancer.SVCTypeClusterIP,
-	})
+		ForwardingMode:           loadbalancer.SVCForwardingModeSNAT,
+		LoadBalancerAlgorithm:    loadbalancer.SVCLoadBalancingAlgorithmRandom,
+	}, svc)
+
+	k8sSvc = &slim_corev1.Service{
+		ObjectMeta: *objMeta.DeepCopy(),
+		Spec: slim_corev1.ServiceSpec{
+			Type:      slim_corev1.ServiceTypeClusterIP,
+			ClusterIP: "127.0.0.1",
+		},
+	}
+	k8sSvc.ObjectMeta.Labels[corev1.IsHeadlessService] = ""
+
+	id, svc = ParseService(hivetest.Logger(t), lbcfg, k8sSvc, nil)
+	require.Equal(t, ServiceID{Namespace: "bar", Name: "foo"}, id)
+	require.Equal(t, &Service{
+		IsHeadless:               true,
+		ExtTrafficPolicy:         loadbalancer.SVCTrafficPolicyCluster,
+		IntTrafficPolicy:         loadbalancer.SVCTrafficPolicyCluster,
+		FrontendIPs:              []net.IP{net.ParseIP("127.0.0.1")},
+		Labels:                   map[string]string{"foo": "bar", corev1.IsHeadlessService: ""},
+		Ports:                    map[loadbalancer.FEPortName]*loadbalancer.L4Addr{},
+		NodePorts:                map[loadbalancer.FEPortName]NodePortToFrontend{},
+		LoadBalancerSourceRanges: map[string]*cidr.CIDR{},
+		SourceRangesPolicy:       loadbalancer.SVCSourceRangesPolicyAllow,
+		ProxyDelegation:          loadbalancer.SVCProxyDelegationNone,
+		Type:                     loadbalancer.SVCTypeClusterIP,
+		ForwardingMode:           loadbalancer.SVCForwardingModeSNAT,
+		LoadBalancerAlgorithm:    loadbalancer.SVCLoadBalancingAlgorithmRandom,
+	}, svc)
 
 	serviceInternalTrafficPolicyLocal := slim_corev1.ServiceInternalTrafficPolicyLocal
 	k8sSvc = &slim_corev1.Service{
@@ -230,9 +374,9 @@ func (s *K8sSuite) TestParseService(c *check.C) {
 		},
 	}
 
-	id, svc = ParseService(k8sSvc, fakeDatapath.NewNodeAddressing())
-	c.Assert(id, checker.DeepEquals, ServiceID{Namespace: "bar", Name: "foo"})
-	c.Assert(svc, checker.DeepEquals, &Service{
+	id, svc = ParseService(hivetest.Logger(t), lbcfg, k8sSvc, nil)
+	require.Equal(t, ServiceID{Namespace: "bar", Name: "foo"}, id)
+	require.Equal(t, &Service{
 		FrontendIPs:              []net.IP{net.ParseIP("127.0.0.1")},
 		ExtTrafficPolicy:         loadbalancer.SVCTrafficPolicyLocal,
 		IntTrafficPolicy:         loadbalancer.SVCTrafficPolicyLocal,
@@ -240,8 +384,12 @@ func (s *K8sSuite) TestParseService(c *check.C) {
 		Ports:                    map[loadbalancer.FEPortName]*loadbalancer.L4Addr{},
 		NodePorts:                map[loadbalancer.FEPortName]NodePortToFrontend{},
 		LoadBalancerSourceRanges: map[string]*cidr.CIDR{},
+		SourceRangesPolicy:       loadbalancer.SVCSourceRangesPolicyAllow,
+		ProxyDelegation:          loadbalancer.SVCProxyDelegationNone,
 		Type:                     loadbalancer.SVCTypeNodePort,
-	})
+		ForwardingMode:           loadbalancer.SVCForwardingModeSNAT,
+		LoadBalancerAlgorithm:    loadbalancer.SVCLoadBalancingAlgorithmRandom,
+	}, svc)
 
 	oldNodePort := option.Config.EnableNodePort
 	option.Config.EnableNodePort = true
@@ -251,6 +399,160 @@ func (s *K8sSuite) TestParseService(c *check.C) {
 	objMeta.Annotations = map[string]string{
 		corev1.DeprecatedAnnotationTopologyAwareHints: "auto",
 	}
+	loadbalancerIngressIP := "127.0.0.1"
+	k8sSvc = &slim_corev1.Service{
+		ObjectMeta: objMeta,
+		Spec: slim_corev1.ServiceSpec{
+			ClusterIP: "127.0.0.1",
+			Type:      slim_corev1.ServiceTypeLoadBalancer,
+			Ports: []slim_corev1.ServicePort{
+				{
+					Name:     "http",
+					Port:     80,
+					NodePort: 31111,
+					Protocol: slim_corev1.ProtocolTCP,
+				},
+				{
+					// NodePort should not be allocated for this entry.
+					Name:     "tftp",
+					Port:     69,
+					NodePort: 0,
+					Protocol: slim_corev1.ProtocolUDP,
+				},
+			},
+		},
+		Status: slim_corev1.ServiceStatus{
+			LoadBalancer: slim_corev1.LoadBalancerStatus{
+				Ingress: []slim_corev1.LoadBalancerIngress{
+					{
+						IP: loadbalancerIngressIP,
+					},
+				},
+			},
+		},
+	}
+
+	ipv4ZeroAddrCluster := cmtypes.MustParseAddrCluster("0.0.0.0")
+	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4InternalAddress)
+	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeTypes.IPv4NodePortAddress)
+
+	lbID := loadbalancer.ID(0)
+	tcpProto := loadbalancer.L4Type(slim_corev1.ProtocolTCP)
+	zeroFE := loadbalancer.NewL3n4AddrID(tcpProto, ipv4ZeroAddrCluster, 31111,
+		loadbalancer.ScopeExternal, lbID)
+	internalFE := loadbalancer.NewL3n4AddrID(tcpProto, ipv4InternalAddrCluster, 31111,
+		loadbalancer.ScopeExternal, lbID)
+	nodePortFE := loadbalancer.NewL3n4AddrID(tcpProto, ipv4NodePortAddrCluster, 31111,
+		loadbalancer.ScopeExternal, lbID)
+
+	addrs := []netip.Addr{
+		ipv4InternalAddrCluster.Addr(),
+		ipv4NodePortAddrCluster.Addr(),
+	}
+
+	lbcfg.AlgorithmAnnotation = true
+	lbcfg.LBAlgorithm = loadbalancer.LBAlgorithmMaglev
+
+	id, svc = ParseService(hivetest.Logger(t), lbcfg, k8sSvc, addrs)
+	require.Equal(t, ServiceID{Namespace: "bar", Name: "foo"}, id)
+	require.Equal(t, &Service{
+		FrontendIPs: []net.IP{net.ParseIP("127.0.0.1")},
+		Labels:      map[string]string{"foo": "bar"},
+		Ports: map[loadbalancer.FEPortName]*loadbalancer.L4Addr{
+			"http": loadbalancer.NewL4Addr(loadbalancer.L4Type(slim_corev1.ProtocolTCP), uint16(80)),
+			"tftp": loadbalancer.NewL4Addr(loadbalancer.L4Type(slim_corev1.ProtocolUDP), uint16(69)),
+		},
+		ExtTrafficPolicy: loadbalancer.SVCTrafficPolicyCluster,
+		IntTrafficPolicy: loadbalancer.SVCTrafficPolicyCluster,
+		NodePorts: map[loadbalancer.FEPortName]NodePortToFrontend{
+			"http": {
+				zeroFE.String():     zeroFE,
+				internalFE.String(): internalFE,
+				nodePortFE.String(): nodePortFE,
+			},
+		},
+		LoadBalancerSourceRanges: map[string]*cidr.CIDR{},
+		K8sExternalIPs:           map[string]net.IP{},
+		LoadBalancerIPs:          map[string]net.IP{loadbalancerIngressIP: net.ParseIP(loadbalancerIngressIP)},
+		Type:                     loadbalancer.SVCTypeLoadBalancer,
+		TopologyAware:            true,
+		SourceRangesPolicy:       loadbalancer.SVCSourceRangesPolicyAllow,
+		ProxyDelegation:          loadbalancer.SVCProxyDelegationNone,
+		ForwardingMode:           loadbalancer.SVCForwardingModeSNAT,
+		Annotations:              map[string]string{"service.kubernetes.io/topology-aware-hints": "auto"},
+		LoadBalancerAlgorithm:    loadbalancer.SVCLoadBalancingAlgorithmMaglev,
+	}, svc)
+
+	objMeta.Annotations[annotation.ServiceLoadBalancingAlgorithm] = loadbalancer.LBAlgorithmRandom
+
+	ipMode := slim_corev1.LoadBalancerIPModeProxy
+	k8sSvc = &slim_corev1.Service{
+		ObjectMeta: objMeta,
+		Spec: slim_corev1.ServiceSpec{
+			ClusterIP: "127.0.0.1",
+			Type:      slim_corev1.ServiceTypeLoadBalancer,
+			Ports: []slim_corev1.ServicePort{
+				{
+					Name:     "http",
+					Port:     80,
+					NodePort: 31111,
+					Protocol: slim_corev1.ProtocolTCP,
+				},
+				{
+					// NodePort should not be allocated for this entry.
+					Name:     "tftp",
+					Port:     69,
+					NodePort: 0,
+					Protocol: slim_corev1.ProtocolUDP,
+				},
+			},
+		},
+		Status: slim_corev1.ServiceStatus{
+			LoadBalancer: slim_corev1.LoadBalancerStatus{
+				Ingress: []slim_corev1.LoadBalancerIngress{
+					{
+						IP:     loadbalancerIngressIP,
+						IPMode: &ipMode,
+					},
+				},
+			},
+		},
+	}
+	id, svc = ParseService(hivetest.Logger(t), lbcfg, k8sSvc, addrs)
+	require.Equal(t, ServiceID{Namespace: "bar", Name: "foo"}, id)
+	require.Equal(t, &Service{
+		FrontendIPs: []net.IP{net.ParseIP("127.0.0.1")},
+		Labels:      map[string]string{"foo": "bar"},
+		Ports: map[loadbalancer.FEPortName]*loadbalancer.L4Addr{
+			"http": loadbalancer.NewL4Addr(loadbalancer.L4Type(slim_corev1.ProtocolTCP), uint16(80)),
+			"tftp": loadbalancer.NewL4Addr(loadbalancer.L4Type(slim_corev1.ProtocolUDP), uint16(69)),
+		},
+		ExtTrafficPolicy: loadbalancer.SVCTrafficPolicyCluster,
+		IntTrafficPolicy: loadbalancer.SVCTrafficPolicyCluster,
+		NodePorts: map[loadbalancer.FEPortName]NodePortToFrontend{
+			"http": {
+				zeroFE.String():     zeroFE,
+				internalFE.String(): internalFE,
+				nodePortFE.String(): nodePortFE,
+			},
+		},
+		LoadBalancerSourceRanges: map[string]*cidr.CIDR{},
+		K8sExternalIPs:           map[string]net.IP{},
+		LoadBalancerIPs:          map[string]net.IP{},
+		SourceRangesPolicy:       loadbalancer.SVCSourceRangesPolicyAllow,
+		ProxyDelegation:          loadbalancer.SVCProxyDelegationNone,
+		Type:                     loadbalancer.SVCTypeLoadBalancer,
+		ForwardingMode:           loadbalancer.SVCForwardingModeSNAT,
+		TopologyAware:            true,
+		Annotations: map[string]string{
+			"service.kubernetes.io/topology-aware-hints": "auto",
+			annotation.ServiceLoadBalancingAlgorithm:     loadbalancer.LBAlgorithmRandom,
+		},
+		LoadBalancerAlgorithm: loadbalancer.SVCLoadBalancingAlgorithmRandom,
+	}, svc)
+
+	// Same as the previous test, but LB service status is empty.
+	// This is to simulate the delay while waiting for cloud provider to assign IP.
 	k8sSvc = &slim_corev1.Service{
 		ObjectMeta: objMeta,
 		Spec: slim_corev1.ServiceSpec{
@@ -273,23 +575,9 @@ func (s *K8sSuite) TestParseService(c *check.C) {
 			},
 		},
 	}
-
-	ipv4ZeroAddrCluster := cmtypes.MustParseAddrCluster("0.0.0.0")
-	ipv4InternalAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4InternalAddress)
-	ipv4NodePortAddrCluster := cmtypes.MustAddrClusterFromIP(fakeDatapath.IPv4NodePortAddress)
-
-	lbID := loadbalancer.ID(0)
-	tcpProto := loadbalancer.L4Type(slim_corev1.ProtocolTCP)
-	zeroFE := loadbalancer.NewL3n4AddrID(tcpProto, ipv4ZeroAddrCluster, 31111,
-		loadbalancer.ScopeExternal, lbID)
-	internalFE := loadbalancer.NewL3n4AddrID(tcpProto, ipv4InternalAddrCluster, 31111,
-		loadbalancer.ScopeExternal, lbID)
-	nodePortFE := loadbalancer.NewL3n4AddrID(tcpProto, ipv4NodePortAddrCluster, 31111,
-		loadbalancer.ScopeExternal, lbID)
-
-	id, svc = ParseService(k8sSvc, fakeDatapath.NewIPv4OnlyNodeAddressing())
-	c.Assert(id, checker.DeepEquals, ServiceID{Namespace: "bar", Name: "foo"})
-	c.Assert(svc, checker.DeepEquals, &Service{
+	id, svc = ParseService(hivetest.Logger(t), lbcfg, k8sSvc, addrs)
+	require.Equal(t, ServiceID{Namespace: "bar", Name: "foo"}, id)
+	require.Equal(t, &Service{
 		FrontendIPs: []net.IP{net.ParseIP("127.0.0.1")},
 		Labels:      map[string]string{"foo": "bar"},
 		Ports: map[loadbalancer.FEPortName]*loadbalancer.L4Addr{
@@ -308,30 +596,38 @@ func (s *K8sSuite) TestParseService(c *check.C) {
 		LoadBalancerSourceRanges: map[string]*cidr.CIDR{},
 		K8sExternalIPs:           map[string]net.IP{},
 		LoadBalancerIPs:          map[string]net.IP{},
+		SourceRangesPolicy:       loadbalancer.SVCSourceRangesPolicyAllow,
+		ProxyDelegation:          loadbalancer.SVCProxyDelegationNone,
 		Type:                     loadbalancer.SVCTypeLoadBalancer,
+		ForwardingMode:           loadbalancer.SVCForwardingModeSNAT,
 		TopologyAware:            true,
-	})
+		Annotations: map[string]string{
+			"service.kubernetes.io/topology-aware-hints": "auto",
+			annotation.ServiceLoadBalancingAlgorithm:     loadbalancer.LBAlgorithmRandom,
+		},
+		LoadBalancerAlgorithm: loadbalancer.SVCLoadBalancingAlgorithmRandom,
+	}, svc)
 }
 
-func (s *K8sSuite) TestIsK8ServiceExternal(c *check.C) {
+func TestIsK8ServiceExternal(t *testing.T) {
 	si := Service{}
 
-	c.Assert(si.IsExternal(), check.Equals, true)
+	require.True(t, si.IsExternal())
 
 	si.Selector = map[string]string{"l": "v"}
-	c.Assert(si.IsExternal(), check.Equals, false)
+	require.False(t, si.IsExternal())
 }
 
-func (s *K8sSuite) TestServiceUniquePorts(c *check.C) {
+func TestServiceUniquePorts(t *testing.T) {
 	type testMatrix struct {
 		input    Service
-		expected map[uint16]bool
+		expected map[string]bool
 	}
 
 	matrix := []testMatrix{
 		{
 			input:    Service{},
-			expected: map[uint16]bool{},
+			expected: map[string]bool{},
 		},
 		{
 			input: Service{
@@ -346,14 +642,15 @@ func (s *K8sSuite) TestServiceUniquePorts(c *check.C) {
 					},
 				},
 			},
-			expected: map[uint16]bool{
-				1: true,
-				2: true,
-			}},
+			expected: map[string]bool{
+				"1/NONE": true,
+				"2/NONE": true,
+			},
+		},
 	}
 
 	for _, m := range matrix {
-		c.Assert(m.input.UniquePorts(), checker.DeepEquals, m.expected)
+		require.Equal(t, m.expected, m.input.UniquePorts())
 	}
 }
 
@@ -901,7 +1198,7 @@ func TestService_Equals(t *testing.T) {
 	}
 }
 
-func (s *K8sSuite) TestServiceString(c *check.C) {
+func TestServiceString(t *testing.T) {
 	tests := []struct {
 		name      string
 		service   *slim_corev1.Service
@@ -961,31 +1258,29 @@ func (s *K8sSuite) TestServiceString(c *check.C) {
 		},
 	}
 
-	nodeAddressing := fakeDatapath.NewNodeAddressing()
 	for _, tt := range tests {
-		_, svc := ParseService(tt.service, nodeAddressing)
-		c.Assert(svc.String(), check.Equals, tt.svcString)
+		_, svc := ParseService(hivetest.Logger(t), loadbalancer.DefaultConfig, tt.service, nil)
+		require.Equal(t, tt.svcString, svc.String())
 	}
 }
 
-func (s *K8sSuite) TestNewClusterService(c *check.C) {
-	id, svc := ParseService(
-		&slim_corev1.Service{
-			ObjectMeta: slim_metav1.ObjectMeta{
-				Name:      "foo",
-				Namespace: "bar",
-				Labels: map[string]string{
-					"foo": "bar",
-				},
+func TestNewClusterService(t *testing.T) {
+	id, svc := ParseService(hivetest.Logger(t), loadbalancer.DefaultConfig, &slim_corev1.Service{
+		ObjectMeta: slim_metav1.ObjectMeta{
+			Name:      "foo",
+			Namespace: "bar",
+			Labels: map[string]string{
+				"foo": "bar",
 			},
-			Spec: slim_corev1.ServiceSpec{
-				ClusterIP: "127.0.0.1",
-				Selector: map[string]string{
-					"foo": "bar",
-				},
-				Type: slim_corev1.ServiceTypeClusterIP,
+		},
+		Spec: slim_corev1.ServiceSpec{
+			ClusterIP: "127.0.0.1",
+			Selector: map[string]string{
+				"foo": "bar",
 			},
-		}, fakeDatapath.NewNodeAddressing())
+			Type: slim_corev1.ServiceTypeClusterIP,
+		},
+	}, nil)
 
 	endpoints := ParseEndpoints(&slim_corev1.Endpoints{
 		ObjectMeta: slim_metav1.ObjectMeta{
@@ -994,7 +1289,7 @@ func (s *K8sSuite) TestNewClusterService(c *check.C) {
 		},
 		Subsets: []slim_corev1.EndpointSubset{
 			{
-				Addresses: []slim_corev1.EndpointAddress{{IP: "10.0.0.2"}},
+				Addresses: []slim_corev1.EndpointAddress{{IP: "10.0.0.2", Hostname: "hostname-1"}},
 				Ports: []slim_corev1.EndpointPort{
 					{
 						Name:     "http-test-svc",
@@ -1007,7 +1302,7 @@ func (s *K8sSuite) TestNewClusterService(c *check.C) {
 	})
 
 	clusterService := NewClusterService(id, svc, endpoints)
-	c.Assert(clusterService, checker.DeepEquals, serviceStore.ClusterService{
+	require.Equal(t, serviceStore.ClusterService{
 		Name:      "foo",
 		Namespace: "bar",
 		Labels:    map[string]string{"foo": "bar"},
@@ -1020,7 +1315,8 @@ func (s *K8sSuite) TestNewClusterService(c *check.C) {
 				"http-test-svc": {Protocol: loadbalancer.TCP, Port: 8080},
 			},
 		},
-	})
+		Hostnames: map[string]string{"10.0.0.2": "hostname-1"},
+	}, clusterService)
 }
 
 func TestParseServiceIDFrom(t *testing.T) {
@@ -1045,6 +1341,83 @@ func TestParseServiceIDFrom(t *testing.T) {
 			if got := ParseServiceIDFrom(tt.args.dn); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("ParseServiceIDFrom() = %v, want %v", got, tt.want)
 			}
+		})
+	}
+}
+
+func TestCheckServiceNodeExposure(t *testing.T) {
+	tests := []struct {
+		name           string // description of this test case
+		nodeLabels     map[string]string
+		svcAnnotations map[string]string
+		wantExposed    bool
+	}{
+		{
+			name:           "no annotation matches all nodes",
+			nodeLabels:     map[string]string{},
+			svcAnnotations: map[string]string{},
+			wantExposed:    true,
+		},
+		{
+			name:           "match via service.cilium.io/node annotation",
+			nodeLabels:     map[string]string{"service.cilium.io/node": "beefy"},
+			svcAnnotations: map[string]string{annotation.ServiceNodeExposure: "beefy"},
+			wantExposed:    true,
+		},
+		{
+			name:           "no match via service.cilium.io/node annotation",
+			nodeLabels:     map[string]string{"service.cilium.io/node": "beefy"},
+			svcAnnotations: map[string]string{annotation.ServiceNodeExposure: "slow"},
+			wantExposed:    false,
+		},
+		{
+			name:           "exact match via service.cilium.io/node-selector annotation",
+			nodeLabels:     map[string]string{"service.cilium.io/node": "beefy"},
+			svcAnnotations: map[string]string{annotation.ServiceNodeSelectorExposure: "service.cilium.io/node == beefy"},
+			wantExposed:    true,
+		},
+		{
+			name:           "no match via exact service.cilium.io/node-selector annotation",
+			nodeLabels:     map[string]string{"service.cilium.io/node": "beefy"},
+			svcAnnotations: map[string]string{annotation.ServiceNodeSelectorExposure: "service.cilium.io/node == slow"},
+			wantExposed:    false,
+		},
+		{
+			name:           "in match via service.cilium.io/node-selector annotation",
+			nodeLabels:     map[string]string{"service.cilium.io/node": "beefy"},
+			svcAnnotations: map[string]string{annotation.ServiceNodeSelectorExposure: "service.cilium.io/node in ( beefy , slow )"},
+			wantExposed:    true,
+		},
+		{
+			name:           "in match via service.cilium.io/node-selector annotation 2",
+			nodeLabels:     map[string]string{"service.cilium.io/node": "slow"},
+			svcAnnotations: map[string]string{annotation.ServiceNodeSelectorExposure: "service.cilium.io/node in ( beefy , slow )"},
+			wantExposed:    true,
+		},
+		{
+			name:           "no match via in service.cilium.io/node-selector annotation",
+			nodeLabels:     map[string]string{"service.cilium.io/node": "another"},
+			svcAnnotations: map[string]string{annotation.ServiceNodeSelectorExposure: "service.cilium.io/node in ( beefy , slow )"},
+			wantExposed:    false,
+		},
+		{
+			name:       "no match via via node annotation if node-selector exists and doesn't match",
+			nodeLabels: map[string]string{"service.cilium.io/node": "another"},
+			svcAnnotations: map[string]string{
+				annotation.ServiceNodeSelectorExposure: "service.cilium.io/node in ( beefy , slow )",
+				annotation.ServiceNodeExposure:         "another",
+			},
+			wantExposed: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			exposedOnLocalNode, err := CheckServiceNodeExposure(
+				node.NewTestLocalNodeStore(node.LocalNode{Node: types.Node{Labels: tt.nodeLabels}}),
+				tt.svcAnnotations,
+			)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.wantExposed, exposedOnLocalNode)
 		})
 	}
 }

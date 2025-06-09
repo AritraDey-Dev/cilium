@@ -8,9 +8,10 @@ import (
 	"net/netip"
 	"testing"
 
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 
 	"github.com/cilium/cilium/pkg/bgpv1/manager/instance"
 	"github.com/cilium/cilium/pkg/bgpv1/manager/store"
@@ -25,28 +26,29 @@ var (
 	podCIDR       = "10.0.0.0/24"
 	podCIDRPrefix = netip.MustParsePrefix(podCIDR)
 
-	lbPool = &v2alpha1api.CiliumLoadBalancerIPPool{
+	lbPool = &v2.CiliumLoadBalancerIPPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
 				"label1": "value1",
 			},
 		},
-		Spec: v2alpha1api.CiliumLoadBalancerIPPoolSpec{
-			Cidrs: []v2alpha1api.CiliumLoadBalancerIPPoolIPBlock{
+		Spec: v2.CiliumLoadBalancerIPPoolSpec{
+			Blocks: []v2.CiliumLoadBalancerIPPoolIPBlock{
 				{
 					Cidr: "192.168.0.0/24",
 				},
 			},
 		},
 	}
-	lbPoolUpdated = &v2alpha1api.CiliumLoadBalancerIPPool{
+
+	lbPoolUpdated = &v2.CiliumLoadBalancerIPPool{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
 				"label1": "value1",
 			},
 		},
-		Spec: v2alpha1api.CiliumLoadBalancerIPPoolSpec{
-			Cidrs: []v2alpha1api.CiliumLoadBalancerIPPoolIPBlock{
+		Spec: v2.CiliumLoadBalancerIPPoolSpec{
+			Blocks: []v2.CiliumLoadBalancerIPPoolIPBlock{
 				{
 					Cidr: "10.100.99.0/24", // UPDATED
 				},
@@ -109,9 +111,9 @@ var (
 
 	peerAddress = "172.16.0.1/32"
 
-	standardCommunity = "64125:100"
-
-	largeCommunity = "64125:4294967295:100"
+	standardCommunity  = "64125:100"
+	wellKnownCommunity = "no-advertise"
+	largeCommunity     = "64125:4294967295:100"
 
 	attrSelectLBPool = v2alpha1api.CiliumBGPPathAttributes{
 		SelectorType: v2alpha1api.CiliumLoadBalancerIPPoolSelectorName,
@@ -121,8 +123,9 @@ var (
 			},
 		},
 		Communities: &v2alpha1api.BGPCommunities{
-			Standard: []v2alpha1api.BGPStandardCommunity{v2alpha1api.BGPStandardCommunity(standardCommunity)},
-			Large:    []v2alpha1api.BGPLargeCommunity{v2alpha1api.BGPLargeCommunity(largeCommunity)},
+			Standard:  []v2alpha1api.BGPStandardCommunity{v2alpha1api.BGPStandardCommunity(standardCommunity)},
+			WellKnown: []v2alpha1api.BGPWellKnownCommunity{v2alpha1api.BGPWellKnownCommunity(wellKnownCommunity)},
+			Large:     []v2alpha1api.BGPLargeCommunity{v2alpha1api.BGPLargeCommunity(largeCommunity)},
 		},
 	}
 
@@ -134,14 +137,15 @@ var (
 			},
 		},
 		Communities: &v2alpha1api.BGPCommunities{
-			Standard: []v2alpha1api.BGPStandardCommunity{v2alpha1api.BGPStandardCommunity(standardCommunity)},
-			Large:    []v2alpha1api.BGPLargeCommunity{v2alpha1api.BGPLargeCommunity(largeCommunity)},
+			Standard:  []v2alpha1api.BGPStandardCommunity{v2alpha1api.BGPStandardCommunity(standardCommunity)},
+			WellKnown: []v2alpha1api.BGPWellKnownCommunity{v2alpha1api.BGPWellKnownCommunity(wellKnownCommunity)},
+			Large:     []v2alpha1api.BGPLargeCommunity{v2alpha1api.BGPLargeCommunity(largeCommunity)},
 		},
 	}
 
 	attrSelectAnyNode = v2alpha1api.CiliumBGPPathAttributes{
 		SelectorType:    v2alpha1api.PodCIDRSelectorName,
-		LocalPreference: pointer.Int64(150),
+		LocalPreference: ptr.To[int64](150),
 	}
 
 	attrSelectNonExistingNode = v2alpha1api.CiliumBGPPathAttributes{
@@ -151,7 +155,7 @@ var (
 				"node": "non-existing",
 			},
 		},
-		LocalPreference: pointer.Int64(150),
+		LocalPreference: ptr.To[int64](150),
 	}
 
 	attrSelectInvalid = v2alpha1api.CiliumBGPPathAttributes{
@@ -166,7 +170,7 @@ var (
 
 type routePolicyTestInputs struct {
 	podCIDRs         []string
-	LBPools          []*v2alpha1api.CiliumLoadBalancerIPPool
+	LBPools          []*v2.CiliumLoadBalancerIPPool
 	NodePools        []ipamTypes.IPAMPoolAllocation
 	PodPools         []*v2alpha1api.CiliumPodIPPool
 	neighbors        []v2alpha1api.CiliumBGPNeighbor
@@ -186,7 +190,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 				podCIDRs: []string{
 					podCIDR,
 				},
-				LBPools: []*v2alpha1api.CiliumLoadBalancerIPPool{
+				LBPools: []*v2.CiliumLoadBalancerIPPool{
 					lbPool,
 				},
 				PodPools: []*v2alpha1api.CiliumPodIPPool{
@@ -215,7 +219,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 									MatchNeighbors: []string{peerAddress},
 									MatchPrefixes: []*types.RoutePolicyPrefixMatch{
 										{
-											CIDR:         netip.MustParsePrefix(string(lbPool.Spec.Cidrs[0].Cidr)),
+											CIDR:         netip.MustParsePrefix(string(lbPool.Spec.Blocks[0].Cidr)),
 											PrefixLenMin: maxPrefixLenIPv4,
 											PrefixLenMax: maxPrefixLenIPv4,
 										},
@@ -223,7 +227,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 								},
 								Actions: types.RoutePolicyActions{
 									RouteAction:         types.RoutePolicyActionNone,
-									AddCommunities:      []string{standardCommunity},
+									AddCommunities:      []string{standardCommunity, wellKnownCommunity},
 									AddLargeCommunities: []string{largeCommunity},
 								},
 							},
@@ -246,7 +250,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 								},
 								Actions: types.RoutePolicyActions{
 									RouteAction:         types.RoutePolicyActionNone,
-									AddCommunities:      []string{standardCommunity},
+									AddCommunities:      []string{standardCommunity, wellKnownCommunity},
 									AddLargeCommunities: []string{largeCommunity},
 								},
 							},
@@ -263,7 +267,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 								},
 								Actions: types.RoutePolicyActions{
 									RouteAction:         types.RoutePolicyActionNone,
-									AddCommunities:      []string{standardCommunity},
+									AddCommunities:      []string{standardCommunity, wellKnownCommunity},
 									AddLargeCommunities: []string{largeCommunity},
 								},
 							},
@@ -298,7 +302,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 		{
 			name: "update policy - lb pool change",
 			initial: &routePolicyTestInputs{
-				LBPools: []*v2alpha1api.CiliumLoadBalancerIPPool{
+				LBPools: []*v2.CiliumLoadBalancerIPPool{
 					lbPool,
 				},
 				neighbors: []v2alpha1api.CiliumBGPNeighbor{
@@ -319,7 +323,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 									MatchNeighbors: []string{peerAddress},
 									MatchPrefixes: []*types.RoutePolicyPrefixMatch{
 										{
-											CIDR:         netip.MustParsePrefix(string(lbPool.Spec.Cidrs[0].Cidr)),
+											CIDR:         netip.MustParsePrefix(string(lbPool.Spec.Blocks[0].Cidr)),
 											PrefixLenMin: maxPrefixLenIPv4,
 											PrefixLenMax: maxPrefixLenIPv4,
 										},
@@ -327,7 +331,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 								},
 								Actions: types.RoutePolicyActions{
 									RouteAction:         types.RoutePolicyActionNone,
-									AddCommunities:      []string{standardCommunity},
+									AddCommunities:      []string{standardCommunity, wellKnownCommunity},
 									AddLargeCommunities: []string{largeCommunity},
 								},
 							},
@@ -336,7 +340,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 				},
 			},
 			updated: &routePolicyTestInputs{
-				LBPools: []*v2alpha1api.CiliumLoadBalancerIPPool{
+				LBPools: []*v2.CiliumLoadBalancerIPPool{
 					lbPoolUpdated, // UPDATED - modified CIDR
 				},
 				neighbors: []v2alpha1api.CiliumBGPNeighbor{
@@ -357,7 +361,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 									MatchNeighbors: []string{peerAddress},
 									MatchPrefixes: []*types.RoutePolicyPrefixMatch{
 										{
-											CIDR:         netip.MustParsePrefix(string(lbPoolUpdated.Spec.Cidrs[0].Cidr)),
+											CIDR:         netip.MustParsePrefix(string(lbPoolUpdated.Spec.Blocks[0].Cidr)),
 											PrefixLenMin: maxPrefixLenIPv4,
 											PrefixLenMax: maxPrefixLenIPv4,
 										},
@@ -365,7 +369,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 								},
 								Actions: types.RoutePolicyActions{
 									RouteAction:         types.RoutePolicyActionNone,
-									AddCommunities:      []string{standardCommunity},
+									AddCommunities:      []string{standardCommunity, wellKnownCommunity},
 									AddLargeCommunities: []string{largeCommunity},
 								},
 							},
@@ -410,7 +414,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 								},
 								Actions: types.RoutePolicyActions{
 									RouteAction:         types.RoutePolicyActionNone,
-									AddCommunities:      []string{standardCommunity},
+									AddCommunities:      []string{standardCommunity, wellKnownCommunity},
 									AddLargeCommunities: []string{largeCommunity},
 								},
 							},
@@ -427,7 +431,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 								},
 								Actions: types.RoutePolicyActions{
 									RouteAction:         types.RoutePolicyActionNone,
-									AddCommunities:      []string{standardCommunity},
+									AddCommunities:      []string{standardCommunity, wellKnownCommunity},
 									AddLargeCommunities: []string{largeCommunity},
 								},
 							},
@@ -473,7 +477,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 								},
 								Actions: types.RoutePolicyActions{
 									RouteAction:         types.RoutePolicyActionNone,
-									AddCommunities:      []string{standardCommunity},
+									AddCommunities:      []string{standardCommunity, wellKnownCommunity},
 									AddLargeCommunities: []string{largeCommunity},
 								},
 							},
@@ -495,7 +499,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 								},
 								Actions: types.RoutePolicyActions{
 									RouteAction:         types.RoutePolicyActionNone,
-									AddCommunities:      []string{standardCommunity},
+									AddCommunities:      []string{standardCommunity, wellKnownCommunity},
 									AddLargeCommunities: []string{largeCommunity},
 								},
 							},
@@ -589,16 +593,16 @@ func TestRoutePolicyReconciler(t *testing.T) {
 					ListenPort: -1,
 				},
 			}
-			testSC, err := instance.NewServerWithConfig(context.Background(), log, srvParams)
+			testSC, err := instance.NewServerWithConfig(context.Background(), hivetest.Logger(t), srvParams)
 			require.NoError(t, err)
 
 			testSC.Config = &v2alpha1api.CiliumBGPVirtualRouter{
 				LocalASN:      64125,
-				ExportPodCIDR: pointer.Bool(true),
+				ExportPodCIDR: ptr.To[bool](true),
 				Neighbors:     tt.initial.neighbors,
 			}
 
-			lbStore := store.NewMockBGPCPResourceStore[*v2alpha1api.CiliumLoadBalancerIPPool]()
+			lbStore := store.NewMockBGPCPResourceStore[*v2.CiliumLoadBalancerIPPool]()
 			for _, obj := range tt.initial.LBPools {
 				lbStore.Upsert(obj)
 			}
@@ -608,7 +612,7 @@ func TestRoutePolicyReconciler(t *testing.T) {
 				podStore.Upsert(obj)
 			}
 
-			policyReconciler := NewRoutePolicyReconciler(lbStore, podStore).Reconciler.(*RoutePolicyReconciler)
+			policyReconciler := NewRoutePolicyReconciler(hivetest.Logger(t), lbStore, podStore).Reconciler.(*RoutePolicyReconciler)
 			params := ReconcileParams{
 				CurrentServer: testSC,
 				DesiredConfig: testSC.Config,
@@ -624,13 +628,18 @@ func TestRoutePolicyReconciler(t *testing.T) {
 				},
 			}
 
-			// initial reconcile
-			err = policyReconciler.Reconcile(context.Background(), params)
-			if tt.expectError {
-				require.Error(t, err)
-				return
+			// Run the reconciler twice to ensure idempotency. This
+			// simulates the retrying behavior of the controller.
+			for range 2 {
+				t.Run(tt.name+"-init", func(t *testing.T) {
+					err = policyReconciler.Reconcile(context.Background(), params)
+					if tt.expectError {
+						require.Error(t, err)
+						return
+					}
+					require.NoError(t, err)
+				})
 			}
-			require.NoError(t, err)
 
 			// validate cached vs. expected policies
 			validatePoliciesMatch(t, policyReconciler.getMetadata(testSC), tt.initial.expectedPolicies)
@@ -649,8 +658,14 @@ func TestRoutePolicyReconciler(t *testing.T) {
 			for _, obj := range tt.updated.PodPools {
 				podStore.Upsert(obj)
 			}
-			err = policyReconciler.Reconcile(context.Background(), params)
-			require.NoError(t, err)
+			// Run the reconciler twice to ensure idempotency. This
+			// simulates the retrying behavior of the controller.
+			for range 2 {
+				t.Run(tt.name+"-follow-up", func(t *testing.T) {
+					err = policyReconciler.Reconcile(context.Background(), params)
+					require.NoError(t, err)
+				})
+			}
 
 			// validate cached vs. expected policies
 			validatePoliciesMatch(t, policyReconciler.getMetadata(testSC), tt.updated.expectedPolicies)
@@ -664,6 +679,78 @@ func validatePoliciesMatch(t *testing.T, actual map[string]*types.RoutePolicy, e
 	for _, expPolicy := range expected {
 		policy := actual[expPolicy.Name]
 		require.NotNil(t, policy)
-		require.EqualValues(t, policy, expPolicy)
+		require.Equal(t, expPolicy, policy)
+	}
+}
+
+func TestCommunityDeduplication(t *testing.T) {
+	var table = []struct {
+		name      string
+		standard  []v2alpha1api.BGPStandardCommunity
+		wellKnown []v2alpha1api.BGPWellKnownCommunity
+		large     []v2alpha1api.BGPLargeCommunity
+		expected  []string
+		expectErr bool
+	}{
+		{
+			name:     "single standard",
+			standard: []v2alpha1api.BGPStandardCommunity{"64125:100"},
+			expected: []string{"64125:100"},
+		},
+		{
+			name:      "single well-known",
+			wellKnown: []v2alpha1api.BGPWellKnownCommunity{"no-advertise"},
+			expected:  []string{"no-advertise"},
+		},
+		{
+			name:     "single large",
+			large:    []v2alpha1api.BGPLargeCommunity{"64125:4294967295:100"},
+			expected: []string{"64125:4294967295:100"},
+		},
+		{
+			name:     "duplicate standard",
+			standard: []v2alpha1api.BGPStandardCommunity{"0:100", "100", "0:101", "0:100"},
+			expected: []string{"0:100", "0:101"},
+		},
+		{
+			name:      "duplicate well-known",
+			wellKnown: []v2alpha1api.BGPWellKnownCommunity{"no-export", "no-advertise", "no-export"},
+			expected:  []string{"no-export", "no-advertise"},
+		},
+		{
+			name:      "invalid standard",
+			standard:  []v2alpha1api.BGPStandardCommunity{"64125:100", "999999:999999", "64125:101"},
+			expectErr: true,
+		},
+		{
+			name:      "invalid well-known",
+			wellKnown: []v2alpha1api.BGPWellKnownCommunity{"no-export", "NON-EXISTING"},
+			expectErr: true,
+		},
+		{
+			name:     "duplicate large",
+			large:    []v2alpha1api.BGPLargeCommunity{"64125:4294967295:100", "64125:4294967295:200", "64125:4294967295:200"},
+			expected: []string{"64125:4294967295:100", "64125:4294967295:200"},
+		},
+		{
+			name:      "standard + well-known duplicated",
+			standard:  []v2alpha1api.BGPStandardCommunity{"64125:100", "64125:101", "65535:65282"},
+			wellKnown: []v2alpha1api.BGPWellKnownCommunity{"no-export", "no-advertise"}, // no-advertise = "65535:65282"
+			expected:  []string{"64125:100", "64125:101", "65535:65282", "no-export"},
+		},
+	}
+	for _, tt := range table {
+		t.Run(tt.name, func(t *testing.T) {
+			res, err := mergeAndDedupCommunities(tt.standard, tt.wellKnown)
+			if tt.expectErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+
+			res2 := dedupLargeCommunities(tt.large)
+
+			require.Equal(t, tt.expected, append(res, res2...))
+		})
 	}
 }

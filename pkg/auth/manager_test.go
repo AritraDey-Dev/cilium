@@ -6,19 +6,19 @@ package auth
 import (
 	"context"
 	"errors"
+	"maps"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/cilium/ebpf"
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/assert"
-	"golang.org/x/exp/maps"
 
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/auth/certs"
 	"github.com/cilium/cilium/pkg/identity"
-	"github.com/cilium/cilium/pkg/policy"
+	policyTypes "github.com/cilium/cilium/pkg/policy/types"
 )
 
 func Test_newAuthManager_clashingAuthHandlers(t *testing.T) {
@@ -27,18 +27,18 @@ func Test_newAuthManager_clashingAuthHandlers(t *testing.T) {
 		&alwaysFailAuthHandler{},
 	}
 
-	am, err := newAuthManager(logrus.New(), authHandlers, nil, nil, time.Second)
+	am, err := newAuthManager(hivetest.Logger(t), authHandlers, nil, nil, time.Second)
 	assert.ErrorContains(t, err, "multiple handlers for auth type: test-always-fail")
 	assert.Nil(t, am)
 }
 
 func Test_newAuthManager(t *testing.T) {
 	authHandlers := []authHandler{
-		newAlwaysPassAuthHandler(logrus.New()),
+		newAlwaysPassAuthHandler(hivetest.Logger(t)),
 		&fakeAuthHandler{},
 	}
 
-	am, err := newAuthManager(logrus.New(), authHandlers, nil, nil, time.Second)
+	am, err := newAuthManager(hivetest.Logger(t), authHandlers, nil, nil, time.Second)
 	assert.NoError(t, err)
 	assert.NotNil(t, am)
 
@@ -56,8 +56,8 @@ func Test_authManager_authenticate(t *testing.T) {
 		{
 			name: "missing handler for auth type",
 			args: authKey{
-				localIdentity:  1,
-				remoteIdentity: 2,
+				localIdentity:  1000,
+				remoteIdentity: 2000,
 				remoteNodeID:   2,
 				authType:       1,
 			},
@@ -67,8 +67,8 @@ func Test_authManager_authenticate(t *testing.T) {
 		{
 			name: "missing node IP for node ID",
 			args: authKey{
-				localIdentity:  1,
-				remoteIdentity: 2,
+				localIdentity:  1000,
+				remoteIdentity: 2000,
 				remoteNodeID:   1,
 				authType:       2,
 			},
@@ -78,8 +78,8 @@ func Test_authManager_authenticate(t *testing.T) {
 		{
 			name: "successful auth",
 			args: authKey{
-				localIdentity:  1,
-				remoteIdentity: 2,
+				localIdentity:  1000,
+				remoteIdentity: 2000,
 				remoteNodeID:   2,
 				authType:       100,
 			},
@@ -93,8 +93,8 @@ func Test_authManager_authenticate(t *testing.T) {
 				entries: map[authKey]authInfo{},
 			}
 			am, err := newAuthManager(
-				logrus.New(),
-				[]authHandler{&alwaysFailAuthHandler{}, newAlwaysPassAuthHandler(logrus.New())},
+				hivetest.Logger(t),
+				[]authHandler{&alwaysFailAuthHandler{}, newAlwaysPassAuthHandler(hivetest.Logger(t))},
 				authMap,
 				newFakeNodeIDHandler(map[uint16]string{
 					2: "172.18.0.2",
@@ -114,9 +114,9 @@ func Test_authManager_authenticate(t *testing.T) {
 }
 
 func Test_authManager_handleAuthRequest(t *testing.T) {
-	authHandlers := []authHandler{newAlwaysPassAuthHandler(logrus.New())}
+	authHandlers := []authHandler{newAlwaysPassAuthHandler(hivetest.Logger(t))}
 
-	am, err := newAuthManager(logrus.New(), authHandlers, nil, nil, time.Second)
+	am, err := newAuthManager(hivetest.Logger(t), authHandlers, nil, nil, time.Second)
 	assert.NoError(t, err)
 	assert.NotNil(t, am)
 
@@ -124,21 +124,55 @@ func Test_authManager_handleAuthRequest(t *testing.T) {
 	am.handleAuthenticationFunc = func(_ *AuthManager, k authKey, reAuth bool) {
 		handleAuthCalled = true
 		assert.False(t, reAuth)
-		assert.Equal(t, authKey{localIdentity: 1, remoteIdentity: 2, remoteNodeID: 0, authType: 100}, k)
+		assert.Equal(t, authKey{localIdentity: 1000, remoteIdentity: 2000, remoteNodeID: 0, authType: 100}, k)
 	}
 
-	err = am.handleAuthRequest(context.Background(), signalAuthKey{LocalIdentity: 1, RemoteIdentity: 2, RemoteNodeID: 0, AuthType: 100, Pad: 0})
+	err = am.handleAuthRequest(context.Background(), signalAuthKey{LocalIdentity: 1000, RemoteIdentity: 2000, RemoteNodeID: 0, AuthType: 100, Pad: 0})
 	assert.NoError(t, err)
 	assert.True(t, handleAuthCalled)
 }
 
+func Test_authManager_handleAuthRequest_reservedRemoteIdentity(t *testing.T) {
+	authHandlers := []authHandler{newAlwaysPassAuthHandler(hivetest.Logger(t))}
+
+	am, err := newAuthManager(hivetest.Logger(t), authHandlers, nil, nil, time.Second)
+	assert.NoError(t, err)
+	assert.NotNil(t, am)
+
+	handleAuthCalled := false
+	am.handleAuthenticationFunc = func(_ *AuthManager, k authKey, reAuth bool) {
+		handleAuthCalled = true
+	}
+
+	err = am.handleAuthRequest(context.Background(), signalAuthKey{LocalIdentity: 100, RemoteIdentity: identity.ReservedIdentityWorldIPv6.Uint32(), RemoteNodeID: 0, AuthType: 100, Pad: 0})
+	assert.NoError(t, err)
+	assert.False(t, handleAuthCalled)
+}
+
+func Test_authManager_handleAuthRequest_reservedLocalIdentity(t *testing.T) {
+	authHandlers := []authHandler{newAlwaysPassAuthHandler(hivetest.Logger(t))}
+
+	am, err := newAuthManager(hivetest.Logger(t), authHandlers, nil, nil, time.Second)
+	assert.NoError(t, err)
+	assert.NotNil(t, am)
+
+	handleAuthCalled := false
+	am.handleAuthenticationFunc = func(_ *AuthManager, k authKey, reAuth bool) {
+		handleAuthCalled = true
+	}
+
+	err = am.handleAuthRequest(context.Background(), signalAuthKey{LocalIdentity: identity.ReservedIdentityWorldIPv6.Uint32(), RemoteIdentity: 100, RemoteNodeID: 0, AuthType: 100, Pad: 0})
+	assert.NoError(t, err)
+	assert.False(t, handleAuthCalled)
+}
+
 func Test_authManager_handleCertificateRotationEvent_Error(t *testing.T) {
-	authHandlers := []authHandler{newAlwaysPassAuthHandler(logrus.New())}
+	authHandlers := []authHandler{newAlwaysPassAuthHandler(hivetest.Logger(t))}
 	aMap := &fakeAuthMap{
 		failGet: true,
 	}
 
-	am, err := newAuthManager(logrus.New(), authHandlers, aMap, nil, time.Second)
+	am, err := newAuthManager(hivetest.Logger(t), authHandlers, aMap, nil, time.Second)
 	assert.NoError(t, err)
 	assert.NotNil(t, am)
 
@@ -147,16 +181,16 @@ func Test_authManager_handleCertificateRotationEvent_Error(t *testing.T) {
 }
 
 func Test_authManager_handleCertificateRotationEvent(t *testing.T) {
-	authHandlers := []authHandler{newAlwaysPassAuthHandler(logrus.New())}
+	authHandlers := []authHandler{newAlwaysPassAuthHandler(hivetest.Logger(t))}
 	aMap := &fakeAuthMap{
 		entries: map[authKey]authInfo{
-			{localIdentity: 1, remoteIdentity: 2, remoteNodeID: 1, authType: 100}: {expiration: time.Now()},
-			{localIdentity: 2, remoteIdentity: 3, remoteNodeID: 1, authType: 100}: {expiration: time.Now()},
-			{localIdentity: 3, remoteIdentity: 4, remoteNodeID: 1, authType: 100}: {expiration: time.Now()},
+			{localIdentity: 1000, remoteIdentity: 2000, remoteNodeID: 1, authType: 100}: {expiration: time.Now()},
+			{localIdentity: 2000, remoteIdentity: 3000, remoteNodeID: 1, authType: 100}: {expiration: time.Now()},
+			{localIdentity: 3000, remoteIdentity: 4000, remoteNodeID: 1, authType: 100}: {expiration: time.Now()},
 		},
 	}
 
-	am, err := newAuthManager(logrus.New(), authHandlers, aMap, nil, time.Second)
+	am, err := newAuthManager(hivetest.Logger(t), authHandlers, aMap, nil, time.Second)
 	assert.NoError(t, err)
 	assert.NotNil(t, am)
 
@@ -164,30 +198,30 @@ func Test_authManager_handleCertificateRotationEvent(t *testing.T) {
 	am.handleAuthenticationFunc = func(_ *AuthManager, k authKey, reAuth bool) {
 		handleAuthCalled = true
 		assert.True(t, reAuth)
-		assert.True(t, k.localIdentity == 2 || k.remoteIdentity == 2)
+		assert.True(t, k.localIdentity == 2000 || k.remoteIdentity == 2000)
 	}
 
-	err = am.handleCertificateRotationEvent(context.Background(), certs.CertificateRotationEvent{Identity: identity.NumericIdentity(2)})
+	err = am.handleCertificateRotationEvent(context.Background(), certs.CertificateRotationEvent{Identity: identity.NumericIdentity(2000)})
 	assert.NoError(t, err)
 	assert.True(t, handleAuthCalled)
 }
 
 func Test_authManager_handleCertificateDeletionEvent(t *testing.T) {
-	authHandlers := []authHandler{newAlwaysPassAuthHandler(logrus.New())}
+	authHandlers := []authHandler{newAlwaysPassAuthHandler(hivetest.Logger(t))}
 	aMap := &fakeAuthMap{
 		entries: map[authKey]authInfo{
-			{localIdentity: 1, remoteIdentity: 2, remoteNodeID: 1, authType: 100}: {expiration: time.Now()},
-			{localIdentity: 2, remoteIdentity: 3, remoteNodeID: 1, authType: 100}: {expiration: time.Now()},
-			{localIdentity: 3, remoteIdentity: 4, remoteNodeID: 1, authType: 100}: {expiration: time.Now()},
+			{localIdentity: 1000, remoteIdentity: 2000, remoteNodeID: 1000, authType: 100}: {expiration: time.Now()},
+			{localIdentity: 2000, remoteIdentity: 3000, remoteNodeID: 1000, authType: 100}: {expiration: time.Now()},
+			{localIdentity: 3000, remoteIdentity: 4000, remoteNodeID: 1000, authType: 100}: {expiration: time.Now()},
 		},
 	}
 
-	am, err := newAuthManager(logrus.New(), authHandlers, aMap, nil, time.Second)
+	am, err := newAuthManager(hivetest.Logger(t), authHandlers, aMap, nil, time.Second)
 	assert.NoError(t, err)
 	assert.NotNil(t, am)
 
 	err = am.handleCertificateRotationEvent(context.Background(), certs.CertificateRotationEvent{
-		Identity: identity.NumericIdentity(2),
+		Identity: identity.NumericIdentity(2000),
 		Deleted:  true,
 	})
 	assert.NoError(t, err)
@@ -235,8 +269,8 @@ func (r *fakeAuthHandler) authenticate(authReq *authRequest) (*authResponse, err
 	return &authResponse{}, nil
 }
 
-func (r *fakeAuthHandler) authType() policy.AuthType {
-	return policy.AuthType(255)
+func (r *fakeAuthHandler) authType() policyTypes.AuthType {
+	return policyTypes.AuthType(127)
 }
 
 func (r *fakeAuthHandler) subscribeToRotatedIdentities() <-chan certs.CertificateRotationEvent {
@@ -321,7 +355,7 @@ func (r *fakeAuthMap) MaxEntries() uint32 {
 }
 
 func assertErrorString(errString string) assert.ErrorAssertionFunc {
-	return func(t assert.TestingT, err error, msgAndArgs ...interface{}) bool {
-		return assert.EqualError(t, err, errString, msgAndArgs)
+	return func(t assert.TestingT, err error, msgAndArgs ...any) bool {
+		return assert.EqualError(t, err, errString, msgAndArgs...)
 	}
 }

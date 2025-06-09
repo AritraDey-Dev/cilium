@@ -1,10 +1,9 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __BPF_CTX_SKB_H_
-#define __BPF_CTX_SKB_H_
+#pragma once
 
-#define __section_entry __section("tc")
+#define PROG_TYPE		"tc"
 
 #define __ctx_buff		__sk_buff
 #define __ctx_is		__ctx_skb
@@ -58,9 +57,10 @@
 /* Avoid expensive calls into the kernel flow dissector if it's not an L4
  * hash. We currently only use the hash for debugging. If needed later, we
  * can map it to BPF_FUNC(get_hash_recalc) to get the L4 hash.
+ *
+ * bpf function get_hash_recalc from ../helpers_skb.h
  */
 #define get_hash(ctx)		ctx->hash
-#define get_hash_recalc(ctx)	get_hash(ctx)
 
 #define DEFINE_FUNC_CTX_POINTER(FIELD)						\
 static __always_inline void *							\
@@ -127,6 +127,15 @@ ctx_load_meta(const struct __sk_buff *ctx, const __u32 off)
 	return ctx->cb[off];
 }
 
+static __always_inline __maybe_unused __u32
+ctx_load_and_clear_meta(struct __sk_buff *ctx, const __u32 off)
+{
+	__u32 val = ctx_load_meta(ctx, off);
+
+	ctx_store_meta(ctx, off, 0);
+	return val;
+}
+
 static __always_inline __maybe_unused __u16
 ctx_get_protocol(const struct __sk_buff *ctx)
 {
@@ -139,4 +148,8 @@ ctx_get_ifindex(const struct __sk_buff *ctx)
 	return ctx->ifindex;
 }
 
-#endif /* __BPF_CTX_SKB_H_ */
+static __always_inline __maybe_unused __u32
+ctx_get_ingress_ifindex(const struct __sk_buff *ctx)
+{
+	return ctx->ingress_ifindex;
+}

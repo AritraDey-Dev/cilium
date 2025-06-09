@@ -7,37 +7,46 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
+	"github.com/cilium/cilium/pkg/cmdref"
 	"github.com/cilium/cilium/pkg/hive"
+	"github.com/cilium/cilium/pkg/logging"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
+	shell "github.com/cilium/cilium/pkg/shell/client"
 	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/version"
 )
 
-func NewAgentCmd(h *hive.Hive) *cobra.Command {
+func NewAgentCmd(hfn func() *hive.Hive) *cobra.Command {
+	bootstrapStats.overall.Start()
+	h := hfn()
+
 	rootCmd := &cobra.Command{
 		Use:   "cilium-agent",
 		Short: "Run the cilium agent",
 		Run: func(cobraCmd *cobra.Command, args []string) {
-			bootstrapStats.overall.Start()
-
 			if v, _ := cobraCmd.Flags().GetBool("version"); v {
 				fmt.Printf("%s %s\n", cobraCmd.Name(), version.Version)
 				os.Exit(0)
 			}
 
+			daemonLogger := logging.DefaultSlogLogger.With(logfields.LogSubsys, daemonSubsys)
 			// Initialize working directories and validate the configuration.
-			initEnv(h.Viper())
+			initEnv(daemonLogger, h.Viper())
 
 			// Validate the daemon-specific global options.
 			if err := option.Config.Validate(h.Viper()); err != nil {
-				log.Fatalf("invalid daemon configuration: %s", err)
+				logging.Fatal(daemonLogger, fmt.Sprintf("invalid daemon configuration: %s", err))
 			}
 
-			if err := h.Run(); err != nil {
-				log.Fatal(err)
+			if err := h.Run(logging.DefaultSlogLogger); err != nil {
+				logging.Fatal(daemonLogger, fmt.Sprintf("unable to run agent: %s", err))
+			} else {
+				// If h.Run() exits with no errors, it means the agent gracefully shut down.
+				// (There is a CI job that ensures this is the case)
+				daemonLogger.Info("All stop hooks executed successfully.")
 			}
 		},
 	}
@@ -46,35 +55,27 @@ func NewAgentCmd(h *hive.Hive) *cobra.Command {
 
 	h.RegisterFlags(rootCmd.Flags())
 
-	cmdrefCmd := &cobra.Command{
-		Use:    "cmdref [output directory]",
-		Short:  "Generate command reference for cilium-agent to given output directory",
-		Args:   cobra.ExactArgs(1),
-		Hidden: true,
-		Run: func(cmd *cobra.Command, args []string) {
-			genMarkdown(rootCmd, args[0])
-		},
-	}
 	rootCmd.AddCommand(
-		cmdrefCmd,
+		cmdref.NewCmd(rootCmd),
+		shell.ShellCmd,
 		h.Command(),
 	)
 
-	InitGlobalFlags(rootCmd, h.Viper())
+	InitGlobalFlags(logging.DefaultSlogLogger, rootCmd, h.Viper())
 
 	cobra.OnInitialize(
-		option.InitConfig(rootCmd, "cilium-agent", "cilium", h.Viper()),
+		option.InitConfig(logging.DefaultSlogLogger, rootCmd, "cilium-agent", "cilium", h.Viper()),
 
 		// Populate the config and initialize the logger early as these
 		// are shared by all commands.
 		func() {
-			initDaemonConfig(h.Viper())
+			initDaemonConfigAndLogging(h.Viper())
 		},
-		initLogging,
 	)
 
 	return rootCmd
 }
+
 func Execute(cmd *cobra.Command) {
 	if err := cmd.Execute(); err != nil {
 		fmt.Println(err)
@@ -88,7 +89,7 @@ func setupSleepBeforeFatal(cmd *cobra.Command) {
 			time.Sleep(fatalSleep)
 			return e
 		})
-	logrus.RegisterExitHandler(func() {
+	logging.RegisterExitHandler(func() {
 		time.Sleep(fatalSleep)
 	})
 }

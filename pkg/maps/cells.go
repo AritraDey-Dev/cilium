@@ -4,20 +4,32 @@
 package maps
 
 import (
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"log/slog"
+
+	"github.com/cilium/hive/cell"
+
+	daemonapi "github.com/cilium/cilium/api/v1/server/restapi/daemon"
+	"github.com/cilium/cilium/pkg/maps/act"
 	"github.com/cilium/cilium/pkg/maps/authmap"
+	"github.com/cilium/cilium/pkg/maps/bwmap"
 	"github.com/cilium/cilium/pkg/maps/configmap"
 	"github.com/cilium/cilium/pkg/maps/ctmap/gc"
 	"github.com/cilium/cilium/pkg/maps/egressmap"
 	"github.com/cilium/cilium/pkg/maps/l2respondermap"
+	"github.com/cilium/cilium/pkg/maps/multicast"
+	"github.com/cilium/cilium/pkg/maps/nat"
 	"github.com/cilium/cilium/pkg/maps/nodemap"
+	"github.com/cilium/cilium/pkg/maps/policymap"
 	"github.com/cilium/cilium/pkg/maps/signalmap"
+	"github.com/cilium/cilium/pkg/maps/srv6map"
 )
 
 // Cell contains all cells which are providing BPF Maps.
 var Cell = cell.Module(
 	"maps",
 	"BPF Maps",
+
+	cell.Provide(newMapApiHandler),
 
 	// Provides the auth.Map which contains the authentication state between Cilium security identities.
 	authmap.Cell,
@@ -40,4 +52,39 @@ var Cell = cell.Module(
 
 	// Provides access to the L2 responder map.
 	l2respondermap.Cell,
+
+	// Provides access to the multicast maps.
+	multicast.Cell,
+
+	// Provides access to the SRv6 maps.
+	srv6map.Cell,
+
+	// Bandwidth (cilium_throttle) map contains the per-endpoint bandwidth limits.
+	// Provides RWTable[bwmap.Edt] for configuring the limits.
+	bwmap.Cell,
+
+	// Provides access to ActiveConnectionTracking map.
+	act.Cell,
+
+	// Provides access to NAT maps.
+	nat.Cell,
+
+	// Provides access to policy maps.
+	policymap.Cell,
 )
+
+type mapApiHandlerOut struct {
+	cell.Out
+
+	GetMapHandler           daemonapi.GetMapHandler
+	GetMapNameHandler       daemonapi.GetMapNameHandler
+	GetMapNameEventsHandler daemonapi.GetMapNameEventsHandler
+}
+
+func newMapApiHandler(logger *slog.Logger) mapApiHandlerOut {
+	return mapApiHandlerOut{
+		GetMapHandler:           &getMapHandler{},
+		GetMapNameHandler:       &getMapNameHandler{logger: logger},
+		GetMapNameEventsHandler: &getMapNameEventsHandler{logger: logger, mapGetter: &mapGetterImpl{logger: logger}},
+	}
+}

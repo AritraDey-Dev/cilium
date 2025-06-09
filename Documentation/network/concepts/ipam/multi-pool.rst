@@ -12,7 +12,7 @@ Multi-Pool (Beta)
 .. include:: ../../../beta.rst
 
 The Multi-Pool IPAM mode supports allocating PodCIDRs from multiple different IPAM pools, depending
-on properties of the workload defined by the user, e.g. annotations.
+on workload annotations and node labels defined by the user.
 
 Architecture
 ************
@@ -71,7 +71,10 @@ New pools can be added at run-time. The list of CIDRs in each pool can also be
 extended at run-time. In-use CIDRs may not be removed from an existing pool, and
 existing pools may not be deleted if they are still in use by a Cilium node.
 The mask size of a pool is immutable and the same for all nodes. Neither restriction
-is enforced until :gh-issue:`26966` is resolved.
+is enforced until :gh-issue:`26966` is resolved. The first and last address of a
+``CiliumPodIPPool`` are reserved and cannot be allocated. Pools with less than 3
+addresses (/31, /32, /127, /128) do not have this limitation.
+
 
 Configuration
 *************
@@ -104,6 +107,90 @@ described above.
   For a practical tutorial on how to enable this mode in Cilium, see
   :ref:`gsg_ipam_crd_multi_pool`.
 
+Updating existing CiliumPodIPPools
+----------------------------------
+
+Once you configure the ``CiliumPodIPPools``, you cannot update the existing pool. For example, 
+you can't change the default pool to a different CIDR or add an IPv6 CIDR to the default pool. 
+This restriction prevents pods from receiving IPs from a new range while some pods still use 
+the old IP pool on the same nodes. If you need to update the existing CiliumPodIPPools, Please
+use these steps as the references.
+
+Let's assume you have a Kubernetes cluster and are using the ``multi-pool`` as the IPAM mode. 
+You would like to change the existing default pool CIDR to something else and pods will take the IP address from the new CIDR. 
+You hope the change will cause the least disruption to your clusters while updating the default pool to another CIDR.
+
+We will pick some of your nodes where you would like to update the CIDR first and call them Node Group 1. 
+The other nodes, which will update the CIDR later than Node Group 1, will be called Node Group 2.
+
+1. Update your existing pool through ``autoCreateCiliumPodIPPools`` in helm values.
+2. Delete the existing ``CiliumPodIPPools`` from CR and restart the Cilium operator to create new ``CiliumPodIPPools``.
+3. Cordon the Node Group 1 and evict pods to the Node Group 2.
+4. Delete ``CiliumNodes`` for Node Group 1, restart the Cilium agents and uncordon for Node Group 1.
+5. Cordon Node Group 2, and evict pods to Node Group 1 so they can get IPs from the new CIDR from the pool.
+6. Delete ``CiliumNodes`` for Node Group 2, restart the Cilium agents and uncordon for Node Group 2.
+7. (Optional) Reschedule pods to ensure workload is evenly distributed across nodes in cluster.
+
+Per-Node Default Pool
+---------------------
+
+Cilium can allocate specific IP pools to nodes based on their labels. This
+feature is particularly useful in multi-datacenter environments where different
+nodes require IP ranges that align with their respective datacenter's subnets.
+For instance, nodes in DC1 might use the range 10.1.0.0/16, while nodes in DC2
+might use the range 10.2.0.0/16.
+
+In particular, it is possible to set a per-node default pool by setting the
+``ipam-default-ip-pool`` in a ``CiliumNodeConfig`` resource on nodes matching
+certain node labels.
+
+.. code-block:: yaml
+
+    ---
+    apiVersion: cilium.io/v2alpha1
+    kind: CiliumPodIPPool
+    metadata:
+      name: dc1-pool
+    spec:
+      ipv4:
+        cidrs:
+          - 10.1.0.0/16
+        maskSize: 24
+    ---
+    apiVersion: cilium.io/v2alpha1
+    kind: CiliumPodIPPool
+    metadata:
+      name: dc2-pool
+    spec:
+      ipv4:
+        cidrs:
+          - 10.2.0.0/16
+        maskSize: 24
+    ---
+    apiVersion: cilium.io/v2
+    kind: CiliumNodeConfig
+    metadata:
+      name: ip-pool-dc1
+      namespace: kube-system
+    spec:
+      defaults:
+        ipam-default-ip-pool: dc1-pool
+      nodeSelector:
+        matchLabels:
+          topology.kubernetes.io/zone: dc1
+    ---
+    apiVersion: cilium.io/v2
+    kind: CiliumNodeConfig
+    metadata:
+      name: ip-pool-dc2
+      namespace: kube-system
+    spec:
+      defaults:
+        ipam-default-ip-pool: dc2-pool
+      nodeSelector:
+        matchLabels:
+          topology.kubernetes.io/zone: dc2
+
 Allocation Parameters
 ---------------------
 
@@ -135,6 +222,14 @@ scheduled on the node, but not yet received an IP), and ``preAllocIPs`` is the
 minimum number of IPs that we want to pre-allocate as a buffer, i.e. the value
 taken from the ``ipam-multi-pool-pre-allocation`` map.
 
+Routing to Allocated PodCIDRs
+-----------------------------
+
+PodCIDRs allocated from ``CiliumPodIPPools`` can be announced to the network by the
+:ref:`bgp_control_plane` (:ref:`bgp_control_plane_multipool_ipam`). Alternatively,
+the ``autoDirectNodeRoutes`` Helm option can be used to enable automatic routing
+between nodes on a L2 network.
+
  .. _ipam_crd_multi_pool_limitations:
 
 Limitations
@@ -144,8 +239,8 @@ Multi-Pool IPAM is a preview feature. The following limitations apply to Cilium 
 Multi-Pool IPAM mode:
 
 .. warning::
-   - Tunnel mode is not supported. Multi-Pool IPAM may only be used in direct routing mode.
-   - Transparent encryption is only supported with WireGuard and cannot be used with IPSec.
+   - IPsec is not supported in native routing mode. IPsec in tunnel mode and WireGuard
+     (both in native routing and tunnel mode) are supported.
    - IPAM pools with overlapping CIDRs are not supported. Each pod IP must be
      unique in the cluster due the way Cilium determines the security identity
      of endpoints by way of the IPCache.
@@ -158,5 +253,3 @@ Multi-Pool IPAM mode:
      you may want to use ``ip-masq-agent``, which allows multiple disjunct non-masquerading
      CIDRs to be defined. See :ref:`concepts_masquerading` for details on how to use the
      ``ip-masq-agent`` feature.
-   - Announcing PodCIDRs by way of the built-in :ref:`bgp` mode is not yet
-     supported.  Use ``auto-direct-node-routes`` instead.

@@ -33,9 +33,6 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	// ensure auth plugins are loaded
-	_ "k8s.io/client-go/plugin/pkg/client/auth"
 )
 
 const (
@@ -45,7 +42,7 @@ const (
 
 // MustCreateSelfSignedCertSecret creates a self-signed SSL certificate and stores it in a secret
 func MustCreateSelfSignedCertSecret(t *testing.T, namespace, secretName string, hosts []string) *corev1.Secret {
-	require.Greater(t, len(hosts), 0, "require a non-empty hosts for Subject Alternate Name values")
+	require.NotEmpty(t, hosts, "require a non-empty hosts for Subject Alternate Name values")
 
 	var serverKey, serverCert bytes.Buffer
 
@@ -68,7 +65,7 @@ func MustCreateSelfSignedCertSecret(t *testing.T, namespace, secretName string, 
 	return newSecret
 }
 
-// generateRSACert generates a basic self signed certificate valid for a year
+// generateRSACert generates a basic self-signed certificate valid for a year
 func generateRSACert(hosts []string, keyOut, certOut io.Writer) error {
 	priv, err := rsa.GenerateKey(rand.Reader, rsaBits)
 	if err != nil {

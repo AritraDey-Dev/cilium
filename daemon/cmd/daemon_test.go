@@ -5,48 +5,50 @@ package cmd
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
-	. "github.com/cilium/checkmate"
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/hivetest"
 	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/cilium/api/v1/models"
+	"github.com/cilium/cilium/api/v1/server"
 	cnicell "github.com/cilium/cilium/daemon/cmd/cni"
 	fakecni "github.com/cilium/cilium/daemon/cmd/cni/fake"
 	"github.com/cilium/cilium/pkg/controller"
 	fakeDatapath "github.com/cilium/cilium/pkg/datapath/fake"
-	datapath "github.com/cilium/cilium/pkg/datapath/types"
-	"github.com/cilium/cilium/pkg/endpoint"
+	"github.com/cilium/cilium/pkg/datapath/prefilter"
+	endpointapi "github.com/cilium/cilium/pkg/endpoint/api"
 	"github.com/cilium/cilium/pkg/envoy"
-	fqdnproxy "github.com/cilium/cilium/pkg/fqdn/proxy"
-	"github.com/cilium/cilium/pkg/fqdn/restore"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
-	"github.com/cilium/cilium/pkg/hive/job"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
+	k8sSynced "github.com/cilium/cilium/pkg/k8s/synced"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/kvstore/store"
 	"github.com/cilium/cilium/pkg/labelsfilter"
-	"github.com/cilium/cilium/pkg/lock"
-	ctmapgc "github.com/cilium/cilium/pkg/maps/ctmap/gc"
+	"github.com/cilium/cilium/pkg/loadbalancer"
+	"github.com/cilium/cilium/pkg/maps/ctmap"
+	"github.com/cilium/cilium/pkg/maps/policymap"
 	"github.com/cilium/cilium/pkg/metrics"
 	monitorAgent "github.com/cilium/cilium/pkg/monitor/agent"
-	monitorAPI "github.com/cilium/cilium/pkg/monitor/api"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
+	policyAPI "github.com/cilium/cilium/pkg/policy/api"
+	policycell "github.com/cilium/cilium/pkg/policy/cell"
+	policyTypes "github.com/cilium/cilium/pkg/policy/types"
 	"github.com/cilium/cilium/pkg/promise"
-	"github.com/cilium/cilium/pkg/proxy"
-	"github.com/cilium/cilium/pkg/statedb"
 	"github.com/cilium/cilium/pkg/testutils"
-	"github.com/cilium/cilium/pkg/types"
+	testidentity "github.com/cilium/cilium/pkg/testutils/identity"
 )
 
 type DaemonSuite struct {
 	hive *hive.Hive
+	log  *slog.Logger
 
 	d *Daemon
 
@@ -54,13 +56,9 @@ type DaemonSuite struct {
 	// as returned by policy.GetPolicyEnabled().
 	oldPolicyEnabled string
 
-	// Owners interface mock
-	OnGetPolicyRepository  func() *policy.Repository
-	OnGetNamedPorts        func() (npm types.NamedPortMultiMap)
-	OnQueueEndpointBuild   func(ctx context.Context, epID uint64) (func(), error)
-	OnGetCompilationLock   func() *lock.RWMutex
-	OnSendNotification     func(typ monitorAPI.AgentNotifyMessage) error
-	OnGetCIDRPrefixLengths func() ([]int, []int)
+	PolicyImporter     policycell.PolicyImporter
+	envoyXdsServer     envoy.XDSServer
+	endpointAPIManager endpointapi.EndpointAPIManager
 }
 
 func setupTestDirectories() string {
@@ -90,55 +88,17 @@ func TestMain(m *testing.M) {
 		os.Exit(m.Run())
 	}
 
-	proxy.DefaultDNSProxy = fqdnproxy.MockFQDNProxy{}
-
 	time.Local = time.UTC
 
 	os.Exit(m.Run())
 }
 
-type dummyEpSyncher struct{}
+func setupDaemonSuite(tb testing.TB) *DaemonSuite {
+	testutils.IntegrationTest(tb)
 
-func (epSync *dummyEpSyncher) RunK8sCiliumEndpointSync(e *endpoint.Endpoint, conf endpoint.EndpointStatusConfiguration, hr cell.HealthReporter) {
-}
-
-func (epSync *dummyEpSyncher) DeleteK8sCiliumEndpointSync(e *endpoint.Endpoint) {
-}
-
-func (ds *DaemonSuite) SetUpSuite(c *C) {
-	testutils.IntegrationTest(c)
-}
-
-func (s *DaemonSuite) setupConfigOptions() {
-	// Set up all configuration options which are global to the entire test
-	// run.
-	mockCmd := &cobra.Command{}
-	s.hive.RegisterFlags(mockCmd.Flags())
-	InitGlobalFlags(mockCmd, s.hive.Viper())
-	option.Config.Populate(s.hive.Viper())
-	option.Config.IdentityAllocationMode = option.IdentityAllocationModeKVstore
-	option.Config.DryMode = true
-	option.Config.Opts = option.NewIntOptions(&option.DaemonMutableOptionLibrary)
-	// GetConfig the default labels prefix filter
-	err := labelsfilter.ParseLabelPrefixCfg(nil, "")
-	if err != nil {
-		panic("ParseLabelPrefixCfg() failed")
+	ds := &DaemonSuite{
+		log: hivetest.Logger(tb),
 	}
-	option.Config.Opts.SetBool(option.DropNotify, true)
-	option.Config.Opts.SetBool(option.TraceNotify, true)
-	option.Config.Opts.SetBool(option.PolicyVerdictNotify, true)
-
-	// Disable restore of host IPs for unit tests. There can be arbitrary
-	// state left on disk.
-	option.Config.EnableHostIPRestore = false
-
-	// Disable the replacement, as its initialization function execs bpftool
-	// which requires root privileges. This would require marking the test suite
-	// as privileged.
-	option.Config.KubeProxyReplacement = option.KubeProxyReplacementFalse
-}
-
-func (ds *DaemonSuite) SetUpTest(c *C) {
 	ctx := context.Background()
 
 	ds.oldPolicyEnabled = policy.GetPolicyEnabled()
@@ -147,24 +107,38 @@ func (ds *DaemonSuite) SetUpTest(c *C) {
 	var daemonPromise promise.Promise[*Daemon]
 	ds.hive = hive.New(
 		cell.Provide(
-			func() k8sClient.Clientset {
-				cs, _ := k8sClient.NewFakeClientset()
+			func(log *slog.Logger) k8sClient.Clientset {
+				cs, _ := k8sClient.NewFakeClientset(log)
 				cs.Disable()
 				return cs
 			},
 			func() *option.DaemonConfig { return option.Config },
 			func() cnicell.CNIConfigManager { return &fakecni.FakeCNIConfigManager{} },
-			func() ctmapgc.Enabler { return ctmapgc.NewFake() },
+			func() ctmap.GCRunner { return ctmap.NewFakeGCRunner() },
+			func() policymap.Factory { return nil },
+			k8sSynced.RejectedCRDSyncPromise,
+			func() *loadbalancer.TestConfig {
+				return &loadbalancer.TestConfig{}
+			},
+			func() *server.Server { return nil },
 		),
 		fakeDatapath.Cell,
+		prefilter.Cell,
 		monitorAgent.Cell,
 		ControlPlane,
-		statedb.Cell,
-		job.Cell,
 		metrics.Cell,
 		store.Cell,
 		cell.Invoke(func(p promise.Promise[*Daemon]) {
 			daemonPromise = p
+		}),
+		cell.Invoke(func(pi policycell.PolicyImporter) {
+			ds.PolicyImporter = pi
+		}),
+		cell.Invoke(func(envoyXdsServer envoy.XDSServer) {
+			ds.envoyXdsServer = envoyXdsServer
+		}),
+		cell.Invoke(func(endpointAPIManager endpointapi.EndpointAPIManager) {
+			ds.endpointAPIManager = endpointAPIManager
 		}),
 	)
 
@@ -176,150 +150,94 @@ func (ds *DaemonSuite) SetUpTest(c *C) {
 	option.Config.RunDir = testRunDir
 	option.Config.StateDir = testRunDir
 
-	err := ds.hive.Start(ctx)
-	c.Assert(err, IsNil)
+	err := ds.hive.Start(ds.log, ctx)
+	require.NoError(tb, err)
 
 	ds.d, err = daemonPromise.Await(ctx)
-	c.Assert(err, IsNil)
+	require.NoError(tb, err)
 
-	kvstore.Client().DeletePrefix(ctx, kvstore.OperationalPath)
-	kvstore.Client().DeletePrefix(ctx, kvstore.BaseKeyPrefix)
-
-	ds.OnGetPolicyRepository = ds.d.GetPolicyRepository
-	ds.OnQueueEndpointBuild = nil
-	ds.OnGetCompilationLock = ds.d.GetCompilationLock
-	ds.OnSendNotification = ds.d.SendNotification
-	ds.OnGetCIDRPrefixLengths = nil
+	ds.d.policy.GetSelectorCache().SetLocalIdentityNotifier(testidentity.NewDummyIdentityNotifier())
 
 	// Reset the most common endpoint states before each test.
 	for _, s := range []string{
 		string(models.EndpointStateReady),
 		string(models.EndpointStateWaitingDashForDashIdentity),
-		string(models.EndpointStateWaitingDashToDashRegenerate)} {
+		string(models.EndpointStateWaitingDashToDashRegenerate),
+	} {
 		metrics.EndpointStateCount.WithLabelValues(s).Set(0.0)
 	}
+
+	tb.Cleanup(func() {
+		controller.NewManager().RemoveAllAndWait()
+
+		// It's helpful to keep the directories around if a test failed; only delete
+		// them if tests succeed.
+		if !tb.Failed() {
+			os.RemoveAll(option.Config.RunDir)
+		}
+
+		// Restore the policy enforcement mode.
+		policy.SetPolicyEnabled(ds.oldPolicyEnabled)
+
+		err := ds.hive.Stop(ds.log, ctx)
+		require.NoError(tb, err)
+
+		ds.d.Close()
+	})
+
+	return ds
 }
 
-func (ds *DaemonSuite) TearDownTest(c *C) {
-	ctx := context.Background()
-
-	controller.NewManager().RemoveAllAndWait()
-	ds.d.endpointManager.RemoveAll()
-
-	// It's helpful to keep the directories around if a test failed; only delete
-	// them if tests succeed.
-	if !c.Failed() {
-		os.RemoveAll(option.Config.RunDir)
+func (ds *DaemonSuite) setupConfigOptions() {
+	// Set up all configuration options which are global to the entire test
+	// run.
+	mockCmd := &cobra.Command{}
+	ds.hive.RegisterFlags(mockCmd.Flags())
+	InitGlobalFlags(ds.log, mockCmd, ds.hive.Viper())
+	option.Config.Populate(ds.log, ds.hive.Viper())
+	option.Config.IdentityAllocationMode = option.IdentityAllocationModeKVstore
+	option.Config.DryMode = true
+	option.Config.Opts = option.NewIntOptions(&option.DaemonMutableOptionLibrary)
+	// GetConfig the default labels prefix filter
+	err := labelsfilter.ParseLabelPrefixCfg(ds.log, nil, nil, "")
+	if err != nil {
+		panic("ParseLabelPrefixCfg() failed")
 	}
+	option.Config.Opts.SetBool(option.DropNotify, true)
+	option.Config.Opts.SetBool(option.TraceNotify, true)
+	option.Config.Opts.SetBool(option.PolicyVerdictNotify, true)
 
-	// Restore the policy enforcement mode.
-	policy.SetPolicyEnabled(ds.oldPolicyEnabled)
-
-	err := ds.hive.Stop(ctx)
-	c.Assert(err, IsNil)
-
-	ds.d.Close()
+	// Disable the replacement, as its initialization function execs bpftool
+	// which requires root privileges. This would require marking the test suite
+	// as privileged.
+	option.Config.KubeProxyReplacement = option.KubeProxyReplacementFalse
 }
 
 type DaemonEtcdSuite struct {
 	DaemonSuite
 }
 
-var _ = Suite(&DaemonEtcdSuite{})
+func setupDaemonEtcdSuite(tb testing.TB) *DaemonEtcdSuite {
+	testutils.IntegrationTest(tb)
+	kvstore.SetupDummy(tb, "etcd")
 
-func (e *DaemonEtcdSuite) SetUpSuite(c *C) {
-	testutils.IntegrationTest(c)
-}
-
-func (e *DaemonEtcdSuite) SetUpTest(c *C) {
-	kvstore.SetupDummy(c, "etcd")
-	e.DaemonSuite.SetUpTest(c)
-}
-
-func (e *DaemonEtcdSuite) TearDownTest(c *C) {
-	e.DaemonSuite.TearDownTest(c)
-}
-
-type DaemonConsulSuite struct {
-	DaemonSuite
-}
-
-var _ = Suite(&DaemonConsulSuite{})
-
-func (e *DaemonConsulSuite) SetUpSuite(c *C) {
-	testutils.IntegrationTest(c)
-}
-
-func (e *DaemonConsulSuite) SetUpTest(c *C) {
-	kvstore.SetupDummy(c, "consul")
-	e.DaemonSuite.SetUpTest(c)
-}
-
-func (e *DaemonConsulSuite) TearDownTest(c *C) {
-	e.DaemonSuite.TearDownTest(c)
-}
-
-func (ds *DaemonSuite) TestMinimumWorkerThreadsIsSet(c *C) {
-	c.Assert(numWorkerThreads() >= 2, Equals, true)
-	c.Assert(numWorkerThreads() >= runtime.NumCPU(), Equals, true)
-}
-
-func (ds *DaemonSuite) GetPolicyRepository() *policy.Repository {
-	if ds.OnGetPolicyRepository != nil {
-		return ds.OnGetPolicyRepository()
+	ds := setupDaemonSuite(tb)
+	return &DaemonEtcdSuite{
+		DaemonSuite: *ds,
 	}
-	panic("GetPolicyRepository should not have been called")
 }
 
-func (ds *DaemonSuite) GetNamedPorts() (npm types.NamedPortMultiMap) {
-	if ds.OnGetNamedPorts != nil {
-		return ds.OnGetNamedPorts()
-	}
-	panic("GetNamedPorts should not have been called")
+// convenience wrapper that adds a single policy
+func (ds *DaemonSuite) policyImport(rules policyAPI.Rules) {
+	ds.updatePolicy(&policyTypes.PolicyUpdate{
+		Rules: rules,
+	})
 }
 
-func (ds *DaemonSuite) QueueEndpointBuild(ctx context.Context, epID uint64) (func(), error) {
-	if ds.OnQueueEndpointBuild != nil {
-		return ds.OnQueueEndpointBuild(ctx, epID)
-	}
-
-	return nil, nil
-}
-
-func (ds *DaemonSuite) GetCompilationLock() *lock.RWMutex {
-	if ds.OnGetCompilationLock != nil {
-		return ds.OnGetCompilationLock()
-	}
-	panic("GetCompilationLock should not have been called")
-}
-
-func (ds *DaemonSuite) SendNotification(msg monitorAPI.AgentNotifyMessage) error {
-	if ds.OnSendNotification != nil {
-		return ds.OnSendNotification(msg)
-	}
-	panic("SendNotification should not have been called")
-}
-
-func (ds *DaemonSuite) GetCIDRPrefixLengths() ([]int, []int) {
-	if ds.OnGetCIDRPrefixLengths != nil {
-		return ds.OnGetCIDRPrefixLengths()
-	}
-	panic("GetCIDRPrefixLengths should not have been called")
-}
-
-func (ds *DaemonSuite) Datapath() datapath.Datapath {
-	return ds.d.datapath
-}
-
-func (ds *DaemonSuite) GetDNSRules(epID uint16) restore.DNSRules {
-	return nil
-}
-
-func (ds *DaemonSuite) RemoveRestoredDNSRules(epID uint16) {
-}
-
-func (ds *DaemonSuite) TestMemoryMap(c *C) {
-	pid := os.Getpid()
-	m := memoryMap(pid)
-	c.Assert(m, Not(Equals), "")
+// convenience wrapper that synchronously performs a policy update
+func (ds *DaemonSuite) updatePolicy(upd *policyTypes.PolicyUpdate) {
+	dc := make(chan uint64, 1)
+	upd.DoneChan = dc
+	ds.PolicyImporter.UpdatePolicy(upd)
+	<-dc
 }

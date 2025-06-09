@@ -4,6 +4,7 @@
 package maps
 
 import (
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
@@ -11,8 +12,8 @@ import (
 	"strings"
 
 	"github.com/cilium/cilium/pkg/bpf"
-	"github.com/cilium/cilium/pkg/datapath/linux/bandwidth"
-	"github.com/cilium/cilium/pkg/logging"
+	dptypes "github.com/cilium/cilium/pkg/datapath/types"
+	"github.com/cilium/cilium/pkg/loadbalancer"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/callsmap"
 	"github.com/cilium/cilium/pkg/maps/cidrmap"
@@ -24,10 +25,6 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 )
 
-var (
-	log = logging.DefaultLogger.WithField(logfields.LogSubsys, "datapath-maps")
-)
-
 // endpointManager checks against its list of the current endpoints to determine
 // whether map paths should be removed, and implements map removal.
 //
@@ -37,23 +34,26 @@ type endpointManager interface {
 	EndpointExists(endpointID uint16) bool
 	RemoveDatapathMapping(endpointID uint16) error
 	RemoveMapPath(path string)
-	HasGlobalCT() bool
 }
 
 // MapSweeper is responsible for checking stale map paths on the filesystem
 // and garbage collecting the endpoint if the corresponding endpoint no longer
 // exists.
 type MapSweeper struct {
+	logger *slog.Logger
 	endpointManager
-	bwManager bandwidth.Manager
+	bwManager dptypes.BandwidthManager
+	lbConfig  loadbalancer.Config
 }
 
 // NewMapSweeper creates an object that walks map paths and garbage-collects
 // them.
-func NewMapSweeper(g endpointManager, bwm bandwidth.Manager) *MapSweeper {
+func NewMapSweeper(defaultLogger *slog.Logger, g endpointManager, bwm dptypes.BandwidthManager, lbConfig loadbalancer.Config) *MapSweeper {
 	return &MapSweeper{
+		logger:          defaultLogger.With(logfields.LogSubsys, "datapath-maps"),
 		endpointManager: g,
 		bwManager:       bwm,
+		lbConfig:        lbConfig,
 	}
 }
 
@@ -70,19 +70,13 @@ func (ms *MapSweeper) deleteMapIfStale(path string, filename string, endpointID 
 		} else {
 			err2 := ms.RemoveDatapathMapping(epID)
 			if err2 != nil {
-				log.WithError(err2).Debugf("Failed to remove ID %d from global policy map", tmp)
+				ms.logger.Debug("Failed to remove ID from global policy map",
+					logfields.Error, err2,
+					logfields.ID, tmp,
+				)
 			}
 			ms.RemoveMapPath(path)
 		}
-	}
-}
-
-func (ms *MapSweeper) checkStaleGlobalMap(path string, filename string) {
-	globalCTinUse := ms.HasGlobalCT() || option.Config.EnableNodePort ||
-		!option.Config.InstallIptRules && option.Config.MasqueradingEnabled()
-
-	if !globalCTinUse && ctmap.NameIsGlobal(filename) {
-		ms.RemoveMapPath(path)
 	}
 }
 
@@ -99,8 +93,6 @@ func (ms *MapSweeper) walk(path string, _ os.FileInfo, _ error) error {
 		callsmap.CustomCallsMapName,
 	}
 
-	ms.checkStaleGlobalMap(path, filename)
-
 	for _, m := range mapPrefix {
 		if strings.HasPrefix(filename, m) {
 			if endpointID := strings.TrimPrefix(filename, m); endpointID != filename {
@@ -116,7 +108,7 @@ func (ms *MapSweeper) walk(path string, _ os.FileInfo, _ error) error {
 // datapath.
 func (ms *MapSweeper) CollectStaleMapGarbage() {
 	if err := filepath.Walk(bpf.TCGlobalsPath(), ms.walk); err != nil {
-		log.WithError(err).Warn("Error while scanning for stale maps")
+		ms.logger.Warn("Error while scanning for stale maps", logfields.Error, err)
 	}
 }
 
@@ -124,7 +116,7 @@ func (ms *MapSweeper) CollectStaleMapGarbage() {
 // been disabled. The maps may still be in use in which case they will continue
 // to live until the BPF program using them is being replaced.
 func (ms *MapSweeper) RemoveDisabledMaps() {
-	maps := []string{}
+	maps := []string{"cilium_proxy4", "cilium_proxy6"}
 
 	if !option.Config.EnableIPv6 {
 		maps = append(maps, []string{
@@ -138,7 +130,6 @@ func (ms *MapSweeper) RemoveDisabledMaps() {
 			"cilium_lb6_backends_v2",
 			"cilium_lb6_reverse_sk",
 			"cilium_snat_v6_external",
-			"cilium_proxy6",
 			recorder.MapNameWcard6,
 			lbmap.MaglevOuter6MapName,
 			lbmap.Affinity6MapName,
@@ -162,7 +153,6 @@ func (ms *MapSweeper) RemoveDisabledMaps() {
 			"cilium_lb4_backends_v2",
 			"cilium_lb4_reverse_sk",
 			"cilium_snat_v4_external",
-			"cilium_proxy4",
 			recorder.MapNameWcard4,
 			lbmap.MaglevOuter4MapName,
 			lbmap.Affinity4MapName,
@@ -187,6 +177,10 @@ func (ms *MapSweeper) RemoveDisabledMaps() {
 		maps = append(maps, "cilium_ipv4_frag_datagrams")
 	}
 
+	if !option.Config.EnableIPv6FragmentsTracking {
+		maps = append(maps, "cilium_ipv6_frag_datagrams")
+	}
+
 	if !ms.bwManager.Enabled() {
 		maps = append(maps, "cilium_throttle")
 	}
@@ -195,7 +189,8 @@ func (ms *MapSweeper) RemoveDisabledMaps() {
 		maps = append(maps, lbmap.HealthProbe6MapName, lbmap.HealthProbe4MapName)
 	}
 
-	if option.Config.NodePortAlg != option.NodePortAlgMaglev {
+	if ms.lbConfig.LBAlgorithm != loadbalancer.LBAlgorithmMaglev &&
+		!ms.lbConfig.AlgorithmAnnotation {
 		maps = append(maps, lbmap.MaglevOuter6MapName, lbmap.MaglevOuter4MapName)
 	}
 

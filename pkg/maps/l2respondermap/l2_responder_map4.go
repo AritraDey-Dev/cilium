@@ -5,15 +5,15 @@ package l2respondermap
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"unsafe"
 
+	"github.com/cilium/hive/cell"
 	"golang.org/x/sys/unix"
 
 	"github.com/cilium/cilium/pkg/ebpf"
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/types"
 )
 
@@ -31,26 +31,26 @@ type Map interface {
 	IterateWithCallback(cb IterateCallback) error
 }
 
-func NewMap(lifecycle hive.Lifecycle) (Map, error) {
-	return newMap(lifecycle, DefaultMaxEntries)
+func NewMap(lifecycle cell.Lifecycle, logger *slog.Logger) Map {
+	return newMap(lifecycle, DefaultMaxEntries, logger)
 }
 
 type l2ResponderMap struct {
 	*ebpf.Map
 }
 
-func newMap(lifecycle hive.Lifecycle, maxEntries int) (*l2ResponderMap, error) {
+func newMap(lifecycle cell.Lifecycle, maxEntries int, logger *slog.Logger) *l2ResponderMap {
 	outerMap := &l2ResponderMap{}
 
-	lifecycle.Append(hive.Hook{
-		OnStart: func(hc hive.HookContext) error {
+	lifecycle.Append(cell.Hook{
+		OnStart: func(hc cell.HookContext) error {
 			var (
 				m   *ebpf.Map
 				err error
 			)
 
-			if m, err = ebpf.LoadRegisterMap(MapName); err != nil {
-				m = ebpf.NewMap(&ebpf.MapSpec{
+			if m, err = ebpf.LoadRegisterMap(logger, MapName); err != nil {
+				m = ebpf.NewMap(logger, &ebpf.MapSpec{
 					Name:       MapName,
 					Type:       ebpf.Hash,
 					KeySize:    uint32(unsafe.Sizeof(L2ResponderKey{})),
@@ -70,7 +70,7 @@ func newMap(lifecycle hive.Lifecycle, maxEntries int) (*l2ResponderMap, error) {
 		},
 	})
 
-	return outerMap, nil
+	return outerMap
 }
 
 // Create creates a new entry for the given IP and IfIndex tuple.
@@ -104,7 +104,7 @@ type IterateCallback func(*L2ResponderKey, *L2ResponderStats)
 // passing each key/value pair to the cb callback.
 func (m *l2ResponderMap) IterateWithCallback(cb IterateCallback) error {
 	return m.Map.IterateWithCallback(&L2ResponderKey{}, &L2ResponderStats{},
-		func(k, v interface{}) {
+		func(k, v any) {
 			key := k.(*L2ResponderKey)
 			value := v.(*L2ResponderStats)
 			cb(key, value)

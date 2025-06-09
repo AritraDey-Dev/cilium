@@ -37,6 +37,9 @@ EXCLUDED_DIRS=(
   "testutils"
   "vendor"
 
+  # Not for cilium-cli
+  "cilium-cli"
+
   # Source shared with other binaries
   "hive"
   "lock"
@@ -51,7 +54,6 @@ EXCLUDED_DIRS=(
   "types"
 
   # May need subsequent evaluation to detect resiliency issues in CI
-  "contexthelpers"
   "rate"
   "resiliency"
 )

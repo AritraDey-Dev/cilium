@@ -1,6 +1,5 @@
 bpf:
   masquerade: true
-kubeProxyReplacement: "strict"
-l7Proxy: false
+kubeProxyReplacement: "true"
 egressGateway:
   enabled: true

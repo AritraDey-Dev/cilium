@@ -6,7 +6,9 @@ package ipmasq
 import (
 	"encoding/json"
 	"fmt"
-	"net"
+	"log/slog"
+	"maps"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,37 +16,36 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"k8s.io/apimachinery/pkg/util/yaml"
 
-	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/maps/ipmasq"
+	"github.com/cilium/cilium/pkg/metrics"
 )
 
 var (
-	log = logging.DefaultLogger.WithField(logfields.LogSubsys, "ipmasq")
-
 	// The following reserved by RFCs IP addr ranges are used by
 	// https://github.com/kubernetes-sigs/ip-masq-agent
-	defaultNonMasqCIDRs = map[string]net.IPNet{
-		"10.0.0.0/8":      mustParseCIDR("10.0.0.0/8"),
-		"172.16.0.0/12":   mustParseCIDR("172.16.0.0/12"),
-		"192.168.0.0/16":  mustParseCIDR("192.168.0.0/16"),
-		"100.64.0.0/10":   mustParseCIDR("100.64.0.0/10"),
-		"192.0.0.0/24":    mustParseCIDR("192.0.0.0/24"),
-		"192.0.2.0/24":    mustParseCIDR("192.0.2.0/24"),
-		"192.88.99.0/24":  mustParseCIDR("192.88.99.0/24"),
-		"198.18.0.0/15":   mustParseCIDR("198.18.0.0/15"),
-		"198.51.100.0/24": mustParseCIDR("198.51.100.0/24"),
-		"203.0.113.0/24":  mustParseCIDR("203.0.113.0/24"),
-		"240.0.0.0/4":     mustParseCIDR("240.0.0.0/4"),
+	defaultNonMasqCIDRs = map[string]netip.Prefix{
+		"10.0.0.0/8":      netip.MustParsePrefix("10.0.0.0/8"),
+		"172.16.0.0/12":   netip.MustParsePrefix("172.16.0.0/12"),
+		"192.168.0.0/16":  netip.MustParsePrefix("192.168.0.0/16"),
+		"100.64.0.0/10":   netip.MustParsePrefix("100.64.0.0/10"),
+		"192.0.0.0/24":    netip.MustParsePrefix("192.0.0.0/24"),
+		"192.0.2.0/24":    netip.MustParsePrefix("192.0.2.0/24"),
+		"192.88.99.0/24":  netip.MustParsePrefix("192.88.99.0/24"),
+		"198.18.0.0/15":   netip.MustParsePrefix("198.18.0.0/15"),
+		"198.51.100.0/24": netip.MustParsePrefix("198.51.100.0/24"),
+		"203.0.113.0/24":  netip.MustParsePrefix("203.0.113.0/24"),
+		"240.0.0.0/4":     netip.MustParsePrefix("240.0.0.0/4"),
 	}
 	linkLocalCIDRIPv4Str = "169.254.0.0/16"
-	linkLocalCIDRIPv4    = mustParseCIDR(linkLocalCIDRIPv4Str)
+	linkLocalCIDRIPv4    = netip.MustParsePrefix(linkLocalCIDRIPv4Str)
 	linkLocalCIDRIPv6Str = "fe80::/10"
-	linkLocalCIDRIPv6    = mustParseCIDR(linkLocalCIDRIPv6Str)
+	linkLocalCIDRIPv6    = netip.MustParsePrefix(linkLocalCIDRIPv6Str)
 )
 
-// ipnet is a wrapper type for net.IPNet to enable de-serialization of CIDRs
-type Ipnet net.IPNet
+// ipnet is a wrapper type for netip.Prefix to enable de-serialization
+// of CIDRs
+type Ipnet netip.Prefix
 
 func (c *Ipnet) UnmarshalJSON(json []byte) error {
 	str := string(json)
@@ -58,16 +59,16 @@ func (c *Ipnet) UnmarshalJSON(json []byte) error {
 		return err
 	}
 
-	*c = Ipnet(*n)
+	*c = Ipnet(n)
 	return nil
 }
 
-func parseCIDR(c string) (*net.IPNet, error) {
-	_, n, err := net.ParseCIDR(c)
+func parseCIDR(c string) (netip.Prefix, error) {
+	n, err := netip.ParsePrefix(c)
 	if err != nil {
-		return nil, fmt.Errorf("Invalid CIDR %s: %s", c, err)
+		return netip.Prefix{}, fmt.Errorf("Invalid CIDR %q: %w", c, err)
 	}
-	return n, nil
+	return n.Masked(), nil
 }
 
 // config represents the ip-masq-agent configuration file encoded as YAML
@@ -79,32 +80,33 @@ type config struct {
 
 // IPMasqMap is an interface describing methods for manipulating an ipmasq map
 type IPMasqMap interface {
-	Update(cidr net.IPNet) error
-	Delete(cidr net.IPNet) error
-	Dump() ([]net.IPNet, error)
+	Update(cidr netip.Prefix) error
+	Delete(cidr netip.Prefix) error
+	Dump() ([]netip.Prefix, error)
 }
 
 // IPMasqAgent represents a state of the ip-masq-agent
 type IPMasqAgent struct {
+	logger                 *slog.Logger
 	configPath             string
 	masqLinkLocalIPv4      bool
 	masqLinkLocalIPv6      bool
-	nonMasqCIDRsFromConfig map[string]net.IPNet
-	nonMasqCIDRsInMap      map[string]net.IPNet
+	nonMasqCIDRsFromConfig map[string]netip.Prefix
+	nonMasqCIDRsInMap      map[string]netip.Prefix
 	ipMasqMap              IPMasqMap
 	watcher                *fsnotify.Watcher
 	stop                   chan struct{}
 	handlerFinished        chan struct{}
 }
 
-func NewIPMasqAgent(configPath string) (*IPMasqAgent, error) {
-	return newIPMasqAgent(configPath, &ipmasq.IPMasqBPFMap{})
+func NewIPMasqAgent(logger *slog.Logger, reg *metrics.Registry, configPath string) (*IPMasqAgent, error) {
+	return newIPMasqAgent(logger, configPath, &ipmasq.IPMasqBPFMap{MetricsRegistry: reg})
 }
 
-func newIPMasqAgent(configPath string, ipMasqMap IPMasqMap) (*IPMasqAgent, error) {
+func newIPMasqAgent(logger *slog.Logger, configPath string, ipMasqMap IPMasqMap) (*IPMasqAgent, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		return nil, fmt.Errorf("Failed to create fsnotify watcher: %s", err)
+		return nil, fmt.Errorf("Failed to create fsnotify watcher: %w", err)
 	}
 
 	configDir := filepath.Dir(configPath)
@@ -112,13 +114,14 @@ func newIPMasqAgent(configPath string, ipMasqMap IPMasqMap) (*IPMasqAgent, error
 	// the watcher will fail to add
 	if err := watcher.Add(configDir); err != nil {
 		watcher.Close()
-		return nil, fmt.Errorf("Failed to add %q dir to fsnotify watcher: %s", configDir, err)
+		return nil, fmt.Errorf("Failed to add %q dir to fsnotify watcher: %w", configDir, err)
 	}
 
 	a := &IPMasqAgent{
+		logger:                 logger,
 		configPath:             configPath,
-		nonMasqCIDRsFromConfig: map[string]net.IPNet{},
-		nonMasqCIDRsInMap:      map[string]net.IPNet{},
+		nonMasqCIDRsFromConfig: map[string]netip.Prefix{},
+		nonMasqCIDRsInMap:      map[string]netip.Prefix{},
 		ipMasqMap:              ipMasqMap,
 		watcher:                watcher,
 	}
@@ -130,10 +133,10 @@ func newIPMasqAgent(configPath string, ipMasqMap IPMasqMap) (*IPMasqAgent, error
 // updates the BPF map accordingly.
 func (a *IPMasqAgent) Start() {
 	if err := a.restore(); err != nil {
-		log.WithError(err).Warn("Failed to restore")
+		a.logger.Warn("Failed to restore", logfields.Error, err)
 	}
 	if err := a.Update(); err != nil {
-		log.WithError(err).Warn("Failed to update")
+		a.logger.Warn("Failed to update", logfields.Error, err)
 	}
 
 	a.stop = make(chan struct{})
@@ -143,7 +146,7 @@ func (a *IPMasqAgent) Start() {
 		for {
 			select {
 			case event := <-a.watcher.Events:
-				log.Debugf("Received fsnotify event: %+v", event)
+				a.logger.Debug("Received fsnotify event", logfields.Event, event)
 
 				switch {
 				case event.Has(fsnotify.Create),
@@ -152,15 +155,15 @@ func (a *IPMasqAgent) Start() {
 					event.Has(fsnotify.Remove),
 					event.Has(fsnotify.Rename):
 					if err := a.Update(); err != nil {
-						log.WithError(err).Warn("Failed to update")
+						a.logger.Warn("Failed to update", logfields.Error, err)
 					}
 				default:
-					log.Warnf("Watcher received unknown event: %s. Ignoring.", event)
+					a.logger.Warn("Watcher received unknown event. Ignoring...", logfields.Event, event)
 				}
 			case err := <-a.watcher.Errors:
-				log.WithError(err).Warn("Watcher received an error")
+				a.logger.Warn("Watcher received an error", logfields.Error, err)
 			case <-a.stop:
-				log.Info("Stopping ip-masq-agent")
+				a.logger.Info("Stopping ip-masq-agent")
 				close(a.handlerFinished)
 				return
 			}
@@ -184,9 +187,7 @@ func (a *IPMasqAgent) Update() error {
 
 	// Set default nonMasq CIDRS if user hasn't specified any
 	if isEmpty {
-		for cidrStr, cidr := range defaultNonMasqCIDRs {
-			a.nonMasqCIDRsFromConfig[cidrStr] = cidr
-		}
+		maps.Copy(a.nonMasqCIDRsFromConfig, defaultNonMasqCIDRs)
 	}
 
 	if !a.masqLinkLocalIPv4 {
@@ -199,7 +200,7 @@ func (a *IPMasqAgent) Update() error {
 
 	for cidrStr, cidr := range a.nonMasqCIDRsFromConfig {
 		if _, ok := a.nonMasqCIDRsInMap[cidrStr]; !ok {
-			log.WithField(logfields.CIDR, cidrStr).Info("Adding CIDR")
+			a.logger.Info("Adding CIDR", logfields.CIDR, cidrStr)
 			a.ipMasqMap.Update(cidr)
 			a.nonMasqCIDRsInMap[cidrStr] = cidr
 		}
@@ -207,7 +208,7 @@ func (a *IPMasqAgent) Update() error {
 
 	for cidrStr, cidr := range a.nonMasqCIDRsInMap {
 		if _, ok := a.nonMasqCIDRsFromConfig[cidrStr]; !ok {
-			log.WithField(logfields.CIDR, cidrStr).Info("Removing CIDR")
+			a.logger.Info("Removing CIDR", logfields.CIDR, cidrStr)
 			a.ipMasqMap.Delete(cidr)
 			delete(a.nonMasqCIDRsInMap, cidrStr)
 		}
@@ -224,17 +225,17 @@ func (a *IPMasqAgent) readConfig() (bool, error) {
 	raw, err := os.ReadFile(a.configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.WithField(logfields.Path, a.configPath).Info("Config file not found")
-			a.nonMasqCIDRsFromConfig = map[string]net.IPNet{}
+			a.logger.Info("Config file not found", logfields.Path, a.configPath)
+			a.nonMasqCIDRsFromConfig = map[string]netip.Prefix{}
 			a.masqLinkLocalIPv4 = false
 			a.masqLinkLocalIPv6 = false
 			return true, nil
 		}
-		return false, fmt.Errorf("Failed to read %s: %s", a.configPath, err)
+		return false, fmt.Errorf("Failed to read %s: %w", a.configPath, err)
 	}
 
 	if len(raw) == 0 {
-		a.nonMasqCIDRsFromConfig = map[string]net.IPNet{}
+		a.nonMasqCIDRsFromConfig = map[string]netip.Prefix{}
 		a.masqLinkLocalIPv4 = false
 		a.masqLinkLocalIPv6 = false
 		return true, nil
@@ -242,16 +243,16 @@ func (a *IPMasqAgent) readConfig() (bool, error) {
 
 	jsonStr, err := yaml.ToJSON(raw)
 	if err != nil {
-		return false, fmt.Errorf("Failed to convert to json: %s", err)
+		return false, fmt.Errorf("Failed to convert to json: %w", err)
 	}
 
 	if err := json.Unmarshal(jsonStr, &cfg); err != nil {
-		return false, fmt.Errorf("Failed to de-serialize json: %s", err)
+		return false, fmt.Errorf("Failed to de-serialize json: %w", err)
 	}
 
-	nonMasqCIDRs := map[string]net.IPNet{}
+	nonMasqCIDRs := map[string]netip.Prefix{}
 	for _, cidr := range cfg.NonMasqCIDRs {
-		n := net.IPNet(cidr)
+		n := netip.Prefix(cidr)
 		nonMasqCIDRs[n.String()] = n
 	}
 	a.nonMasqCIDRsFromConfig = nonMasqCIDRs
@@ -266,22 +267,14 @@ func (a *IPMasqAgent) readConfig() (bool, error) {
 func (a *IPMasqAgent) restore() error {
 	cidrsInMap, err := a.ipMasqMap.Dump()
 	if err != nil {
-		return fmt.Errorf("Failed to dump ip-masq-agent cidrs from map: %s", err)
+		return fmt.Errorf("Failed to dump ip-masq-agent cidrs from map: %w", err)
 	}
 
-	cidrs := map[string]net.IPNet{}
+	cidrs := map[string]netip.Prefix{}
 	for _, cidr := range cidrsInMap {
 		cidrs[cidr.String()] = cidr
 	}
 	a.nonMasqCIDRsInMap = cidrs
 
 	return nil
-}
-
-func mustParseCIDR(c string) net.IPNet {
-	n, err := parseCIDR(c)
-	if err != nil {
-		panic(err)
-	}
-	return *n
 }

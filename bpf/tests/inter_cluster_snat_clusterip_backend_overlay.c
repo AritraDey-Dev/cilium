@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /* Copyright Authors of Cilium */
 
-#include "common.h"
 
 #include <bpf/ctx/skb.h>
-#include "linux/if_ether.h"
+#include "common.h"
 #include "pktgen.h"
 #include "mock_skb_metadata.h"
 
@@ -31,7 +30,7 @@
 #define ENABLE_INTER_CLUSTER_SNAT
 
 /* Import map definitions and some default values */
-#include "node_config.h"
+#include <bpf/config/node.h>
 
 /* Overwrite the default port range defined in node_config.h
  * to have deterministic source port selection.
@@ -41,7 +40,7 @@
 #undef NODEPORT_PORT_MAX_NAT
 #define NODEPORT_PORT_MAX 32767
 #define NODEPORT_PORT_MIN_NAT (NODEPORT_PORT_MAX + 1)
-#define NODEPORT_PORT_MAX_NAT (NODEPORT_PORT_MIN_NAT + 1)
+#define NODEPORT_PORT_MAX_NAT (NODEPORT_PORT_MIN_NAT)
 
 /* Overwrite (local) CLUSTER_ID defined in node_config.h */
 #undef CLUSTER_ID
@@ -192,10 +191,10 @@ int from_overlay_syn_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "01_from_overlay_syn")
 int from_overlay_syn_setup(struct __ctx_buff *ctx)
 {
-	endpoint_v4_add_entry(BACKEND_IP, BACKEND_IFINDEX, 0, 0,
+	endpoint_v4_add_entry(BACKEND_IP, BACKEND_IFINDEX, 0, 0, 0, 0,
 			      (__u8 *)BACKEND_MAC, (__u8 *)BACKEND_ROUTER_MAC);
 
-	tail_call_static(ctx, &entry_call_map, FROM_OVERLAY);
+	tail_call_static(ctx, entry_call_map, FROM_OVERLAY);
 	return TEST_ERROR;
 }
 
@@ -249,15 +248,21 @@ int from_overlay_syn_check(struct __ctx_buff *ctx)
 	if (l3->daddr != BACKEND_IP)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0x4212))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != CLIENT_INTER_CLUSTER_SNAT_PORT)
 		test_fatal("src port has changed");
 
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
 
-	meta = ctx_load_meta(ctx, CB_IFINDEX);
-	if (meta != BACKEND_IFINDEX)
-		test_fatal("skb->cb[CB_IFINDEX] should be %d, got %d", BACKEND_IFINDEX, meta);
+	if (l4->check != bpf_htons(0x777f))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+
+	meta = ctx_load_meta(ctx, CB_DELIVERY_REDIRECT);
+	if (meta != 1)
+		test_fatal("skb->cb[CB_DELIVERY_REDIRECT] should be 1, got %d", meta);
 
 	meta = ctx_load_meta(ctx, CB_SRC_LABEL);
 	if (meta != CLIENT_IDENTITY)
@@ -287,7 +292,7 @@ int to_overlay_synack_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "02_to_overlay_synack")
 int to_overlay_synack_setup(struct __ctx_buff *ctx)
 {
-	tail_call_static(ctx, &entry_call_map, TO_OVERLAY);
+	tail_call_static(ctx, entry_call_map, TO_OVERLAY);
 	return TEST_ERROR;
 }
 
@@ -337,11 +342,17 @@ int to_overlay_synack_check(struct __ctx_buff *ctx)
 	if (l3->daddr != CLIENT_NODE_IP)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0x4112))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != BACKEND_PORT)
 		test_fatal("src port has changed");
 
 	if (l4->dest != CLIENT_INTER_CLUSTER_SNAT_PORT)
 		test_fatal("dst port has changed");
+
+	if (l4->check != bpf_htons(0x776f))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
 
 	test_finish();
 }
@@ -355,7 +366,7 @@ int from_overlay_ack_pktgen(struct __ctx_buff *ctx)
 SETUP("tc", "03_from_overlay_ack")
 int from_overlay_ack_setup(struct __ctx_buff *ctx)
 {
-	tail_call_static(ctx, &entry_call_map, FROM_OVERLAY);
+	tail_call_static(ctx, entry_call_map, FROM_OVERLAY);
 	return TEST_ERROR;
 }
 
@@ -406,15 +417,21 @@ int from_overlay_ack_check(struct __ctx_buff *ctx)
 	if (l3->daddr != BACKEND_IP)
 		test_fatal("dst IP has changed");
 
+	if (l3->check != bpf_htons(0x4212))
+		test_fatal("L3 checksum is invalid: %x", bpf_htons(l3->check));
+
 	if (l4->source != CLIENT_INTER_CLUSTER_SNAT_PORT)
 		test_fatal("src port has changed");
 
 	if (l4->dest != BACKEND_PORT)
 		test_fatal("dst port has changed");
 
-	meta = ctx_load_meta(ctx, CB_IFINDEX);
-	if (meta != BACKEND_IFINDEX)
-		test_fatal("skb->cb[CB_IFINDEX] should be %d, got %d", BACKEND_IFINDEX, meta);
+	if (l4->check != bpf_htons(0x7771))
+		test_fatal("L4 checksum is invalid: %x", bpf_htons(l4->check));
+
+	meta = ctx_load_meta(ctx, CB_DELIVERY_REDIRECT);
+	if (meta != 1)
+		test_fatal("skb->cb[CB_DELIVERY_REDIRECT] should be 1, got %d", meta);
 
 	meta = ctx_load_meta(ctx, CB_SRC_LABEL);
 	if (meta != CLIENT_IDENTITY)

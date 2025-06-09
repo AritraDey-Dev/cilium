@@ -6,13 +6,11 @@ package routechecks
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"time"
 
-	"github.com/sirupsen/logrus"
-
-	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
-
+	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -20,12 +18,14 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+
+	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 )
 
 // TLSRouteInput is used to implement the Input interface for TLSRoute
 type TLSRouteInput struct {
 	Ctx      context.Context
-	Logger   *logrus.Entry
+	Logger   *slog.Logger
 	Client   client.Client
 	Grants   *gatewayv1beta1.ReferenceGrantList
 	TLSRoute *gatewayv1alpha2.TLSRoute
@@ -41,7 +41,6 @@ func (t *TLSRouteInput) SetParentCondition(ref gatewayv1.ParentReference, condit
 	t.mergeStatusConditions(ref, []metav1.Condition{
 		condition,
 	})
-
 }
 
 func (t *TLSRouteInput) SetAllParentCondition(condition metav1.Condition) {
@@ -54,7 +53,6 @@ func (t *TLSRouteInput) SetAllParentCondition(condition metav1.Condition) {
 			condition,
 		})
 	}
-
 }
 
 func (t *TLSRouteInput) mergeStatusConditions(parentRef gatewayv1alpha2.ParentReference, updates []metav1.Condition) {
@@ -144,6 +142,10 @@ func (t *TLSRouteInput) GetGateway(parent gatewayv1.ParentReference) (*gatewayv1
 	return gw, nil
 }
 
-func (t *TLSRouteInput) Log() *logrus.Entry {
+func (t *TLSRouteInput) GetParentGammaService(parent gatewayv1.ParentReference) (*corev1.Service, error) {
+	return nil, fmt.Errorf("GAMMA support is not implemented in this reconciler")
+}
+
+func (t *TLSRouteInput) Log() *slog.Logger {
 	return t.Logger
 }

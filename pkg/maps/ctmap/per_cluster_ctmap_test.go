@@ -6,9 +6,9 @@ package ctmap
 import (
 	"testing"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/cilium/hive/hivetest"
+	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/cilium/pkg/bpf"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
@@ -17,8 +17,9 @@ import (
 
 func setup(tb testing.TB) {
 	testutils.PrivilegedTest(tb)
+	logger := hivetest.Logger(tb)
 
-	bpf.CheckOrMountFS("")
+	bpf.CheckOrMountFS(logger, "")
 	require.NoError(tb, rlimit.RemoveMemlock(), "Failed to set memlock rlimit")
 
 	// Override the map names to avoid clashing with the real ones.
@@ -26,7 +27,7 @@ func setup(tb testing.TB) {
 }
 
 func BenchmarkPerClusterCTMapUpdate(b *testing.B) {
-	b.StopTimer()
+
 	setup(b)
 
 	om := newPerClusterCTMap(mapTypeIPv4TCPGlobal)
@@ -38,9 +39,7 @@ func BenchmarkPerClusterCTMapUpdate(b *testing.B) {
 		require.NoError(b, CleanupPerClusterCTMaps(true, true), "Failed to cleanup maps")
 	})
 
-	b.StartTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		require.NoError(b, om.createClusterCTMap(1), "Failed to create map")
 	}
 
@@ -48,7 +47,7 @@ func BenchmarkPerClusterCTMapUpdate(b *testing.B) {
 }
 
 func BenchmarkPerClusterCTMapLookup(b *testing.B) {
-	b.StopTimer()
+
 	setup(b)
 
 	om := newPerClusterCTMap(mapTypeIPv4TCPGlobal)
@@ -62,10 +61,8 @@ func BenchmarkPerClusterCTMapLookup(b *testing.B) {
 
 	require.NoError(b, om.createClusterCTMap(1), "Failed to create map")
 
-	b.StartTimer()
-
 	key := &PerClusterCTMapKey{1}
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := om.Lookup(key)
 		require.NoError(b, err, "Failed to lookup element")
 	}
@@ -75,6 +72,7 @@ func BenchmarkPerClusterCTMapLookup(b *testing.B) {
 
 func TestPerClusterCTMaps(t *testing.T) {
 	setup(t)
+	logger := hivetest.Logger(t)
 
 	maps := NewPerClusterCTMaps(true, true)
 	for _, om := range []*PerClusterCTMap{maps.tcp4, maps.any4, maps.tcp6, maps.any6} {
@@ -83,7 +81,7 @@ func TestPerClusterCTMaps(t *testing.T) {
 
 	require.NoError(t, maps.OpenOrCreate(), "Failed to create outer maps")
 	for _, om := range []*PerClusterCTMap{maps.tcp4, maps.any4, maps.tcp6, maps.any6} {
-		require.FileExists(t, bpf.MapPath(om.Map.Name()), "Failed to create outer maps")
+		require.FileExists(t, bpf.MapPath(logger, om.Map.Name()), "Failed to create outer maps")
 	}
 
 	t.Cleanup(func() {
@@ -115,7 +113,7 @@ func TestPerClusterCTMaps(t *testing.T) {
 			require.NotZero(t, value, "Outer map not updated correctly (id=%v, map=%v)", id, om.Name())
 
 			// After update, the inner map should exist
-			require.FileExists(t, bpf.MapPath(om.newInnerMap(id).Map.Name()), "Inner map not correctly present (id=%v, map=%v)", id, om.Name())
+			require.FileExists(t, bpf.MapPath(logger, om.newInnerMap(id).Map.Name()), "Inner map not correctly present (id=%v, map=%v)", id, om.Name())
 		}
 
 		// After update, it should be possible to get and open the inner map
@@ -147,7 +145,7 @@ func TestPerClusterCTMaps(t *testing.T) {
 			require.Error(t, err, "Outer map not updated correctly (id=%v, map=%v)", id, om.Name())
 
 			// After delete, the inner map should not exist
-			require.NoFileExists(t, bpf.MapPath(om.newInnerMap(id).Map.Name()), "Inner map not correctly deleted (id=%v, map=%v)", id, om.Name())
+			require.NoFileExists(t, bpf.MapPath(logger, om.newInnerMap(id).Map.Name()), "Inner map not correctly deleted (id=%v, map=%v)", id, om.Name())
 		}
 
 		// After delete, it should be no longer be possible to open the inner map
@@ -166,6 +164,7 @@ func TestPerClusterCTMaps(t *testing.T) {
 
 func TestPerClusterCTMapsCleanup(t *testing.T) {
 	setup(t)
+	logger := hivetest.Logger(t)
 
 	tests := []struct {
 		name            string
@@ -213,16 +212,16 @@ func TestPerClusterCTMapsCleanup(t *testing.T) {
 
 			for _, typ := range tt.present {
 				for _, id := range ids {
-					require.FileExists(t, bpf.MapPath(ClusterInnerMapName(typ, id)), "Inner map should not have been deleted (id=%v, type=%v)", id, typ.name())
+					require.FileExists(t, bpf.MapPath(logger, ClusterInnerMapName(typ, id)), "Inner map should not have been deleted (id=%v, type=%v)", id, typ.name())
 				}
-				require.FileExists(t, bpf.MapPath(ClusterOuterMapName(typ)), "Outer map should not have been deleted (type=%v)", typ.name())
+				require.FileExists(t, bpf.MapPath(logger, ClusterOuterMapName(typ)), "Outer map should not have been deleted (type=%v)", typ.name())
 			}
 
 			for _, typ := range tt.absent {
 				for _, id := range ids {
-					require.NoFileExists(t, bpf.MapPath(ClusterInnerMapName(typ, id)), "Inner map should have been deleted (id=%v, type=%v)", id, typ.name())
+					require.NoFileExists(t, bpf.MapPath(logger, ClusterInnerMapName(typ, id)), "Inner map should have been deleted (id=%v, type=%v)", id, typ.name())
 				}
-				require.NoFileExists(t, bpf.MapPath(ClusterOuterMapName(typ)), "Outer map should have been deleted (type=%v)", typ.name())
+				require.NoFileExists(t, bpf.MapPath(logger, ClusterOuterMapName(typ)), "Outer map should have been deleted (type=%v)", typ.name())
 			}
 		})
 	}

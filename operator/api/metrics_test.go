@@ -4,7 +4,6 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -12,6 +11,8 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/hive/hivetest"
 	"github.com/go-openapi/runtime"
 	"go.uber.org/goleak"
 
@@ -19,7 +20,7 @@ import (
 	"github.com/cilium/cilium/api/v1/operator/server/restapi/metrics"
 	operatorMetrics "github.com/cilium/cilium/operator/metrics"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	cellMetric "github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/metrics/metric"
 	"github.com/cilium/cilium/pkg/safeio"
 )
@@ -37,8 +38,7 @@ func TestMetricsHandlerWithoutMetrics(t *testing.T) {
 		operatorMetrics.Cell,
 		cell.Provide(func() operatorMetrics.SharedConfig {
 			return operatorMetrics.SharedConfig{
-				EnableMetrics:    false,
-				EnableGatewayAPI: false,
+				EnableMetrics: false,
 			}
 		}),
 
@@ -59,7 +59,8 @@ func TestMetricsHandlerWithoutMetrics(t *testing.T) {
 		}),
 	)
 
-	if err := hive.Start(context.Background()); err != nil {
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, t.Context()); err != nil {
 		t.Fatalf("failed to start: %s", err)
 	}
 
@@ -82,7 +83,7 @@ func TestMetricsHandlerWithoutMetrics(t *testing.T) {
 		t.Fatalf("no metrics expected, found %v", metrics)
 	}
 
-	if err := hive.Stop(context.Background()); err != nil {
+	if err := hive.Stop(tlog, t.Context()); err != nil {
 		t.Fatalf("failed to stop: %s", err)
 	}
 }
@@ -100,11 +101,10 @@ func TestMetricsHandlerWithMetrics(t *testing.T) {
 		operatorMetrics.Cell,
 		cell.Provide(func() operatorMetrics.SharedConfig {
 			return operatorMetrics.SharedConfig{
-				EnableMetrics:    true,
-				EnableGatewayAPI: false,
+				EnableMetrics: true,
 			}
 		}),
-		cell.Metric(newTestMetrics),
+		cellMetric.Metric(newTestMetrics),
 
 		MetricsHandlerCell,
 
@@ -117,9 +117,9 @@ func TestMetricsHandlerWithMetrics(t *testing.T) {
 			}
 		}),
 
-		cell.Invoke(func(lc hive.Lifecycle, metrics *testMetrics, hf http.HandlerFunc) {
-			lc.Append(hive.Hook{
-				OnStart: func(hive.HookContext) error {
+		cell.Invoke(func(lc cell.Lifecycle, metrics *testMetrics, hf http.HandlerFunc) {
+			lc.Append(cell.Hook{
+				OnStart: func(cell.HookContext) error {
 					// set values for some metrics
 					metrics.MetricA.
 						WithLabelValues("success").
@@ -138,7 +138,8 @@ func TestMetricsHandlerWithMetrics(t *testing.T) {
 	// To avoid port clashing while testing, let the kernel pick an available port.
 	hive.Viper().Set(operatorMetrics.OperatorPrometheusServeAddr, "localhost:0")
 
-	if err := hive.Start(context.Background()); err != nil {
+	tlog := hivetest.Logger(t)
+	if err := hive.Start(tlog, t.Context()); err != nil {
 		t.Fatalf("failed to start: %s", err)
 	}
 
@@ -168,7 +169,7 @@ func TestMetricsHandlerWithMetrics(t *testing.T) {
 		t.Fatalf("error while inspecting metric: %s", err)
 	}
 
-	if err := hive.Stop(context.Background()); err != nil {
+	if err := hive.Stop(tlog, t.Context()); err != nil {
 		t.Fatalf("failed to stop: %s", err)
 	}
 }

@@ -9,11 +9,17 @@
 End-To-End Testing Framework (Legacy)
 =====================================
 
+.. warning::
+   The Ginkgo end-to-end testing framework is deprecated. New end-to-end
+   tests should be implemented using the `cilium-cli
+   <https://github.com/cilium/cilium-cli/#connectivity-check>`_ connectivity
+   testing framework. For more information, see :ref:`testsuite`.
+
 Introduction
 ~~~~~~~~~~~~
 
 This section provides an overview of the two modes available for running
-Cilium's end-to-end tests locally: Vagrant and similar to GitHub Actions (GHA).
+Cilium's end-to-end tests locally: Kubeconfig and similar to GitHub Actions (GHA).
 It offers instructions on setting up and running tests in these modes.
 
 Before proceeding, it is recommended to familiarize yourself with Ginkgo by
@@ -24,9 +30,9 @@ can also run the `example tests
 Ginkgo workflow.
 
 The tests in the ``test`` directory are built on top of Ginkgo and utilize the
-Ginkgo ``focus`` concept to determine which virtual machines (VMs), in ``vagrant``
-mode are necessary to run specific tests. All test names must begin with one of
-the following prefixes:
+Ginkgo ``focus`` concept to determine which Kubernetes nodes are necessary to
+run specific tests. All test names must begin with one of the following
+prefixes:
 
 - ``Runtime``: Tests Cilium in a runtime environment running on a single node.
 - ``K8s``: Sets up a small multi-node Kubernetes environment for testing features
@@ -39,14 +45,6 @@ Running Tests with GitHub Actions (GHA)
 GitHub Actions provide an alternative mode for running Cilium's end-to-end tests.
 The configuration is set up to closely match the environment used in GHA. Refer
 to the relevant documentation for instructions on running tests using GHA.
-
-Running Tests with Vagrant
-^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-To run tests locally using Vagrant, the test scripts invoke ``vagrant`` to create
-virtual machine(s). These tests utilize the Ginkgo testing framework, leveraging
-its rich capabilities and the benefits of Go's compilation-time checks and
-strong typing.
 
 Running End-To-End Tests
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -72,8 +70,8 @@ usage information.
 
    .. code-block:: shell-session
 
-      $ HELM_VERSION=3.7.0
-      $ wget "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+      $ HELM_VERSION=v3.13.1
+      $ wget "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
       $ tar -xf "helm-v${HELM_VERSION}-linux-amd64.tar.gz"
       $ mv linux-amd64/helm ./helm
 
@@ -135,7 +133,7 @@ usage information.
           -m 12G \
           -enable-kvm \
           -cpu host \
-          -hda /tmp/_images/datapath-conformance.qcow2 \
+          -drive file=/tmp/_images/datapath-conformance.qcow2,if=virtio,index=0,media=disk \
           -netdev user,id=user.0,hostfwd=tcp::2222-:22 \
           -device virtio-net-pci,netdev=user.0 \
           -fsdev local,id=host_id,path=./,security_model=none \
@@ -174,9 +172,6 @@ usage information.
       # else
       #   ./contrib/scripts/kind.sh "" 1 "" "${kubernetes_image}" "iptables" "${ip_family}"
       # fi
-      ## Some tests using demo-customcalls.yaml are mounting this directoy
-      # mkdir -p /home/vagrant/go/src/github.com/cilium
-      # ln -s /host /home/vagrant/go/src/github.com/cilium/cilium
       # git config --global --add safe.directory /cilium
 
    Verify that kind is running inside the VM:
@@ -225,8 +220,6 @@ usage information.
       #    export KUBEPROXY=0
       #    export K8S_NODES=3
       #    export NO_CILIUM_ON_NODES=kind-worker2
-      # elif [[ "${kernel_tag}" == 4.19-* ]]; then
-      #    export KERNEL=419
       # elif [[ "${kernel_tag}" == 5.4-* ]]; then
       #    export KERNEL=54
       # fi
@@ -253,7 +246,6 @@ usage information.
         -cilium.hubble-relay-image=quay.io/${quay_org}/hubble-relay-ci \
         -cilium.hubble-relay-tag=${commit_sha} \
         -cilium.kubeconfig=/root/.kube/config \
-        -cilium.provision-k8s=false \
         -cilium.operator-suffix=-ci \
         -cilium.holdEnvironment=true
       Using CNI_INTEGRATION="kind"
@@ -281,22 +273,6 @@ usage information.
    dependencies are installed. Thus steps up to and excluding step
    :ref:`installing kind <install_kind>` can be skipped next time and the VM
    state can be re-used from step :ref:`installing kind <install_kind>` onwards.
-
-Running All Ginkgo Tests
-^^^^^^^^^^^^^^^^^^^^^^^^
-
-Running all of the Ginkgo tests may take an hour or longer. To run all the
-ginkgo tests, invoke the make command as follows from the root of the cilium
-repository:
-
-.. code-block:: shell-session
-
-    $ sudo make -C test/ test
-
-The first time that this is invoked, the testsuite will pull the
-`testing VMs <https://app.vagrantup.com/cilium/boxes/ginkgo>`_ and provision
-Cilium into them. This may take several minutes, depending on your internet
-connection speed. Subsequent runs of the test will reuse the image.
 
 Running Runtime Tests
 ^^^^^^^^^^^^^^^^^^^^^
@@ -347,72 +323,6 @@ here is an example showing what tests will be ran using Ginkgo's dryRun option:
 The output has been truncated. For more information about this functionality,
 consult the aforementioned Ginkgo documentation.
 
-.. _running_k8s_tests:
-
-Running Kubernetes Tests
-^^^^^^^^^^^^^^^^^^^^^^^^
-
-To run all of the Kubernetes tests, run the following command from the ``test`` directory:
-
-.. code-block:: shell-session
-
-    INTEGRATION_TESTS=true ginkgo --focus="K8s"
-
-To run a specific test from the Kubernetes tests suite, run the following command
-from the ``test`` directory:
-
-.. code-block:: shell-session
-
-    INTEGRATION_TESTS=true ginkgo --focus="K8s.*Check iptables masquerading with random-fully"
-
-Similar to the Runtime test suite, Ginkgo searches for all tests in all
-subdirectories that are "named" beginning with the string "K8s" and
-contain any characters after it.
-
-The Kubernetes tests support the following Kubernetes versions:
-
-* 1.19
-* 1.20
-* 1.21
-* 1.22
-* 1.23
-* 1.24
-* 1.25
-* 1.26
-* 1.27
-* 1.28
-
-By default, the Vagrant VMs are provisioned with Kubernetes 1.23. To run with any other
-supported version of Kubernetes, run the test suite with the following format:
-
-.. code-block:: shell-session
-
-    INTEGRATION_TESTS=true K8S_VERSION=<version> ginkgo --focus="K8s"
-
-.. note::
-
-   When provisioning VMs with the net-next kernel (``NETNEXT=1``) on
-   VirtualBox which version does not match a version of the VM image
-   VirtualBox Guest Additions, Vagrant will install a new version of
-   the Additions with ``mount.vboxsf``. The latter is not compatible with
-   ``vboxsf.ko`` shipped within the VM image, and thus syncing of shared
-   folders will not work.
-
-   To avoid this, one can prevent Vagrant from installing the Additions by
-   putting the following into ``$HOME/.vagrant.d/Vagrantfile``:
-
-   .. code-block:: ruby
-
-      Vagrant.configure('2') do |config|
-        if Vagrant.has_plugin?("vagrant-vbguest") then
-          config.vbguest.auto_update = false
-        end
-
-        config.vm.provider :virtualbox do |vbox|
-          vbox.check_guest_additions = false
-        end
-      end
-
 Available CLI Options
 ^^^^^^^^^^^^^^^^^^^^^
 
@@ -447,10 +357,6 @@ framework in the ``test/`` directory and interact with ginkgo directly:
             Pass the environment invoking ginkgo, including PATH, to subcommands
       -cilium.provision
             Provision Vagrant boxes and Cilium before running test (default true)
-      -cilium.provision-k8s
-            Specifies whether Kubernetes should be deployed and installed via kubeadm or not (default true)
-      -cilium.runQuarantined
-            Run tests that are under quarantine.
       -cilium.showCommands
             Output which commands are ran to stdout
       -cilium.skipLogs
@@ -554,7 +460,7 @@ Best Practices for Writing Tests
 
 * Provide informative output to console during a test using the `By construct <https://onsi.github.io/ginkgo/#documenting-complex-specs-by>`_. This helps with debugging and gives those who did not write the test a good idea of what is going on. The lower the barrier of entry is for understanding tests, the better our tests will be!
 * Leave the testing environment in the same state that it was in when the test started by deleting resources, resetting configuration, etc.
-* Gather logs in the case that a test fails. If a test fails while running on Jenkins, a postmortem needs to be done to analyze why. So, dumping logs to a location where Jenkins can pick them up is of the highest imperative. Use the following code in an ``AfterFailed`` method:
+* Gather logs in the case that a test fails. If a test fails while running on Ginkgo, a postmortem needs to be done to analyze why. So, dumping logs to a location where Ginkgo can pick them up is of the highest imperative. Use the following code in an ``AfterFailed`` method:
 
 .. code-block:: go
 
@@ -676,7 +582,7 @@ test an exhaustive data will be added.
 	level=info msg=Starting testName=RuntimeKafka
 	level=info msg="Vagrant: running command \"vagrant ssh-config runtime\""
 	cmd: "sudo cilium-dbg status" exitCode: 0
-	 KVStore:            Ok         Consul: 172.17.0.3:8300
+	 KVStore:            Ok         Etcd: 172.17.0.3:4001
 	ContainerRuntime:   Ok
 	Kubernetes:         Disabled
 	Kubernetes APIs:    [""]
@@ -703,10 +609,9 @@ Example how to run ginkgo using ``dlv``:
 Running End-To-End Tests In Other Environments via kubeconfig
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The end-to-end tests can be run with an arbitrary kubeconfig file. Normally the
-CI will use the kubernetes created via vagrant but this can be overridden with
-``--cilium.kubeconfig``. When used, ginkgo will not start a VM nor compile
-cilium. It will also skip some setup tasks like labeling nodes for testing.
+You can run the end-to-end tests with an arbitrary kubeconfig file by specifying
+``--cilium.kubeconfig`` parameter on the Ginkgo command line. This will skip
+provisioning the environment and some setup tasks like labeling nodes for testing.
 
 This mode expects:
 
@@ -741,7 +646,7 @@ To run tests with Kind, try
 
 .. code-block:: shell-session
 
-  K8S_VERSION=1.25 ginkgo --focus=K8s -- -cilium.provision=false --cilium.image=localhost:5000/cilium/cilium-dev -cilium.tag=local  --cilium.operator-image=localhost:5000/cilium/operator -cilium.operator-tag=local -cilium.kubeconfig=`echo ~/.kube/config` -cilium.provision-k8s=false  -cilium.testScope=K8s -cilium.operator-suffix=
+  K8S_VERSION=1.25 ginkgo --focus=K8s -- -cilium.provision=false --cilium.image=localhost:5000/cilium/cilium-dev -cilium.tag=local  --cilium.operator-image=localhost:5000/cilium/operator -cilium.operator-tag=local -cilium.kubeconfig=`echo ~/.kube/config` -cilium.testScope=K8s -cilium.operator-suffix=
 
 
 Running in GKE
@@ -848,7 +753,7 @@ use ``--cilium.SSHConfig`` to provide the SSH configuration of the endpoint on
 which tests will be run. The tests presume the following on the remote
 instance:
 
-- Cilium source code is located in the directory ``/home/vagrant/go/src/github.com/cilium/cilium/``.
+- Cilium source code is located in the directory ``/home/$USER/go/src/github.com/cilium/cilium/``.
 - Cilium is installed and running.
 
 The ssh connection needs to be defined as a ``ssh-config`` file and need to have
@@ -880,11 +785,10 @@ To run this you can use the following command:
     ginkgo -- --cilium.provision=false --cilium.SSHConfig="cat ssh-config"
 
 
-VMs for Testing
-~~~~~~~~~~~~~~~
+Environment variables
+~~~~~~~~~~~~~~~~~~~~~
 
-The VMs used for testing are defined in ``test/Vagrantfile``. There are a variety of
-configuration options that can be passed as environment variables:
+There are a variety of configuration options that can be passed as environment variables:
 
 +----------------------+-------------------+--------------+------------------------------------------------------------------+
 | ENV variable         | Default Value     | Options      | Description                                                      |
@@ -893,78 +797,10 @@ configuration options that can be passed as environment variables:
 +----------------------+-------------------+--------------+------------------------------------------------------------------+
 | NO_CILIUM_ON_NODE[S] | none              | \*           | Comma-separated list of K8s nodes that should not run Cilium     |
 +----------------------+-------------------+--------------+------------------------------------------------------------------+
-| NFS                  | 0                 | 1            | If Cilium folder needs to be shared using NFS                    |
-+----------------------+-------------------+--------------+------------------------------------------------------------------+
-| IPv6                 | 0                 | 0-1          | If 1 the Kubernetes cluster will use IPv6                        |
-+----------------------+-------------------+--------------+------------------------------------------------------------------+
-| CONTAINER\_RUNTIME   | docker            | containerd   | To set the default container runtime in the Kubernetes cluster   |
-+----------------------+-------------------+--------------+------------------------------------------------------------------+
 | K8S\_VERSION         | 1.18              | 1.\*\*       | Kubernetes version to install                                    |
 +----------------------+-------------------+--------------+------------------------------------------------------------------+
 | KUBEPROXY            | 1                 | 0-1          | If 0 the Kubernetes' kube-proxy won't be installed               |
 +----------------------+-------------------+--------------+------------------------------------------------------------------+
-| SERVER\_BOX          | cilium/ubuntu-dev | \*           | Vagrantcloud base image                                          |
-+----------------------+-------------------+--------------+------------------------------------------------------------------+
-| VM\_CPUS             | 2                 | 0..100       | Number of CPUs that need to have the VM                          |
-+----------------------+-------------------+--------------+------------------------------------------------------------------+
-| VM\_MEMORY           | 4096              | \d+          | RAM size in Megabytes                                            |
-+----------------------+-------------------+--------------+------------------------------------------------------------------+
-
-VM images
-~~~~~~~~~
-
-The test suite relies on Vagrant to automatically download the required VM
-image, if it is not already available on the system. VM images weight several
-gigabytes so this may take some time, but faster tools such as `aria2`_ can
-speed up the process by opening multiple connections. The script
-`contrib/scripts/add_vagrant_box.sh`_ can be useful to manually download
-selected images with aria2 prior to launching the test suite, or to
-periodically update images in a ``cron`` job::
-
-    $ bash contrib/scripts/add_vagrant_box.sh -h
-    usage: add_vagrant_box.sh [options] [vagrant_box_defaults.rb path]
-            path to vagrant_box_defaults.rb defaults to ./vagrant_box_defaults.rb
-
-    options:
-            -a              use aria2c instead of curl
-            -b <box>        download selected box (defaults: ubuntu ubuntu-next)
-            -d <dir>        download to dir instead of /tmp/
-            -l              download latest versions instead of using vagrant_box_defaults
-            -h              display this help
-
-    examples:
-            download boxes ubuntu and ubuntu-next from vagrant_box_defaults.rb:
-            $ add-vagrant-boxes.sh $HOME/go/src/github.com/cilium/cilium/vagrant_box_defaults.rb
-            download latest version for ubuntu-dev and ubuntu-next:
-            $ add-vagrant-boxes.sh -l -b ubuntu-dev -b ubuntu-next
-            same as above, downloading into /tmp/foo and using aria2c:
-            $ add-vagrant-boxes.sh -al -d /tmp/foo -b ubuntu-dev -b ubuntu-next
-
-.. _aria2: https://aria2.github.io/
-.. _contrib/scripts/add_vagrant_box.sh:
-   https://github.com/cilium/cilium/blob/main/contrib/scripts/add_vagrant_box.sh
-
-Known Issues and Workarounds
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-VirtualBox hostonlyifs and DHCP related errors
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-If you see the following error, take a look at this `GitHub issue
-<https://github.com/hashicorp/vagrant/issues/3083#issuecomment-41156076>`_ for
-workarounds.
-
-::
-
-    A host only network interface you're attempting to configure via DHCP
-    already has a conflicting host only adapter with DHCP enabled. The
-    DHCP on this adapter is incompatible with the DHCP settings. Two
-    host only network interfaces are not allowed to overlap, and each
-    host only network interface can have only one DHCP server. Please
-    reconfigure your host only network or remove the virtual machine
-    using the other host only network.
-
-Also, consider upgrading VirtualBox and Vagrant to the latest versions.
 
 Further Assistance
 ~~~~~~~~~~~~~~~~~~

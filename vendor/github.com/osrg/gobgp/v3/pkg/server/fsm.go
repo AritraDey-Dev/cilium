@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	minConnectRetryInterval = 5
+	minConnectRetryInterval = 1
 )
 
 type fsmStateReasonType uint8
@@ -494,7 +494,7 @@ func (h *fsmHandler) connectLoop(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 	fsm := h.fsm
 
-	retry, addr, port, password, ttl, ttlMin, mss, localAddress, localPort, bindInterface := func() (int, string, int, string, uint8, uint8, uint16, string, int, string) {
+	retryInterval, addr, port, password, ttl, ttlMin, mss, localAddress, localPort, bindInterface := func() (int, string, int, string, uint8, uint8, uint16, string, int, string) {
 		fsm.lock.RLock()
 		defer fsm.lock.RUnlock()
 
@@ -527,7 +527,7 @@ func (h *fsmHandler) connectLoop(ctx context.Context, wg *sync.WaitGroup) {
 	tick := minConnectRetryInterval
 	for {
 		r := rand.New(rand.NewSource(time.Now().UnixNano()))
-		timer := time.NewTimer(time.Duration(r.Intn(tick)+tick) * time.Second)
+		timer := time.NewTimer(time.Duration(r.Intn(tick*1000)+tick*1000) * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			fsm.logger.Debug("stop connect loop",
@@ -537,10 +537,12 @@ func (h *fsmHandler) connectLoop(ctx context.Context, wg *sync.WaitGroup) {
 			timer.Stop()
 			return
 		case <-timer.C:
-			fsm.logger.Debug("try to connect",
-				log.Fields{
-					"Topic": "Peer",
-					"Key":   addr})
+			if fsm.logger.GetLevel() >= log.DebugLevel {
+				fsm.logger.Debug("try to connect",
+					log.Fields{
+						"Topic": "Peer",
+						"Key":   addr})
+			}
 		}
 
 		laddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(localAddress, strconv.Itoa(localPort)))
@@ -554,7 +556,7 @@ func (h *fsmHandler) connectLoop(ctx context.Context, wg *sync.WaitGroup) {
 		if err == nil {
 			d := net.Dialer{
 				LocalAddr: laddr,
-				Timeout:   time.Duration(tick-1) * time.Second,
+				Timeout:   time.Duration(max(retryInterval-1, minConnectRetryInterval)) * time.Second,
 				Control: func(network, address string, c syscall.RawConn) error {
 					return dialerControl(fsm.logger, network, address, c, ttl, ttlMin, mss, password, bindInterface)
 				},
@@ -583,14 +585,16 @@ func (h *fsmHandler) connectLoop(ctx context.Context, wg *sync.WaitGroup) {
 							"Key":   addr})
 				}
 			} else {
-				fsm.logger.Debug("failed to connect",
-					log.Fields{
-						"Topic": "Peer",
-						"Key":   addr,
-						"Error": err})
+				if fsm.logger.GetLevel() >= log.DebugLevel {
+					fsm.logger.Debug("failed to connect",
+						log.Fields{
+							"Topic": "Peer",
+							"Key":   addr,
+							"Error": err})
+				}
 			}
 		}
-		tick = retry
+		tick = retryInterval
 	}
 }
 
@@ -1250,9 +1254,9 @@ func open2Cap(open *bgp.BGPOpen, n *oc.Neighbor) (map[bgp.BGPCapabilityCode][]bg
 func (h *fsmHandler) opensent(ctx context.Context) (bgp.FSMState, *fsmStateReason) {
 	fsm := h.fsm
 
-	fsm.lock.RLock()
+	fsm.lock.Lock()
 	m := buildopen(fsm.gConf, fsm.pConf)
-	fsm.lock.RUnlock()
+	fsm.lock.Unlock()
 
 	b, _ := m.Serialize()
 	fsm.conn.Write(b)
@@ -1655,6 +1659,22 @@ func (h *fsmHandler) sendMessageloop(ctx context.Context, wg *sync.WaitGroup) er
 			table.UpdatePathAttrs2ByteAs(m.Body.(*bgp.BGPUpdate))
 			table.UpdatePathAggregator2ByteAs(m.Body.(*bgp.BGPUpdate))
 		}
+
+		// RFC8538 defines a Hard Reset notification subcode which
+		// indicates that the BGP speaker wants to reset the session
+		// without triggering graceful restart procedures. Here we map
+		// notification subcodes to the Hard Reset subcode following
+		// the RFC8538 suggestion.
+		//
+		// We check Status instead of Config because RFC8538 states
+		// that A BGP speaker SHOULD NOT send a Hard Reset to a peer
+		// from which it has not received the "N" bit.
+		if fsm.pConf.GracefulRestart.State.NotificationEnabled && m.Header.Type == bgp.BGP_MSG_NOTIFICATION {
+			if body := m.Body.(*bgp.BGPNotification); body.ErrorCode == bgp.BGP_ERROR_CEASE && bgp.ShouldHardReset(body.ErrorSubcode, false) {
+				body.ErrorSubcode = bgp.BGP_ERROR_SUB_HARD_RESET
+			}
+		}
+
 		b, err := m.Serialize(h.fsm.marshallingOptions)
 		fsm.lock.RUnlock()
 		if err != nil {
@@ -1726,16 +1746,18 @@ func (h *fsmHandler) sendMessageloop(ctx context.Context, wg *sync.WaitGroup) er
 			return fmt.Errorf("closed")
 		case bgp.BGP_MSG_UPDATE:
 			update := m.Body.(*bgp.BGPUpdate)
-			fsm.lock.RLock()
-			fsm.logger.Debug("sent update",
-				log.Fields{
-					"Topic":       "Peer",
-					"Key":         fsm.pConf.State.NeighborAddress,
-					"State":       fsm.state.String(),
-					"nlri":        update.NLRI,
-					"withdrawals": update.WithdrawnRoutes,
-					"attributes":  update.PathAttributes})
-			fsm.lock.RUnlock()
+			if fsm.logger.GetLevel() >= log.DebugLevel {
+				fsm.lock.RLock()
+				fsm.logger.Debug("sent update",
+					log.Fields{
+						"Topic":       "Peer",
+						"Key":         fsm.pConf.State.NeighborAddress,
+						"State":       fsm.state.String(),
+						"nlri":        update.NLRI,
+						"withdrawals": update.WithdrawnRoutes,
+						"attributes":  update.PathAttributes})
+				fsm.lock.RUnlock()
+			}
 		default:
 			fsm.lock.RLock()
 			fsm.logger.Debug("sent",
@@ -1828,6 +1850,20 @@ func (h *fsmHandler) established(ctx context.Context) (bgp.FSMState, *fsmStateRe
 		case <-ctx.Done():
 			select {
 			case m := <-fsm.notification:
+				// RFC8538 defines a Hard Reset notification subcode which
+				// indicates that the BGP speaker wants to reset the session
+				// without triggering graceful restart procedures. Here we map
+				// notification subcodes to the Hard Reset subcode following
+				// the RFC8538 suggestion.
+				//
+				// We check Status instead of Config because RFC8538 states
+				// that A BGP speaker SHOULD NOT send a Hard Reset to a peer
+				// from which it has not received the "N" bit.
+				if fsm.pConf.GracefulRestart.State.NotificationEnabled {
+					if body := m.Body.(*bgp.BGPNotification); body.ErrorCode == bgp.BGP_ERROR_CEASE && bgp.ShouldHardReset(body.ErrorSubcode, false) {
+						body.ErrorSubcode = bgp.BGP_ERROR_SUB_HARD_RESET
+					}
+				}
 				b, _ := m.Serialize(h.fsm.marshallingOptions)
 				h.conn.Write(b)
 			default:

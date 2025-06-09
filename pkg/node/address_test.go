@@ -8,32 +8,19 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 
-	. "github.com/cilium/checkmate"
-
-	"github.com/cilium/cilium/pkg/checker"
+	"github.com/stretchr/testify/require"
 )
 
-// Hook up gocheck into the "go test" runner.
-func Test(t *testing.T) {
-	TestingT(t)
-}
-
-type NodeSuite struct{}
-
-var _ = Suite(&NodeSuite{})
-
-func (s *NodeSuite) TearDownTest(c *C) {
-}
-
-func (s *NodeSuite) Test_getCiliumHostIPsFromFile(c *C) {
-	tmpDir := c.MkDir()
+func Test_getCiliumHostIPsFromFile(t *testing.T) {
+	tmpDir := t.TempDir()
 	allIPsCorrect := filepath.Join(tmpDir, "node_config.h")
 	f, err := os.Create(allIPsCorrect)
-	c.Assert(err, IsNil)
-	defer f.Close()
+	defer func(f *os.File) {
+		require.NoError(t, f.Close())
+	}(f)
+	require.NoError(t, err)
 	fmt.Fprintf(f, `/*
  cilium.v6.external.str fd01::b
  cilium.v6.internal.str f00d::a00:0:0:a4ad
@@ -48,15 +35,12 @@ func (s *NodeSuite) Test_getCiliumHostIPsFromFile(c *C) {
  */
 
 #define ENABLE_IPV4 1
-#define ROUTER_IP 0xf0, 0xd, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xa, 0x0, 0x0, 0x0, 0x0, 0x0, 0xa4, 0xad
 #define IPV4_GATEWAY 0x100000a
-#define IPV4_LOOPBACK 0x5dd0000a
 #define IPV4_MASK 0xffff
 #define HOST_IP 0xfd, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xb
 #define HOST_ID 1
 #define WORLD_ID 2
 #define CILIUM_LB_MAP_MAX_ENTRIES 65536
-#define TUNNEL_ENDPOINT_MAP_SIZE 65536
 #define ENDPOINTS_MAP_SIZE 65535
 #define LPM_MAP_SIZE 16384
 #define POLICY_MAP_SIZE 16384
@@ -66,8 +50,8 @@ func (s *NodeSuite) Test_getCiliumHostIPsFromFile(c *C) {
 #ifndef CILIUM_NET_MAC
 #define CILIUM_NET_MAC { .addr = {0x26,0x11,0x70,0xcc,0xca,0x0c}}
 #endif /* CILIUM_NET_MAC */
-#define HOST_IFINDEX 356
-#define HOST_IFINDEX_MAC { .addr = {0x3e,0x28,0xb4,0x4b,0x95,0x25}}
+#define CILIUM_NET_IFINDEX 356
+#define CILIUM_HOST_MAC { .addr = {0x3e,0x28,0xb4,0x4b,0x95,0x25}}
 #define ENCAP_IFINDEX 358
 `)
 
@@ -100,12 +84,10 @@ func (s *NodeSuite) Test_getCiliumHostIPsFromFile(c *C) {
 		},
 	}
 	for _, tt := range tests {
-		gotIpv4GW, gotIpv6Router := getCiliumHostIPsFromFile(tt.args.nodeConfig)
-		if !reflect.DeepEqual(gotIpv4GW, tt.wantIpv4GW) {
-			c.Assert(gotIpv4GW, checker.DeepEquals, tt.wantIpv4GW)
-		}
-		if !reflect.DeepEqual(gotIpv6Router, tt.wantIpv6Router) {
-			c.Assert(gotIpv6Router, checker.DeepEquals, tt.wantIpv6Router)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			gotIpv4GW, gotIpv6Router := getCiliumHostIPsFromFile(tt.args.nodeConfig)
+			require.Equal(t, tt.wantIpv4GW, gotIpv4GW)
+			require.Equal(t, tt.wantIpv6Router, gotIpv6Router)
+		})
 	}
 }

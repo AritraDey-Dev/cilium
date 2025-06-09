@@ -10,22 +10,14 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/cilium/checkmate"
 	"github.com/cilium/ebpf/perf"
+	"github.com/cilium/hive/hivetest"
+	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/cilium/pkg/byteorder"
 	"github.com/cilium/cilium/pkg/logging"
 	fakesignalmap "github.com/cilium/cilium/pkg/maps/signalmap/fake"
 )
-
-// Hook up gocheck into the "go test" runner.
-type signalSuite struct{}
-
-var _ = Suite(&signalSuite{})
-
-func Test(t *testing.T) {
-	TestingT(t)
-}
 
 type testReader struct {
 	paused bool
@@ -60,91 +52,91 @@ func (r *testReader) Close() error {
 	return nil
 }
 
-func (t *signalSuite) TestSignalSet(c *C) {
+func TestSignalSet(t *testing.T) {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, byteorder.Native, SignalNatFillUp)
 
 	events := &testReader{cpu: 1, data: buf.Bytes()}
 	sm := &signalManager{events: events}
-	c.Assert(sm.isMuted(), Equals, true)
-	c.Assert(sm.isSignalMuted(SignalNatFillUp), Equals, true)
-	c.Assert(sm.isSignalMuted(SignalCTFillUp), Equals, true)
-	c.Assert(sm.isSignalMuted(SignalAuthRequired), Equals, true)
+	require.True(t, sm.isMuted())
+	require.True(t, sm.isSignalMuted(SignalNatFillUp))
+	require.True(t, sm.isSignalMuted(SignalCTFillUp))
+	require.True(t, sm.isSignalMuted(SignalAuthRequired))
 
 	// invalid signal, nothing changes
 	err := sm.UnmuteSignals(SignalType(16))
-	c.Assert(err, NotNil)
-	c.Assert(err, ErrorMatches, "signal number not supported: 16")
-	c.Assert(sm.isMuted(), Equals, true)
-	c.Assert(sm.isSignalMuted(SignalNatFillUp), Equals, true)
-	c.Assert(sm.isSignalMuted(SignalCTFillUp), Equals, true)
-	c.Assert(sm.isSignalMuted(SignalAuthRequired), Equals, true)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "signal number not supported: 16")
+	require.True(t, sm.isMuted())
+	require.True(t, sm.isSignalMuted(SignalNatFillUp))
+	require.True(t, sm.isSignalMuted(SignalCTFillUp))
+	require.True(t, sm.isSignalMuted(SignalAuthRequired))
 
 	// 2 active signals
 	err = sm.UnmuteSignals(SignalNatFillUp, SignalCTFillUp)
-	c.Assert(err, IsNil)
-	c.Assert(sm.isMuted(), Equals, false)
-	c.Assert(sm.isSignalMuted(SignalNatFillUp), Equals, false)
-	c.Assert(sm.isSignalMuted(SignalCTFillUp), Equals, false)
-	c.Assert(sm.isSignalMuted(SignalAuthRequired), Equals, true)
+	require.NoError(t, err)
+	require.False(t, sm.isMuted())
+	require.False(t, sm.isSignalMuted(SignalNatFillUp))
+	require.False(t, sm.isSignalMuted(SignalCTFillUp))
+	require.True(t, sm.isSignalMuted(SignalAuthRequired))
 
-	c.Assert(events.paused, Equals, false)
-	c.Assert(events.closed, Equals, false)
+	require.False(t, events.paused)
+	require.False(t, events.closed)
 
 	// Mute one, one still active
 	err = sm.MuteSignals(SignalNatFillUp)
-	c.Assert(err, IsNil)
-	c.Assert(sm.isMuted(), Equals, false)
-	c.Assert(sm.isSignalMuted(SignalNatFillUp), Equals, true)
-	c.Assert(sm.isSignalMuted(SignalCTFillUp), Equals, false)
-	c.Assert(sm.isSignalMuted(SignalAuthRequired), Equals, true)
+	require.NoError(t, err)
+	require.False(t, sm.isMuted())
+	require.True(t, sm.isSignalMuted(SignalNatFillUp))
+	require.False(t, sm.isSignalMuted(SignalCTFillUp))
+	require.True(t, sm.isSignalMuted(SignalAuthRequired))
 
-	c.Assert(events.paused, Equals, false)
-	c.Assert(events.closed, Equals, false)
+	require.False(t, events.paused)
+	require.False(t, events.closed)
 
 	// Nothing happens if the signal is already muted
 	err = sm.MuteSignals(SignalNatFillUp)
-	c.Assert(err, IsNil)
-	c.Assert(sm.isMuted(), Equals, false)
-	c.Assert(sm.isSignalMuted(SignalNatFillUp), Equals, true)
-	c.Assert(sm.isSignalMuted(SignalCTFillUp), Equals, false)
-	c.Assert(sm.isSignalMuted(SignalAuthRequired), Equals, true)
+	require.NoError(t, err)
+	require.False(t, sm.isMuted())
+	require.True(t, sm.isSignalMuted(SignalNatFillUp))
+	require.False(t, sm.isSignalMuted(SignalCTFillUp))
+	require.True(t, sm.isSignalMuted(SignalAuthRequired))
 
-	c.Assert(events.paused, Equals, false)
-	c.Assert(events.closed, Equals, false)
+	require.False(t, events.paused)
+	require.False(t, events.closed)
 
 	// Unmute one more
 	err = sm.UnmuteSignals(SignalAuthRequired)
-	c.Assert(err, IsNil)
-	c.Assert(sm.isMuted(), Equals, false)
-	c.Assert(sm.isSignalMuted(SignalNatFillUp), Equals, true)
-	c.Assert(sm.isSignalMuted(SignalCTFillUp), Equals, false)
-	c.Assert(sm.isSignalMuted(SignalAuthRequired), Equals, false)
+	require.NoError(t, err)
+	require.False(t, sm.isMuted())
+	require.True(t, sm.isSignalMuted(SignalNatFillUp))
+	require.False(t, sm.isSignalMuted(SignalCTFillUp))
+	require.False(t, sm.isSignalMuted(SignalAuthRequired))
 
-	c.Assert(events.paused, Equals, false)
-	c.Assert(events.closed, Equals, false)
+	require.False(t, events.paused)
+	require.False(t, events.closed)
 
 	// Last signala are muted
 	err = sm.MuteSignals(SignalCTFillUp, SignalAuthRequired)
-	c.Assert(err, IsNil)
-	c.Assert(sm.isMuted(), Equals, true)
-	c.Assert(sm.isSignalMuted(SignalNatFillUp), Equals, true)
-	c.Assert(sm.isSignalMuted(SignalCTFillUp), Equals, true)
-	c.Assert(sm.isSignalMuted(SignalAuthRequired), Equals, true)
+	require.NoError(t, err)
+	require.True(t, sm.isMuted())
+	require.True(t, sm.isSignalMuted(SignalNatFillUp))
+	require.True(t, sm.isSignalMuted(SignalCTFillUp))
+	require.True(t, sm.isSignalMuted(SignalAuthRequired))
 
-	c.Assert(events.paused, Equals, true)
-	c.Assert(events.closed, Equals, false)
+	require.True(t, events.paused)
+	require.False(t, events.closed)
 
 	// A signal is unmuted again
 	err = sm.UnmuteSignals(SignalCTFillUp)
-	c.Assert(err, IsNil)
-	c.Assert(sm.isMuted(), Equals, false)
-	c.Assert(sm.isSignalMuted(SignalNatFillUp), Equals, true)
-	c.Assert(sm.isSignalMuted(SignalCTFillUp), Equals, false)
-	c.Assert(sm.isSignalMuted(SignalAuthRequired), Equals, true)
+	require.NoError(t, err)
+	require.False(t, sm.isMuted())
+	require.True(t, sm.isSignalMuted(SignalNatFillUp))
+	require.False(t, sm.isSignalMuted(SignalCTFillUp))
+	require.True(t, sm.isSignalMuted(SignalAuthRequired))
 
-	c.Assert(events.paused, Equals, false)
-	c.Assert(events.closed, Equals, false)
+	require.False(t, events.paused)
+	require.False(t, events.closed)
 }
 
 type SignalData uint32
@@ -167,8 +159,9 @@ func (d SignalData) String() string {
 	return signalProto[d]
 }
 
-func (t *signalSuite) TestLifeCycle(c *C) {
+func TestLifeCycle(t *testing.T) {
 	logging.SetLogLevelToDebug()
+	logger := hivetest.Logger(t)
 
 	buf1 := new(bytes.Buffer)
 	binary.Write(buf1, byteorder.Native, SignalNatFillUp)
@@ -180,21 +173,21 @@ func (t *signalSuite) TestLifeCycle(c *C) {
 
 	messages := [][]byte{buf1.Bytes(), buf2.Bytes()}
 
-	sm := newSignalManager(fakesignalmap.NewFakeSignalMap(messages, time.Second))
-	c.Assert(sm.isMuted(), Equals, true)
+	sm := newSignalManager(fakesignalmap.NewFakeSignalMap(messages, time.Second), logger)
+	require.True(t, sm.isMuted())
 
 	wakeup := make(chan SignalData, 1024)
 	err := sm.RegisterHandler(ChannelHandler(wakeup), SignalNatFillUp, SignalCTFillUp)
-	c.Assert(err, IsNil)
-	c.Assert(sm.isMuted(), Equals, false)
+	require.NoError(t, err)
+	require.False(t, sm.isMuted())
 
 	err = sm.start()
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 
 	select {
 	case x := <-wakeup:
 		sm.MuteSignals(SignalNatFillUp, SignalCTFillUp)
-		c.Assert(sm.isMuted(), Equals, true)
+		require.True(t, sm.isMuted())
 
 		ipv4 := false
 		ipv6 := false
@@ -214,16 +207,16 @@ func (t *signalSuite) TestLifeCycle(c *C) {
 			}
 		}
 
-		c.Assert(ipv4, Equals, true)
-		c.Assert(ipv6, Equals, false)
+		require.True(t, ipv4)
+		require.False(t, ipv6)
 
 	case <-time.After(5 * time.Second):
 		sm.MuteSignals(SignalNatFillUp, SignalCTFillUp)
-		c.Assert(sm.isMuted(), Equals, true)
+		require.True(t, sm.isMuted())
 
-		c.Fatal("No signals received on time.")
+		t.Fatal("No signals received on time.")
 	}
 
 	err = sm.stop()
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 }

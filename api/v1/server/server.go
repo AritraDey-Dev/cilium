@@ -12,9 +12,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -22,7 +24,6 @@ import (
 	"github.com/go-openapi/loads"
 	"github.com/go-openapi/runtime/middleware"
 	"github.com/go-openapi/swag"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 	"golang.org/x/net/netutil"
 
@@ -31,16 +32,15 @@ import (
 	"github.com/cilium/cilium/api/v1/server/restapi/daemon"
 	"github.com/cilium/cilium/api/v1/server/restapi/endpoint"
 	"github.com/cilium/cilium/api/v1/server/restapi/ipam"
-	"github.com/cilium/cilium/api/v1/server/restapi/metrics"
 	"github.com/cilium/cilium/api/v1/server/restapi/policy"
 	"github.com/cilium/cilium/api/v1/server/restapi/prefilter"
 	"github.com/cilium/cilium/api/v1/server/restapi/recorder"
 	"github.com/cilium/cilium/api/v1/server/restapi/service"
-	"github.com/cilium/cilium/api/v1/server/restapi/statedb"
+	"github.com/cilium/hive/cell"
 
 	"github.com/cilium/cilium/pkg/api"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
+	"github.com/cilium/cilium/pkg/logging"
 )
 
 // Cell implements the cilium API REST API server when provided
@@ -63,6 +63,8 @@ type apiParams struct {
 
 	Spec *Spec
 
+	Logger *slog.Logger
+
 	Middleware middleware.Builder `name:"cilium-api-middleware" optional:"true"`
 
 	EndpointDeleteEndpointHandler        endpoint.DeleteEndpointHandler
@@ -72,7 +74,6 @@ type apiParams struct {
 	PolicyDeletePolicyHandler            policy.DeletePolicyHandler
 	PrefilterDeletePrefilterHandler      prefilter.DeletePrefilterHandler
 	RecorderDeleteRecorderIDHandler      recorder.DeleteRecorderIDHandler
-	ServiceDeleteServiceIDHandler        service.DeleteServiceIDHandler
 	BgpGetBgpPeersHandler                bgp.GetBgpPeersHandler
 	BgpGetBgpRoutePoliciesHandler        bgp.GetBgpRoutePoliciesHandler
 	BgpGetBgpRoutesHandler               bgp.GetBgpRoutesHandler
@@ -89,7 +90,6 @@ type apiParams struct {
 	PolicyGetFqdnCacheHandler            policy.GetFqdnCacheHandler
 	PolicyGetFqdnCacheIDHandler          policy.GetFqdnCacheIDHandler
 	PolicyGetFqdnNamesHandler            policy.GetFqdnNamesHandler
-	DaemonGetHealthHandler               daemon.GetHealthHandler
 	DaemonGetHealthzHandler              daemon.GetHealthzHandler
 	PolicyGetIPHandler                   policy.GetIPHandler
 	PolicyGetIdentityHandler             policy.GetIdentityHandler
@@ -99,7 +99,6 @@ type apiParams struct {
 	DaemonGetMapHandler                  daemon.GetMapHandler
 	DaemonGetMapNameHandler              daemon.GetMapNameHandler
 	DaemonGetMapNameEventsHandler        daemon.GetMapNameEventsHandler
-	MetricsGetMetricsHandler             metrics.GetMetricsHandler
 	DaemonGetNodeIdsHandler              daemon.GetNodeIdsHandler
 	PolicyGetPolicyHandler               policy.GetPolicyHandler
 	PolicyGetPolicySelectorsHandler      policy.GetPolicySelectorsHandler
@@ -109,8 +108,6 @@ type apiParams struct {
 	RecorderGetRecorderMasksHandler      recorder.GetRecorderMasksHandler
 	ServiceGetServiceHandler             service.GetServiceHandler
 	ServiceGetServiceIDHandler           service.GetServiceIDHandler
-	StatedbGetStatedbDumpHandler         statedb.GetStatedbDumpHandler
-	StatedbGetStatedbQueryTableHandler   statedb.GetStatedbQueryTableHandler
 	DaemonPatchConfigHandler             daemon.PatchConfigHandler
 	EndpointPatchEndpointIDHandler       endpoint.PatchEndpointIDHandler
 	EndpointPatchEndpointIDConfigHandler endpoint.PatchEndpointIDConfigHandler
@@ -121,7 +118,6 @@ type apiParams struct {
 	EndpointPutEndpointIDHandler         endpoint.PutEndpointIDHandler
 	PolicyPutPolicyHandler               policy.PutPolicyHandler
 	RecorderPutRecorderIDHandler         recorder.PutRecorderIDHandler
-	ServicePutServiceIDHandler           service.PutServiceIDHandler
 }
 
 func newAPI(p apiParams) *restapi.CiliumAPIAPI {
@@ -136,7 +132,6 @@ func newAPI(p apiParams) *restapi.CiliumAPIAPI {
 	api.PolicyDeletePolicyHandler = p.PolicyDeletePolicyHandler
 	api.PrefilterDeletePrefilterHandler = p.PrefilterDeletePrefilterHandler
 	api.RecorderDeleteRecorderIDHandler = p.RecorderDeleteRecorderIDHandler
-	api.ServiceDeleteServiceIDHandler = p.ServiceDeleteServiceIDHandler
 	api.BgpGetBgpPeersHandler = p.BgpGetBgpPeersHandler
 	api.BgpGetBgpRoutePoliciesHandler = p.BgpGetBgpRoutePoliciesHandler
 	api.BgpGetBgpRoutesHandler = p.BgpGetBgpRoutesHandler
@@ -153,7 +148,6 @@ func newAPI(p apiParams) *restapi.CiliumAPIAPI {
 	api.PolicyGetFqdnCacheHandler = p.PolicyGetFqdnCacheHandler
 	api.PolicyGetFqdnCacheIDHandler = p.PolicyGetFqdnCacheIDHandler
 	api.PolicyGetFqdnNamesHandler = p.PolicyGetFqdnNamesHandler
-	api.DaemonGetHealthHandler = p.DaemonGetHealthHandler
 	api.DaemonGetHealthzHandler = p.DaemonGetHealthzHandler
 	api.PolicyGetIPHandler = p.PolicyGetIPHandler
 	api.PolicyGetIdentityHandler = p.PolicyGetIdentityHandler
@@ -163,7 +157,6 @@ func newAPI(p apiParams) *restapi.CiliumAPIAPI {
 	api.DaemonGetMapHandler = p.DaemonGetMapHandler
 	api.DaemonGetMapNameHandler = p.DaemonGetMapNameHandler
 	api.DaemonGetMapNameEventsHandler = p.DaemonGetMapNameEventsHandler
-	api.MetricsGetMetricsHandler = p.MetricsGetMetricsHandler
 	api.DaemonGetNodeIdsHandler = p.DaemonGetNodeIdsHandler
 	api.PolicyGetPolicyHandler = p.PolicyGetPolicyHandler
 	api.PolicyGetPolicySelectorsHandler = p.PolicyGetPolicySelectorsHandler
@@ -173,8 +166,6 @@ func newAPI(p apiParams) *restapi.CiliumAPIAPI {
 	api.RecorderGetRecorderMasksHandler = p.RecorderGetRecorderMasksHandler
 	api.ServiceGetServiceHandler = p.ServiceGetServiceHandler
 	api.ServiceGetServiceIDHandler = p.ServiceGetServiceIDHandler
-	api.StatedbGetStatedbDumpHandler = p.StatedbGetStatedbDumpHandler
-	api.StatedbGetStatedbQueryTableHandler = p.StatedbGetStatedbQueryTableHandler
 	api.DaemonPatchConfigHandler = p.DaemonPatchConfigHandler
 	api.EndpointPatchEndpointIDHandler = p.EndpointPatchEndpointIDHandler
 	api.EndpointPatchEndpointIDConfigHandler = p.EndpointPatchEndpointIDConfigHandler
@@ -185,7 +176,6 @@ func newAPI(p apiParams) *restapi.CiliumAPIAPI {
 	api.EndpointPutEndpointIDHandler = p.EndpointPutEndpointIDHandler
 	api.PolicyPutPolicyHandler = p.PolicyPutPolicyHandler
 	api.RecorderPutRecorderIDHandler = p.RecorderPutRecorderIDHandler
-	api.ServicePutServiceIDHandler = p.ServicePutServiceIDHandler
 
 	// Inject custom middleware if provided by Hive
 	if p.Middleware != nil {
@@ -194,15 +184,17 @@ func newAPI(p apiParams) *restapi.CiliumAPIAPI {
 		}
 	}
 
+	api.Logger = p.Logger.Info
+
 	return api
 }
 
 type serverParams struct {
 	cell.In
 
-	Lifecycle  hive.Lifecycle
+	Lifecycle  cell.Lifecycle
 	Shutdowner hive.Shutdowner
-	Logger     logrus.FieldLogger
+	Logger     *slog.Logger
 	Spec       *Spec
 	API        *restapi.CiliumAPIAPI
 }
@@ -313,7 +305,7 @@ func NewServer(api *restapi.CiliumAPIAPI) *Server {
 // ConfigureAPI configures the API and handlers.
 func (s *Server) ConfigureAPI() {
 	if s.api != nil {
-		s.handler = configureAPI(s.api)
+		s.handler = configureAPI(s.logger, s.api)
 	}
 }
 
@@ -360,15 +352,15 @@ type Server struct {
 
 	wg         sync.WaitGroup
 	shutdowner hive.Shutdowner
-	logger     logrus.FieldLogger
+	logger     *slog.Logger
 }
 
 // Logf logs message either via defined user logger or via system one if no user logger is defined.
 func (s *Server) Logf(f string, args ...interface{}) {
 	if s.logger != nil {
-		s.logger.Infof(f, args...)
+		s.logger.Info(fmt.Sprintf(f, args...))
 	} else if s.api != nil && s.api.Logger != nil {
-		s.api.Logger(f, args...)
+		s.api.Logger(fmt.Sprintf(f, args...))
 	} else {
 		log.Printf(f, args...)
 	}
@@ -396,7 +388,7 @@ func (s *Server) SetAPI(api *restapi.CiliumAPIAPI) {
 	}
 
 	s.api = api
-	s.handler = configureAPI(api)
+	s.handler = configureAPI(s.logger, api)
 }
 
 // GetAPI returns the configured API. Modifications on the API must be performed
@@ -411,12 +403,7 @@ func (s *Server) hasScheme(scheme string) bool {
 		schemes = defaultSchemes
 	}
 
-	for _, v := range schemes {
-		if v == scheme {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(schemes, scheme)
 }
 
 func (s *Server) Serve() error {
@@ -429,9 +416,7 @@ func (s *Server) Serve() error {
 }
 
 // Start the server
-func (s *Server) Start(hive.HookContext) (err error) {
-	s.ConfigureAPI()
-
+func (s *Server) Start(cell.HookContext) (err error) {
 	if !s.hasListeners {
 		if err = s.Listen(); err != nil {
 			return err
@@ -448,6 +433,7 @@ func (s *Server) Start(hive.HookContext) (err error) {
 			return errors.New("can't create the default handler, as no api is set")
 		}
 
+		s.ConfigureAPI()
 		s.SetHandler(s.api.Serve(nil))
 	}
 
@@ -462,7 +448,7 @@ func (s *Server) Start(hive.HookContext) (err error) {
 		configureServer(domainSocket, "unix", s.SocketPath)
 
 		if os.Getuid() == 0 {
-			err := api.SetDefaultPermissions(s.SocketPath)
+			err := api.SetDefaultPermissions(logging.DefaultSlogLogger, s.SocketPath)
 			if err != nil {
 				return err
 			}
@@ -588,9 +574,6 @@ func (s *Server) Start(hive.HookContext) (err error) {
 			s.Fatalf("no certificate was configured for TLS")
 		}
 
-		// must have at least one certificate or panics
-		httpsServer.TLSConfig.BuildNameToCertificate()
-
 		configureServer(httpsServer, "https", s.httpsServerL.Addr().String())
 
 		s.servers = append(s.servers, httpsServer)
@@ -690,7 +673,7 @@ func (s *Server) Shutdown() error {
 	return s.Stop(ctx)
 }
 
-func (s *Server) Stop(ctx hive.HookContext) error {
+func (s *Server) Stop(ctx cell.HookContext) error {
 	// first execute the pre-shutdown hook
 	s.api.PreServerShutdown()
 

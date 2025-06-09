@@ -5,12 +5,11 @@ package apis
 
 import (
 	"fmt"
+	"log/slog"
 
-	"github.com/sirupsen/logrus"
+	"github.com/cilium/hive/cell"
 	"github.com/spf13/pflag"
 
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/client"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 )
@@ -46,13 +45,13 @@ func (c RegisterCRDsConfig) Flags(flags *pflag.FlagSet) {
 }
 
 // RegisterCRDsFunc is a function that register all the CRDs for a k8s group
-type RegisterCRDsFunc func(k8sClient.Clientset) error
+type RegisterCRDsFunc func(*slog.Logger, k8sClient.Clientset) error
 
 type params struct {
 	cell.In
 
-	Logger    logrus.FieldLogger
-	Lifecycle hive.Lifecycle
+	Logger    *slog.Logger
+	Lifecycle cell.Lifecycle
 
 	Clientset k8sClient.Clientset
 
@@ -61,8 +60,8 @@ type params struct {
 }
 
 func createCRDs(p params) {
-	p.Lifecycle.Append(hive.Hook{
-		OnStart: func(ctx hive.HookContext) error {
+	p.Lifecycle.Append(cell.Hook{
+		OnStart: func(ctx cell.HookContext) error {
 			// Register the CRDs after validating that we are running on a supported
 			// version of K8s.
 			if !p.Clientset.IsEnabled() || p.Config.SkipCRDCreation {
@@ -71,7 +70,7 @@ func createCRDs(p params) {
 			}
 
 			for _, f := range p.RegisterCRDsFuncs {
-				if err := f(p.Clientset); err != nil {
+				if err := f(p.Logger, p.Clientset); err != nil {
 					return fmt.Errorf("unable to create CRDs: %w", err)
 				}
 			}

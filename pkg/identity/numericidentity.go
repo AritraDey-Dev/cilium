@@ -16,7 +16,6 @@ import (
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	"github.com/cilium/cilium/pkg/labels"
-	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/option"
 )
 
@@ -132,6 +131,10 @@ const (
 	// ReservedIdentityWorldIPv6 represents any endpoint outside of the cluster
 	// for IPv6 address only.
 	ReservedIdentityWorldIPv6
+
+	// ReservedEncryptedOverlay represents overlay traffic which must be IPSec
+	// encrypted before it leaves the host
+	ReservedEncryptedOverlay
 )
 
 // Special identities for well-known cluster components
@@ -140,13 +143,8 @@ const (
 // one is used for Kubernetes >= 1.21 and when the NamespaceDefaultLabelName is
 // enabled.
 const (
-	// ReservedETCDOperator is the reserved identity used for the etcd-operator
-	// managed by Cilium.
-	ReservedETCDOperator NumericIdentity = iota + 100
-
-	// ReservedCiliumKVStore is the reserved identity used for the kvstore
-	// managed by Cilium (etcd-operator).
-	ReservedCiliumKVStore
+	DeprecatedETCDOperator NumericIdentity = iota + 100
+	DeprecatedCiliumKVStore
 
 	// ReservedKubeDNS is the reserved identity used for kube-dns.
 	ReservedKubeDNS
@@ -163,33 +161,24 @@ const (
 	// ReservedEKSCoreDNS is the reserved identity used for CoreDNS on EKS
 	ReservedEKSCoreDNS
 
-	// ReservedCiliumEtcdOperator is the reserved identity used for the Cilium etcd operator
-	ReservedCiliumEtcdOperator
+	DeprecatedCiliumEtcdOperator
 
 	// Second identities for all above components
-	ReservedETCDOperator2
-	ReservedCiliumKVStore2
+	DeprecatedETCDOperator2
+	DeprecatedCiliumKVStore2
 	ReservedKubeDNS2
 	ReservedEKSKubeDNS2
 	ReservedCoreDNS2
 	ReservedCiliumOperator2
 	ReservedEKSCoreDNS2
-	ReservedCiliumEtcdOperator2
+	DeprecatedCiliumEtcdOperator2
 )
-
-// localNodeIdentity is the endpoint identity allocated for the local node
-var localNodeIdentity = struct {
-	lock.Mutex
-	identity NumericIdentity
-}{
-	identity: ReservedIdentityRemoteNode,
-}
 
 type wellKnownIdentities map[NumericIdentity]wellKnownIdentity
 
 // wellKnownIdentitity is an identity for well-known security labels for which
 // a well-known numeric identity is reserved to avoid requiring a cluster wide
-// setup. Examples of this include kube-dns and the etcd-operator.
+// setup. Examples of this include kube-dns.
 type wellKnownIdentity struct {
 	identity   *Identity
 	labelArray labels.LabelArray
@@ -218,6 +207,12 @@ func (w wellKnownIdentities) LookupByLabels(lbls labels.Labels) *Identity {
 	return nil
 }
 
+func (w wellKnownIdentities) ForEach(yield func(*Identity)) {
+	for _, id := range w {
+		yield(id.identity)
+	}
+}
+
 func (w wellKnownIdentities) lookupByNumericIdentity(identity NumericIdentity) *Identity {
 	wki, ok := w[identity]
 	if !ok {
@@ -237,43 +232,6 @@ func k8sLabel(key string, value string) string {
 // InitWellKnownIdentities establishes all well-known identities. Returns the
 // number of well-known identities initialized.
 func InitWellKnownIdentities(c Configuration, cinfo cmtypes.ClusterInfo) int {
-	// etcd-operator labels
-	//   k8s:io.cilium.k8s.policy.serviceaccount=cilium-etcd-sa
-	//   k8s:io.kubernetes.pod.namespace=<NAMESPACE>
-	//   k8s:io.cilium/app=etcd-operator
-	//   k8s:io.cilium.k8s.policy.cluster=default
-	etcdOperatorLabels := []string{
-		"k8s:io.cilium/app=etcd-operator",
-		k8sLabel(api.PodNamespaceLabel, c.CiliumNamespaceName()),
-		k8sLabel(api.PolicyLabelServiceAccount, "cilium-etcd-sa"),
-		k8sLabel(api.PolicyLabelCluster, cinfo.Name),
-	}
-	WellKnown.add(ReservedETCDOperator, etcdOperatorLabels)
-	WellKnown.add(ReservedETCDOperator2, append(etcdOperatorLabels,
-		k8sLabel(api.PodNamespaceMetaNameLabel, c.CiliumNamespaceName())))
-
-	// cilium-etcd labels
-	//   k8s:app=etcd
-	//   k8s:io.cilium/app=etcd-operator
-	//   k8s:etcd_cluster=cilium-etcd
-	//   k8s:io.cilium.k8s.policy.serviceaccount=default
-	//   k8s:io.kubernetes.pod.namespace=<NAMESPACE>
-	//   k8s:io.cilium.k8s.policy.cluster=default
-	// these 2 labels are ignored by cilium-agent as they can change over time
-	//   container:annotation.etcd.version=3.3.9
-	//   k8s:etcd_node=cilium-etcd-6snk6vsjcm
-	ciliumEtcdLabels := []string{
-		"k8s:app=etcd",
-		"k8s:etcd_cluster=cilium-etcd",
-		"k8s:io.cilium/app=etcd-operator",
-		k8sLabel(api.PodNamespaceLabel, c.CiliumNamespaceName()),
-		k8sLabel(api.PolicyLabelServiceAccount, "default"),
-		k8sLabel(api.PolicyLabelCluster, cinfo.Name),
-	}
-	WellKnown.add(ReservedCiliumKVStore, ciliumEtcdLabels)
-	WellKnown.add(ReservedCiliumKVStore2, append(ciliumEtcdLabels,
-		k8sLabel(api.PodNamespaceMetaNameLabel, c.CiliumNamespaceName())))
-
 	// kube-dns labels
 	//   k8s:io.cilium.k8s.policy.serviceaccount=kube-dns
 	//   k8s:io.kubernetes.pod.namespace=kube-system
@@ -359,27 +317,6 @@ func InitWellKnownIdentities(c Configuration, cinfo cmtypes.ClusterInfo) int {
 	WellKnown.add(ReservedCiliumOperator2, append(ciliumOperatorLabels,
 		k8sLabel(api.PodNamespaceMetaNameLabel, c.CiliumNamespaceName())))
 
-	// cilium-etcd-operator labels
-	//   k8s:io.cilium.k8s.policy.cluster=default
-	//   k8s:io.cilium.k8s.policy.serviceaccount=cilium-etcd-operator
-	//   k8s:io.cilium/app=etcd-operator
-	//   k8s:app.kubernetes.io/name: cilium-etcd-operator
-	//   k8s:app.kubernetes.io/part-of: cilium
-	//   k8s:io.kubernetes.pod.namespace=<NAMESPACE>
-	//   k8s:name=cilium-etcd-operator
-	ciliumEtcdOperatorLabels := []string{
-		"k8s:name=cilium-etcd-operator",
-		"k8s:io.cilium/app=etcd-operator",
-		"k8s:app.kubernetes.io/name: cilium-etcd-operator",
-		"k8s:app.kubernetes.io/part-of: cilium",
-		k8sLabel(api.PodNamespaceLabel, c.CiliumNamespaceName()),
-		k8sLabel(api.PolicyLabelServiceAccount, "cilium-etcd-operator"),
-		k8sLabel(api.PolicyLabelCluster, cinfo.Name),
-	}
-	WellKnown.add(ReservedCiliumEtcdOperator, ciliumEtcdOperatorLabels)
-	WellKnown.add(ReservedCiliumEtcdOperator2, append(ciliumEtcdOperatorLabels,
-		k8sLabel(api.PodNamespaceMetaNameLabel, c.CiliumNamespaceName())))
-
 	return len(WellKnown)
 }
 
@@ -402,33 +339,34 @@ func initClusterIDShift() {
 
 // GetMinimalNumericIdentity returns the minimal numeric identity not used for
 // reserved purposes.
-func GetMinimalAllocationIdentity() NumericIdentity {
-	if option.Config.ClusterID > 0 {
+func GetMinimalAllocationIdentity(clusterID uint32) NumericIdentity {
+	if clusterID > 0 {
 		// For ClusterID > 0, the identity range just starts from cluster shift,
 		// no well-known-identities need to be reserved from the range.
-		return NumericIdentity((1 << GetClusterIDShift()) * option.Config.ClusterID)
+		return NumericIdentity((1 << GetClusterIDShift()) * clusterID)
 	}
 	return MinimalNumericIdentity
 }
 
 // GetMaximumAllocationIdentity returns the maximum numeric identity that
 // should be handed out by the identity allocator.
-func GetMaximumAllocationIdentity() NumericIdentity {
-	return NumericIdentity((1<<GetClusterIDShift())*(option.Config.ClusterID+1) - 1)
+func GetMaximumAllocationIdentity(clusterID uint32) NumericIdentity {
+	return NumericIdentity((1<<GetClusterIDShift())*(clusterID+1) - 1)
 }
 
 var (
 	reservedIdentities = map[string]NumericIdentity{
-		labels.IDNameHost:          ReservedIdentityHost,
-		labels.IDNameWorld:         ReservedIdentityWorld,
-		labels.IDNameWorldIPv4:     ReservedIdentityWorldIPv4,
-		labels.IDNameWorldIPv6:     ReservedIdentityWorldIPv6,
-		labels.IDNameUnmanaged:     ReservedIdentityUnmanaged,
-		labels.IDNameHealth:        ReservedIdentityHealth,
-		labels.IDNameInit:          ReservedIdentityInit,
-		labels.IDNameRemoteNode:    ReservedIdentityRemoteNode,
-		labels.IDNameKubeAPIServer: ReservedIdentityKubeAPIServer,
-		labels.IDNameIngress:       ReservedIdentityIngress,
+		labels.IDNameHost:             ReservedIdentityHost,
+		labels.IDNameWorld:            ReservedIdentityWorld,
+		labels.IDNameWorldIPv4:        ReservedIdentityWorldIPv4,
+		labels.IDNameWorldIPv6:        ReservedIdentityWorldIPv6,
+		labels.IDNameUnmanaged:        ReservedIdentityUnmanaged,
+		labels.IDNameHealth:           ReservedIdentityHealth,
+		labels.IDNameInit:             ReservedIdentityInit,
+		labels.IDNameRemoteNode:       ReservedIdentityRemoteNode,
+		labels.IDNameKubeAPIServer:    ReservedIdentityKubeAPIServer,
+		labels.IDNameIngress:          ReservedIdentityIngress,
+		labels.IDNameEncryptedOverlay: ReservedEncryptedOverlay,
 	}
 	reservedIdentityNames = map[NumericIdentity]string{
 		IdentityUnknown:               "unknown",
@@ -560,23 +498,6 @@ func (id NumericIdentity) Uint32() uint32 {
 	return uint32(id)
 }
 
-// GetLocalNodeID returns the configured local node numeric identity that is
-// set in tunnel headers when encapsulating packets originating from the local
-// node.
-func GetLocalNodeID() NumericIdentity {
-	localNodeIdentity.Lock()
-	defer localNodeIdentity.Unlock()
-	return localNodeIdentity.identity
-}
-
-// SetLocalNodeID sets the local node id.
-// Note that currently changes to the local node id only take effect during agent bootstrap
-func SetLocalNodeID(nodeid uint32) {
-	localNodeIdentity.Lock()
-	defer localNodeIdentity.Unlock()
-	localNodeIdentity.identity = NumericIdentity(nodeid)
-}
-
 func GetReservedID(name string) NumericIdentity {
 	if v, ok := reservedIdentities[name]; ok {
 		return v
@@ -655,4 +576,14 @@ func (id NumericIdentity) IsWorld() bool {
 	}
 	return option.Config.IsDualStack() &&
 		(id == ReservedIdentityWorldIPv4 || id == ReservedIdentityWorldIPv6)
+}
+
+// IsCluster returns true if the identity is a cluster identity by excluding all
+// identities that are known to be non-cluster identities.
+// NOTE: keep this and bpf identity_is_cluster() in sync!
+func (id NumericIdentity) IsCluster() bool {
+	if id.IsWorld() || id.HasLocalScope() {
+		return false
+	}
+	return true
 }

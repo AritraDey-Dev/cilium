@@ -19,7 +19,6 @@ package tests
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,6 +28,7 @@ import (
 	v1 "sigs.k8s.io/gateway-api/apis/v1"
 	"sigs.k8s.io/gateway-api/conformance/utils/kubernetes"
 	"sigs.k8s.io/gateway-api/conformance/utils/suite"
+	"sigs.k8s.io/gateway-api/pkg/features"
 )
 
 func init() {
@@ -38,22 +38,21 @@ func init() {
 var GatewayModifyListeners = suite.ConformanceTest{
 	ShortName:   "GatewayModifyListeners",
 	Description: "A Gateway in the gateway-conformance-infra namespace should handle adding and removing listeners.",
-	Features: []suite.SupportedFeature{
-		suite.SupportGateway,
+	Features: []features.FeatureName{
+		features.SupportGateway,
 	},
 	Manifests: []string{"tests/gateway-modify-listeners.yaml"},
 	Test: func(t *testing.T, s *suite.ConformanceTestSuite) {
 		t.Run("should be able to add a listener that then becomes available for routing traffic", func(t *testing.T) {
 			gwNN := types.NamespacedName{Name: "gateway-add-listener", Namespace: "gateway-conformance-infra"}
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-			defer cancel()
-
 			namespaces := []string{"gateway-conformance-infra"}
 			kubernetes.NamespacesMustBeReady(t, s.Client, s.TimeoutConfig, namespaces)
 
 			// verify that the implementation is tracking the most recent resource changes
 			kubernetes.GatewayMustHaveLatestConditions(t, s.Client, s.TimeoutConfig, gwNN)
 
+			ctx, cancel := context.WithTimeout(context.Background(), s.TimeoutConfig.DefaultTestTimeout)
+			defer cancel()
 			original := &v1.Gateway{}
 			err := s.Client.Get(ctx, gwNN, original)
 			require.NoErrorf(t, err, "error getting Gateway: %v", err)
@@ -137,21 +136,20 @@ var GatewayModifyListeners = suite.ConformanceTest{
 
 		t.Run("should be able to remove listeners, which would then stop routing the relevant traffic", func(t *testing.T) {
 			gwNN := types.NamespacedName{Name: "gateway-remove-listener", Namespace: "gateway-conformance-infra"}
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-			defer cancel()
-
 			namespaces := []string{"gateway-conformance-infra"}
 			kubernetes.NamespacesMustBeReady(t, s.Client, s.TimeoutConfig, namespaces)
 
 			// verify that the implementation is tracking the most recent resource changes
 			kubernetes.GatewayMustHaveLatestConditions(t, s.Client, s.TimeoutConfig, gwNN)
 
+			ctx, cancel := context.WithTimeout(context.Background(), s.TimeoutConfig.DefaultTestTimeout)
+			defer cancel()
 			original := &v1.Gateway{}
 			err := s.Client.Get(ctx, gwNN, original)
 			require.NoErrorf(t, err, "error getting Gateway: %v", err)
 
 			mutate := original.DeepCopy()
-			require.Equalf(t, 2, len(mutate.Spec.Listeners), "the gateway must have 2 listeners")
+			require.Lenf(t, mutate.Spec.Listeners, 2, "the gateway must have 2 listeners")
 
 			// remove the "https" Gateway listener, leaving only the "http" listener
 			var newListeners []v1.Listener

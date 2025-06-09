@@ -4,7 +4,9 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -15,9 +17,10 @@ import (
 	"github.com/cilium/cilium/pkg/defaults"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
 	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/pprof"
 )
 
-func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
+func InitGlobalFlags(logger *slog.Logger, cmd *cobra.Command, vp *viper.Viper) {
 	flags := cmd.Flags()
 
 	flags.Int(operatorOption.IPAMAPIBurst, defaults.IPAMAPIBurst, "Upper burst limit when accessing external APIs")
@@ -53,17 +56,6 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 
 	flags.String(option.ConfigDir, "", `Configuration directory that contains a file for each option`)
 	option.BindEnv(vp, option.ConfigDir)
-
-	flags.Bool(operatorOption.SkipCNPStatusStartupClean, false, `If set to true, the operator will not clean up CNP node status updates at startup`)
-	option.BindEnv(vp, operatorOption.SkipCNPStatusStartupClean)
-
-	flags.Float64(operatorOption.CNPStatusCleanupQPS, operatorOption.CNPStatusCleanupQPSDefault,
-		"Rate used for limiting the clean up of the status nodes updates in CNP, expressed as qps")
-	option.BindEnv(vp, operatorOption.CNPStatusCleanupQPS)
-
-	flags.Int(operatorOption.CNPStatusCleanupBurst, operatorOption.CNPStatusCleanupBurstDefault,
-		"Maximum burst of requests to clean up status nodes updates in CNPs")
-	option.BindEnv(vp, operatorOption.CNPStatusCleanupBurst)
 
 	flags.BoolP(option.DebugArg, "D", false, "Enable debugging mode")
 	option.BindEnv(vp, option.DebugArg)
@@ -146,13 +138,13 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 			if recommendation := recommendInstead(); recommendation != "" {
 				return fmt.Errorf("%s (use %s)", errMsg, recommendation)
 			}
-			return fmt.Errorf(errMsg)
+			return errors.New(errMsg)
 		}
 
 		switch binaryName {
 		case "cilium-operator":
 			if recommendation := recommendInstead(); recommendation != "" {
-				log.Warnf("cilium-operator will be deprecated in the future, for --%s=%s use %s as it has lower memory footprint", option.IPAM, ipamFlagValue, recommendation)
+				logger.Warn(fmt.Sprintf("cilium-operator will be deprecated in the future, for --%s=%s use %s as it has lower memory footprint", option.IPAM, ipamFlagValue, recommendation))
 			}
 		case "cilium-operator-aws":
 			if ipamFlagValue != ipamOption.IPAMENI {
@@ -250,12 +242,6 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 		"Duration that LeaderElector clients should wait between retries of the actions")
 	option.BindEnv(vp, operatorOption.LeaderElectionRetryPeriod)
 
-	flags.Bool(option.BGPAnnounceLBIP, false, "Announces service IPs of type LoadBalancer via BGP")
-	option.BindEnv(vp, option.BGPAnnounceLBIP)
-
-	flags.String(option.BGPConfigPath, "/var/lib/cilium/bgp/config.yaml", "Path to file containing the BGP configuration")
-	option.BindEnv(vp, option.BGPConfigPath)
-
 	flags.Bool(option.EnableCiliumEndpointSlice, false, "If set to true, the CiliumEndpointSlice feature is enabled. If any CiliumEndpoints resources are created, updated, or deleted in the cluster, all those changes are broadcast as CiliumEndpointSlice updates to all of the Cilium agents.")
 	option.BindEnv(vp, option.EnableCiliumEndpointSlice)
 
@@ -264,6 +250,9 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 
 	flags.String(operatorOption.CiliumPodLabels, "k8s-app=cilium", "Cilium Pod's labels. Used to detect if a Cilium pod is running to remove the node taints where its running and set NetworkUnavailable to false")
 	option.BindEnv(vp, operatorOption.CiliumPodLabels)
+
+	flags.Int(operatorOption.TaintSyncWorkers, 10, "Number of workers used to synchronize node tains and conditions")
+	option.BindEnv(vp, operatorOption.TaintSyncWorkers)
 
 	flags.Bool(operatorOption.RemoveCiliumNodeTaints, true, fmt.Sprintf("Remove node taint %q from Kubernetes nodes once Cilium is up and running", option.Config.AgentNotReadyNodeTaintValue()))
 	option.BindEnv(vp, operatorOption.RemoveCiliumNodeTaints)
@@ -274,15 +263,49 @@ func InitGlobalFlags(cmd *cobra.Command, vp *viper.Viper) {
 	flags.Bool(operatorOption.SetCiliumIsUpCondition, true, "Set CiliumIsUp Node condition to mark a Kubernetes Node that a Cilium pod is up and running in that node")
 	option.BindEnv(vp, operatorOption.SetCiliumIsUpCondition)
 
-	flags.Uint32(operatorOption.IngressDefaultXffNumTrustedHops, 0, "The number of additional ingress proxy hops from the right side of the HTTP header to trust when determining the origin client's IP address.")
-	option.BindEnv(vp, operatorOption.IngressDefaultXffNumTrustedHops)
-
 	flags.String(operatorOption.PodRestartSelector, "k8s-app=kube-dns", "cilium-operator will delete/restart any pods with these labels if the pod is not managed by Cilium. If this option is empty, then all pods may be restarted")
 	option.BindEnv(vp, operatorOption.PodRestartSelector)
 
+	flags.Uint(option.KVstoreMaxConsecutiveQuorumErrorsName, defaults.KVstoreMaxConsecutiveQuorumErrors, "Max acceptable kvstore consecutive quorum errors before the operator assumes permanent failure")
+	option.BindEnv(vp, option.KVstoreMaxConsecutiveQuorumErrorsName)
+
 	flags.Duration(option.KVstoreLeaseTTL, defaults.KVstoreLeaseTTL, "Time-to-live for the KVstore lease.")
-	flags.MarkHidden(option.KVstoreLeaseTTL)
 	option.BindEnv(vp, option.KVstoreLeaseTTL)
+
+	flags.String(option.KubeProxyReplacement, "false", "Enable only selected features (will panic if any selected feature cannot be enabled) (\"false\"), or enable all features (will panic if any feature cannot be enabled) (\"true\") (default \"false\")")
+	flags.MarkHidden(option.KubeProxyReplacement)
+	option.BindEnv(vp, option.KubeProxyReplacement)
+
+	flags.Bool(option.EnableNodePort, false, "Enable NodePort type services by Cilium")
+	flags.MarkHidden(option.EnableNodePort)
+	option.BindEnv(vp, option.EnableNodePort)
+
+	flags.String(option.EnablePolicy, option.DefaultEnforcement, "Enable policy enforcement")
+	option.BindEnv(vp, option.EnablePolicy)
+
+	flags.Bool(option.EnableK8sNetworkPolicy, defaults.EnableK8sNetworkPolicy, "Enable support for K8s NetworkPolicy")
+	flags.MarkHidden(option.EnableK8sNetworkPolicy)
+	option.BindEnv(vp, option.EnableK8sNetworkPolicy)
+
+	flags.Bool(option.EnableCiliumNetworkPolicy, defaults.EnableCiliumNetworkPolicy, "Enable support for Cilium Network Policy")
+	flags.MarkHidden(option.EnableCiliumNetworkPolicy)
+	option.BindEnv(vp, option.EnableCiliumNetworkPolicy)
+
+	flags.Bool(option.EnableCiliumClusterwideNetworkPolicy, defaults.EnableCiliumClusterwideNetworkPolicy, "Enable support for Cilium Clusterwide Network Policy")
+	flags.MarkHidden(option.EnableCiliumClusterwideNetworkPolicy)
+	option.BindEnv(vp, option.EnableCiliumClusterwideNetworkPolicy)
+
+	// Options used for policy validation
+
+	flags.Bool(option.EnableL7Proxy, defaults.EnableL7Proxy, "Enable L7 proxy for L7 policy enforcement")
+	option.BindEnv(vp, option.EnableL7Proxy)
+
+	flags.Bool(option.EnableICMPRules, defaults.EnableICMPRules, "Enable ICMP-based rule support for Cilium Network Policies")
+	flags.MarkHidden(option.EnableICMPRules)
+	option.BindEnv(vp, option.EnableICMPRules)
+
+	flags.Bool(option.EnableNodeSelectorLabels, defaults.EnableNodeSelectorLabels, "Enable use of node label based identity")
+	option.BindEnv(vp, option.EnableNodeSelectorLabels)
 
 	vp.BindPFlags(flags)
 }
@@ -296,7 +319,17 @@ const (
 
 	// pprofPort is the port that the pprof listens on
 	pprofPort = "operator-pprof-port"
+
+	k8sClientQps = "operator-k8s-client-qps"
+
+	k8sClientBurst = "operator-k8s-client-burst"
 )
+
+var defaultOperatorPprofConfig = operatorPprofConfig{
+	OperatorPprof:        false,
+	OperatorPprofAddress: operatorOption.PprofAddressOperator,
+	OperatorPprofPort:    operatorOption.PprofPortOperator,
+}
 
 // operatorPprofConfig holds the configuration for the operator pprof cell.
 // Differently from the agent and the clustermesh-apiserver, the operator prefixes
@@ -313,4 +346,22 @@ func (def operatorPprofConfig) Flags(flags *pflag.FlagSet) {
 	flags.Bool(pprofOperator, def.OperatorPprof, "Enable serving pprof debugging API")
 	flags.String(pprofAddress, def.OperatorPprofAddress, "Address that pprof listens on")
 	flags.Uint16(pprofPort, def.OperatorPprofPort, "Port that pprof listens on")
+}
+
+func (def operatorPprofConfig) Config() pprof.Config {
+	return pprof.Config{
+		Pprof:        def.OperatorPprof,
+		PprofAddress: def.OperatorPprofAddress,
+		PprofPort:    def.OperatorPprofPort,
+	}
+}
+
+type operatorClientParams struct {
+	OperatorK8sClientQPS   float32
+	OperatorK8sClientBurst int
+}
+
+func (def operatorClientParams) Flags(flags *pflag.FlagSet) {
+	flags.Float32(k8sClientQps, def.OperatorK8sClientQPS, "Queries per second limit for the K8s client")
+	flags.Int(k8sClientBurst, def.OperatorK8sClientBurst, "Burst value allowed for the K8s client")
 }

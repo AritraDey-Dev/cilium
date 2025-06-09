@@ -65,22 +65,19 @@ repository in the Cilium project:
   will be forward-compatible for upgrade and follow best practices for
   deployment (for example, being GitOps-friendly).
 - `@cilium/sig-hubble-api <https://github.com/orgs/cilium/teams/sig-hubble-api>`__:
-  Review all Hubble API related changes. The Hubble API covers gRPC and
-  metrics endpoints. The team ensures that API changes are backward
+  Review Hubble API changes related to gRPC endpoints.
+  The team ensures that API changes are backward
   compatible or that a new API version is created for backward incompatible
   changes.
 - `@cilium/metrics <https://github.com/orgs/cilium/teams/metrics>`__:
   Provide recommendations about the types, names and labels for metrics to
   follow best practices. This includes considering the cardinality impact of
   metrics being added or extended.
+- `@cilium/release-managers <https://github.com/orgs/cilium/teams/release-managers>`__:
+  Review files related to releases like AUTHORS and VERSION.
 - `@cilium/security <https://github.com/orgs/cilium/teams/security>`__:
   Provide feedback on changes that could have security implications for Cilium,
   and maintain security-related documentation.
-- `@cilium/tophat <https://github.com/orgs/cilium/teams/tophat>`__:
-  Top Hat duties rotate between the committer group from week to week, and
-  they may assist in maintenance, triage and backporting duties across
-  different Cilium repositories. Catch-all for code not otherwise owned by a
-  team.
 - `@cilium/vendor <https://github.com/orgs/cilium/teams/vendor>`__:
   Review vendor updates for software dependencies to check for any potential
   upstream breakages / incompatibilities. Discourage the use of unofficial
@@ -96,6 +93,9 @@ contributions to specific repositories:
   Review all Cilium and Hubble code related to observing system events,
   exporting those via gRPC protocols outside the node and outside the
   cluster. those event channels, for example via TLS.
+- `@cilium/hubble-metrics <https://github.com/orgs/cilium/teams/hubble-metrics>`__:
+  Review code related to Hubble metrics, ensure changes in exposed metrics are
+  consistent and not breaking without careful consideration.
 - `@cilium/hubble-ui <https://github.com/orgs/cilium/teams/hubble-ui>`__:
   Maintain the Hubble UI graphical interface.
 - `@cilium/tetragon <https://github.com/orgs/cilium/teams/tetragon>`__:
@@ -188,6 +188,9 @@ external software and protocols:
   subsystems such as xfrm (IPsec), iptables / nftables, tc. Maintain the
   control plane layers that populate most eBPF maps; account for endianness
   and system architecture impacts on the datapath code.
+- `@cilium/sig-encryption <https://github.com/orgs/cilium/teams/sig-encryption>`__
+  Review control and data plane logic related with encryption (IPSec and
+  WireGuard).
 - `@cilium/sig-hubble <https://github.com/orgs/cilium/teams/sig-hubble>`__:
   Review all Cilium and Hubble code related to observing system events,
   exporting those via gRPC protocols outside the node and outside the
@@ -210,6 +213,9 @@ external software and protocols:
   Responsible for all policy logic from Kubernetes down to eBPF policymap
   entries, including all intermediate layers such as the Policy Repository,
   SelectorCache, PolicyCache, CachedSelectorPolicy, EndpointPolicy, etc.
+- `@cilium/sig-scalability <https://github.com/orgs/cilium/teams/sig-scalability>`__:
+  Maintain scalability and performance tests. Provide input on scalability
+  and performance related changes.
 - `@cilium/sig-servicemesh <https://github.com/orgs/cilium/teams/sig-servicemesh>`__:
   Provide input on the way that Service Mesh constructs such as Gateway API
   are converted into lower-level constructs backed by eBPF or Envoy

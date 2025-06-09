@@ -6,54 +6,24 @@ package endpoint
 import (
 	"context"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	check "github.com/cilium/checkmate"
+	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/assert"
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	"github.com/cilium/cilium/pkg/checker"
 	"github.com/cilium/cilium/pkg/identity"
-	"github.com/cilium/cilium/pkg/identity/cache"
 	k8sConst "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/policy/api"
 	testidentity "github.com/cilium/cilium/pkg/testutils/identity"
-	testipcache "github.com/cilium/cilium/pkg/testutils/ipcache"
-	"github.com/cilium/cilium/pkg/u8proto"
 )
-
-func (s *EndpointSuite) TestUpdateVisibilityPolicy(c *check.C) {
-	do := &DummyOwner{repo: policy.NewPolicyRepository(nil, nil, nil, nil)}
-	ep := NewEndpointWithState(do, do, testipcache.NewMockIPCache(), &FakeEndpointProxy{}, testidentity.NewMockIdentityAllocator(nil), 12345, StateReady)
-	ep.UpdateVisibilityPolicy(func(_, _ string) (string, error) {
-		return "", nil
-	})
-	c.Assert(ep.visibilityPolicy, check.IsNil)
-
-	ep.UpdateVisibilityPolicy(func(_, _ string) (proxyVisibility string, err error) {
-		return "<Ingress/80/TCP/HTTP>", nil
-	})
-
-	c.Assert(ep.visibilityPolicy, check.Not(check.Equals), nil)
-	c.Assert(ep.visibilityPolicy.Ingress["80/TCP"], checker.DeepEquals, &policy.VisibilityMetadata{
-		Parser:  policy.ParserTypeHTTP,
-		Port:    uint16(80),
-		Proto:   u8proto.TCP,
-		Ingress: true,
-	})
-
-	// Check that updating after previously having value works.
-	ep.UpdateVisibilityPolicy(func(_, _ string) (string, error) {
-		return "", nil
-	})
-	c.Assert(ep.visibilityPolicy, check.IsNil)
-}
 
 // This test fuzzes the incremental update engine from an end-to-end perspective
 // to ensure we don't ever miss an incremental update.
@@ -72,16 +42,9 @@ func TestIncrementalUpdatesDuringPolicyGeneration(t *testing.T) {
 	policy.SetPolicyEnabled("always")
 	defer policy.SetPolicyEnabled(pe)
 
-	idcache := make(cache.IdentityCache, testfactor)
+	idcache := make(identity.IdentityMap, testfactor)
 	fakeAllocator := testidentity.NewMockIdentityAllocator(idcache)
-	repo := policy.NewPolicyRepository(fakeAllocator, fakeAllocator.GetIdentityCache(), nil, nil)
-
-	defer func() {
-		repo.RepositoryChangeQueue.Stop()
-		repo.RuleReactionQueue.Stop()
-		repo.RepositoryChangeQueue.WaitToBeDrained()
-		repo.RuleReactionQueue.WaitToBeDrained()
-	}()
+	repo := policy.NewPolicyRepository(hivetest.Logger(t), fakeAllocator.GetIdentityCache(), nil, nil, nil, api.NewPolicyMetricsNoop())
 
 	addIdentity := func(labelKeys ...string) *identity.Identity {
 		t.Helper()
@@ -93,10 +56,10 @@ func TestIncrementalUpdatesDuringPolicyGeneration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		//t.Logf("allocated label %s id %d", labelKeys, id.ID) // commented out for speed
+		// t.Logf("allocated label %s id %d", labelKeys, id.ID) // commented out for speed
 
 		wg := &sync.WaitGroup{}
-		repo.GetSelectorCache().UpdateIdentities(cache.IdentityCache{
+		repo.GetSelectorCache().UpdateIdentities(identity.IdentityMap{
 			id.ID: id.LabelArray,
 		}, nil, wg)
 		wg.Wait()
@@ -104,11 +67,11 @@ func TestIncrementalUpdatesDuringPolicyGeneration(t *testing.T) {
 	}
 
 	podID := addIdentity("pod")
-	repo.GetPolicyCache().LocalEndpointIdentityAdded(podID)
 
 	ep := Endpoint{
 		SecurityIdentity: podID,
-		policyGetter:     &mockPolicyGetter{repo},
+		policyRepo:       repo,
+		desiredPolicy:    policy.NewEndpointPolicy(hivetest.Logger(t), repo),
 	}
 	ep.UpdateLogger(nil)
 
@@ -142,19 +105,16 @@ func TestIncrementalUpdatesDuringPolicyGeneration(t *testing.T) {
 		},
 	}
 
-	_, _, err := repo.Add(*egressDenyRule)
-	if err != nil {
-		t.Fatal(err)
-	}
+	repo.MustAddList(api.Rules{egressDenyRule})
 
 	// Track all IDs we allocate so we can validate later that we never miss any
 	checkMutex := lock.Mutex{}
 	allocatedIDs := make(sets.Set[identity.NumericIdentity], testfactor)
-	done := false
+	done := atomic.Bool{}
 
 	// simulate ipcache churn: continuously allocate IDs and push them to the policy engine.
 	go func() {
-		for i := 0; i < testfactor; i++ {
+		for i := range testfactor {
 			if i%100 == 0 {
 				t.Log(i)
 			}
@@ -167,18 +127,22 @@ func TestIncrementalUpdatesDuringPolicyGeneration(t *testing.T) {
 			checkMutex.Unlock()
 
 		}
-		done = true
+		done.Store(true)
 	}()
 
+	stats := new(regenerationStatistics)
+	datapathRegenCtxt := new(datapathRegenerationContext)
 	// Continuously compute policy for the pod and ensure we never missed an incremental update.
 	for {
 		t.Log("Calculating policy...")
-		res, err := ep.regeneratePolicy()
-		assert.Nil(t, err)
+		ep.forcePolicyCompute = true
+		err := ep.regeneratePolicy(stats, datapathRegenCtxt)
+		assert.NoError(t, err)
+		res := datapathRegenCtxt.policyResult
 
 		// Sleep a random amount, so we accumulate some changes
 		// This does not slow down the test, since we always generate testFactor identities.
-		time.Sleep(time.Duration(rand.Intn(10)) * time.Millisecond)
+		time.Sleep(time.Duration(rand.IntN(10)) * time.Millisecond)
 
 		// Now, check that all the expected entries are there
 		checkMutex.Lock()
@@ -187,12 +151,13 @@ func TestIncrementalUpdatesDuringPolicyGeneration(t *testing.T) {
 		// Apply any pending incremental changes
 		// This mirrors the existing code, where we consume map changes
 		// while holding the endpoint lock
-		res.endpointPolicy.ConsumeMapChanges()
+		closer, _ := res.endpointPolicy.ConsumeMapChanges()
+		closer()
+
 		haveIDs := make(sets.Set[identity.NumericIdentity], testfactor)
-		res.endpointPolicy.GetPolicyMap().ForEach(func(k policy.Key, _ policy.MapStateEntry) bool {
-			haveIDs.Insert(identity.NumericIdentity(k.Identity))
-			return true
-		})
+		for k := range res.endpointPolicy.Entries() {
+			haveIDs.Insert(k.Identity)
+		}
 
 		// It is okay if we have *more* IDs than allocatedIDs, since we may have propagated
 		// an ID change through the policy system but not yet added to the extra list we're
@@ -204,16 +169,8 @@ func TestIncrementalUpdatesDuringPolicyGeneration(t *testing.T) {
 
 		checkMutex.Unlock()
 
-		if done {
+		if done.Load() {
 			break
 		}
 	}
-}
-
-type mockPolicyGetter struct {
-	repo *policy.Repository
-}
-
-func (m *mockPolicyGetter) GetPolicyRepository() *policy.Repository {
-	return m.repo
 }

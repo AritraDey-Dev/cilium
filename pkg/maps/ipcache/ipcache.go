@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"unsafe"
 
 	"github.com/cilium/cilium/pkg/bpf"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/ebpf"
+	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/types"
 )
@@ -22,8 +24,11 @@ const (
 	// RemoteEndpointMap.
 	MaxEntries = 512000
 
+	// OldName is the canonical name for the v1 IPCache map on the filesystem.
+	OldName = "cilium_ipcache"
+
 	// Name is the canonical name for the IPCache map on the filesystem.
-	Name = "cilium_ipcache"
+	Name = "cilium_ipcache_v2"
 )
 
 // Key implements the bpf.MapKey interface.
@@ -66,7 +71,7 @@ func (k Key) String() string {
 	prefixLen := int(k.Prefixlen - getStaticPrefixBits())
 	clusterID := uint32(k.ClusterID)
 
-	return cmtypes.PrefixClusterFrom(addr, prefixLen, cmtypes.WithClusterID(clusterID)).String()
+	return cmtypes.PrefixClusterFrom(netip.PrefixFrom(addr, prefixLen), cmtypes.WithClusterID(clusterID)).String()
 }
 
 func (k *Key) New() bpf.MapKey { return &Key{} }
@@ -118,22 +123,111 @@ func NewKey(ip net.IP, mask net.IPMask, clusterID uint16) Key {
 	return result
 }
 
+// RemoteEndpointInfoFlags represents various flags that can be attached to
+// remote endpoints in the IPCache.
+type RemoteEndpointInfoFlags uint8
+
+// String returns a human-readable representation of the flags present in the
+// RemoteEndpointInfoFlags.
+// The output format is the string name of each flag contained in the flag set,
+// separated by a comma. If no flags are set, then "<none>" is returned.
+func (f RemoteEndpointInfoFlags) String() string {
+	flags := ""
+	if f&FlagSkipTunnel != 0 {
+		flags += "skiptunnel,"
+	}
+	if f&FlagHasTunnelEndpoint != 0 {
+		flags += "hastunnel,"
+	}
+	if f&FlagIPv6TunnelEndpoint != 0 {
+		flags += "ipv6tunnel,"
+	}
+
+	if flags == "" {
+		return "<none>"
+	}
+	return strings.TrimSuffix(flags, ",")
+}
+
+const (
+	// FlagSkipTunnel can be applied to a remote endpoint to signal that
+	// packets destined for said endpoint shall not be forwarded through
+	// a VXLAN/Geneve tunnel, regardless of Cilium's configuration.
+	FlagSkipTunnel RemoteEndpointInfoFlags = 1 << iota
+	// FlagHasTunnelEndpoint is set when the tunnel endpoint is not null. It
+	// aims to simplify the logic compared to checking the IPv6 address.
+	FlagHasTunnelEndpoint
+	// FlagIPv6TunnelEndpoint is set when the tunnel endpoint IP address
+	// is an IPv6 address.
+	FlagIPv6TunnelEndpoint
+)
+
 // RemoteEndpointInfo implements the bpf.MapValue interface. It contains the
 // security identity of a remote endpoint.
 type RemoteEndpointInfo struct {
-	SecurityIdentity uint32     `align:"sec_identity"`
-	TunnelEndpoint   types.IPv4 `align:"tunnel_endpoint"`
-	_                uint16
-	Key              uint8 `align:"key"`
-	_                uint8
+	SecurityIdentity uint32 `align:"sec_identity"`
+	// represents both IPv6 and IPv4 (in the lowest four bytes)
+	TunnelEndpoint types.IPv6 `align:"tunnel_endpoint"`
+	_              uint16
+	Key            uint8                   `align:"key"`
+	Flags          RemoteEndpointInfoFlags `align:"flag_skip_tunnel"`
 }
 
 func (v *RemoteEndpointInfo) String() string {
-	return fmt.Sprintf("identity=%d encryptkey=%d tunnelendpoint=%s",
-		v.SecurityIdentity, v.Key, v.TunnelEndpoint)
+	return fmt.Sprintf("identity=%d encryptkey=%d tunnelendpoint=%s flags=%s",
+		v.SecurityIdentity, v.Key, v.GetTunnelEndpoint(), v.Flags)
+}
+
+func (v *RemoteEndpointInfo) GetTunnelEndpoint() net.IP {
+	if v.Flags&FlagIPv6TunnelEndpoint == 0 {
+		return v.TunnelEndpoint[:4]
+	}
+	return v.TunnelEndpoint[:]
 }
 
 func (v *RemoteEndpointInfo) New() bpf.MapValue { return &RemoteEndpointInfo{} }
+
+// RemoteEndpointInfoV1 implements the bpf.MapValue interface for the v1
+// ipcache map value.
+type RemoteEndpointInfoV1 struct {
+	SecurityIdentity uint32     `align:"sec_identity"`
+	TunnelEndpoint   types.IPv4 `align:"tunnel_endpoint"`
+	_                uint16
+	Key              uint8                   `align:"key"`
+	Flags            RemoteEndpointInfoFlags `align:"flag_skip_tunnel"`
+}
+
+func (v *RemoteEndpointInfoV1) String() string {
+	return fmt.Sprintf("identity=%d encryptkey=%d tunnelendpoint=%s flags=%s",
+		v.SecurityIdentity, v.Key, v.TunnelEndpoint, v.Flags)
+}
+
+func (v *RemoteEndpointInfoV1) New() bpf.MapValue { return &RemoteEndpointInfoV1{} }
+
+// NewValue returns a RemoteEndpointInfo based on the provided security
+// identity, tunnel endpoint IP, IPsec key, and flags. The address family is
+// automatically detected.
+func NewValue(secID uint32, tunnelEndpoint net.IP, key uint8, flags RemoteEndpointInfoFlags) RemoteEndpointInfo {
+	result := RemoteEndpointInfo{}
+
+	result.SecurityIdentity = secID
+	result.Key = key
+	result.Flags = flags
+
+	if tunnelEndpoint == nil {
+		return result
+	}
+
+	result.Flags |= FlagHasTunnelEndpoint
+	if ip4 := tunnelEndpoint.To4(); ip4 != nil {
+		copy(result.TunnelEndpoint[:], ip4)
+	} else {
+		copy(result.TunnelEndpoint[:], tunnelEndpoint)
+		result.Flags |= FlagIPv6TunnelEndpoint
+	}
+
+	return result
+}
 
 // Map represents an IPCache BPF map.
 type Map struct {
@@ -150,10 +244,20 @@ func newIPCacheMap(name string) *bpf.Map {
 		bpf.BPF_F_NO_PREALLOC)
 }
 
+func newIPCacheMapV1(name string) *bpf.Map {
+	return bpf.NewMap(
+		name,
+		ebpf.LPMTrie,
+		&Key{},
+		&RemoteEndpointInfoV1{},
+		MaxEntries,
+		bpf.BPF_F_NO_PREALLOC)
+}
+
 // NewMap instantiates a Map.
-func NewMap(name string) *Map {
+func NewMap(registry *metrics.Registry, name string) *Map {
 	return &Map{
-		Map: *newIPCacheMap(name).WithCache().WithPressureMetric().
+		Map: *newIPCacheMap(name).WithCache().WithPressureMetric(registry).
 			WithEvents(option.Config.GetEventBufferConfig(name)),
 	}
 }
@@ -164,13 +268,27 @@ var (
 	// It is a singleton; there is only one such map per agent.
 	ipcache *Map
 	once    = &sync.Once{}
+
+	oldIPcache     *Map
+	onceOldIPcache = &sync.Once{}
 )
 
 // IPCacheMap gets the ipcache Map singleton. If it has not already been done,
 // this also initializes the Map.
-func IPCacheMap() *Map {
+func IPCacheMap(registry *metrics.Registry) *Map {
 	once.Do(func() {
-		ipcache = NewMap(Name)
+		ipcache = NewMap(registry, Name)
 	})
 	return ipcache
+}
+
+// IPCacheMapV1 does the same as IPCacheMap but for the v1 ipcache map,
+// from v1.18.
+func IPCacheMapV1() *Map {
+	onceOldIPcache.Do(func() {
+		oldIPcache = &Map{
+			Map: *newIPCacheMapV1(OldName),
+		}
+	})
+	return oldIPcache
 }

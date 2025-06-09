@@ -8,15 +8,15 @@ import (
 	"encoding/binary"
 	"testing"
 
-	. "github.com/cilium/checkmate"
+	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/cilium/pkg/byteorder"
 )
 
-func (s *MonitorSuite) TestDecodeDropNotify(c *C) {
+func TestDecodeDropNotify(t *testing.T) {
 	// This check on the struct length constant is there to ensure that this
 	// test is updated when the struct changes.
-	c.Assert(DropNotifyLen, Equals, 36)
+	require.Equal(t, 40, dropNotifyV2Len)
 
 	input := DropNotify{
 		Type:     0x00,
@@ -24,7 +24,8 @@ func (s *MonitorSuite) TestDecodeDropNotify(c *C) {
 		Source:   0x02_03,
 		Hash:     0x04_05_06_07,
 		OrigLen:  0x08_09_0a_0b,
-		CapLen:   0x0c_0d_0e_10,
+		CapLen:   0x0c_0d,
+		Version:  0x02,
 		SrcLabel: 0x11_12_13_14,
 		DstLabel: 0x15_16_17_18,
 		DstID:    0x19_1a_1b_1c,
@@ -32,31 +33,49 @@ func (s *MonitorSuite) TestDecodeDropNotify(c *C) {
 		File:     0x20,
 		ExtError: 0x21,
 		Ifindex:  0x22_23_24_25,
+		Flags:    DropNotifyFlagIsIPv6 | DropNotifyFlagIsL3Device,
 	}
 	buf := bytes.NewBuffer(nil)
 	err := binary.Write(buf, byteorder.Native, input)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 
 	output := &DropNotify{}
 	err = DecodeDropNotify(buf.Bytes(), output)
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 
-	c.Assert(output.Type, Equals, input.Type)
-	c.Assert(output.SubType, Equals, input.SubType)
-	c.Assert(output.Source, Equals, input.Source)
-	c.Assert(output.Hash, Equals, input.Hash)
-	c.Assert(output.OrigLen, Equals, input.OrigLen)
-	c.Assert(output.CapLen, Equals, input.CapLen)
-	c.Assert(output.SrcLabel, Equals, input.SrcLabel)
-	c.Assert(output.DstLabel, Equals, input.DstLabel)
-	c.Assert(output.DstID, Equals, input.DstID)
-	c.Assert(output.Line, Equals, input.Line)
-	c.Assert(output.File, Equals, input.File)
-	c.Assert(output.ExtError, Equals, input.ExtError)
-	c.Assert(output.Ifindex, Equals, input.Ifindex)
+	require.Equal(t, input.Type, output.Type)
+	require.Equal(t, input.SubType, output.SubType)
+	require.Equal(t, input.Source, output.Source)
+	require.Equal(t, input.Hash, output.Hash)
+	require.Equal(t, input.OrigLen, output.OrigLen)
+	require.Equal(t, input.CapLen, output.CapLen)
+	require.Equal(t, input.SrcLabel, output.SrcLabel)
+	require.Equal(t, input.DstLabel, output.DstLabel)
+	require.Equal(t, input.DstID, output.DstID)
+	require.Equal(t, input.Line, output.Line)
+	require.Equal(t, input.File, output.File)
+	require.Equal(t, input.ExtError, output.ExtError)
+	require.Equal(t, input.Ifindex, output.Ifindex)
+	require.Equal(t, input.Flags, output.Flags)
+	require.True(t, output.IsL3Device())
+	require.True(t, output.IsIPv6())
 }
 
-func BenchmarkNewDecodeDropNotify(b *testing.B) {
+func TestDecodeDropNotifyErrors(t *testing.T) {
+	n := DropNotify{}
+	err := DecodeDropNotify([]byte{}, &n)
+	require.Error(t, err)
+	require.Equal(t, "unexpected DropNotify data length, expected at least 36 but got 0", err.Error())
+
+	// invalid version
+	ev := make([]byte, dropNotifyV2Len)
+	ev[14] = 0xff
+	err = DecodeDropNotify(ev, &n)
+	require.Error(t, err)
+	require.Equal(t, "Unrecognized drop event (version 255)", err.Error())
+}
+
+func BenchmarkDecodeDropNotifyV1(b *testing.B) {
 	input := DropNotify{}
 	buf := bytes.NewBuffer(nil)
 
@@ -65,9 +84,8 @@ func BenchmarkNewDecodeDropNotify(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		dn := &DropNotify{}
 		if err := DecodeDropNotify(buf.Bytes(), dn); err != nil {
 			b.Fatal(err)
@@ -75,8 +93,8 @@ func BenchmarkNewDecodeDropNotify(b *testing.B) {
 	}
 }
 
-func BenchmarkOldDecodeDropNotify(b *testing.B) {
-	input := DropNotify{}
+func BenchmarkDecodeDropNotifyV2(b *testing.B) {
+	input := DropNotify{Version: DropNotifyVersion2}
 	buf := bytes.NewBuffer(nil)
 
 	if err := binary.Write(buf, byteorder.Native, input); err != nil {
@@ -84,11 +102,10 @@ func BenchmarkOldDecodeDropNotify(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		dn := &DropNotify{}
-		if err := binary.Read(bytes.NewReader(buf.Bytes()), byteorder.Native, dn); err != nil {
+		if err := DecodeDropNotify(buf.Bytes(), dn); err != nil {
 			b.Fatal(err)
 		}
 	}

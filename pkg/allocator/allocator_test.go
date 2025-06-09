@@ -5,7 +5,10 @@ package allocator
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -13,69 +16,62 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/cilium/checkmate"
+	"github.com/cilium/hive/hivetest"
+	"github.com/cilium/stream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/maps"
 
 	"github.com/cilium/cilium/pkg/idpool"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/lock"
-	"github.com/cilium/cilium/pkg/rand"
 	"github.com/cilium/cilium/pkg/rate"
-	"github.com/cilium/cilium/pkg/stream"
 )
-
-const (
-	testPrefix = "test-prefix"
-)
-
-func Test(t *testing.T) {
-	TestingT(t)
-}
-
-type AllocatorSuite struct{}
-
-var _ = Suite(&AllocatorSuite{})
 
 type dummyBackend struct {
 	mutex      lock.RWMutex
-	identities map[idpool.ID]AllocatorKey
+	masterKeys map[idpool.ID]AllocatorKey
+	slaveKeys  map[idpool.ID]AllocatorKey
 	handler    CacheMutations
 
-	updateKey func(ctx context.Context, id idpool.ID, key AllocatorKey) error
+	updateMasterKeyHandler func(ctx context.Context, id idpool.ID, key AllocatorKey) error
+	updateSlaveKeyHandler  func(ctx context.Context, id idpool.ID, key AllocatorKey) error
 
 	disableListDone bool
 }
 
 func newDummyBackend() *dummyBackend {
 	return &dummyBackend{
-		identities: map[idpool.ID]AllocatorKey{},
+		slaveKeys:  map[idpool.ID]AllocatorKey{},
+		masterKeys: map[idpool.ID]AllocatorKey{},
 	}
-}
-
-func (d *dummyBackend) Encode(v string) string {
-	return v
 }
 
 func (d *dummyBackend) DeleteAllKeys(ctx context.Context) {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
-	d.identities = map[idpool.ID]AllocatorKey{}
+	d.slaveKeys = map[idpool.ID]AllocatorKey{}
+	d.masterKeys = map[idpool.ID]AllocatorKey{}
+}
+
+func (d *dummyBackend) DeleteID(ctx context.Context, id idpool.ID) error {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	delete(d.slaveKeys, id)
+	return nil
 }
 
 func (d *dummyBackend) AllocateID(ctx context.Context, id idpool.ID, key AllocatorKey) (AllocatorKey, error) {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	if _, ok := d.identities[id]; ok {
+	if _, ok := d.masterKeys[id]; ok {
 		return nil, fmt.Errorf("identity already exists")
 	}
 
-	d.identities[id] = key
+	d.masterKeys[id] = key
 
 	if d.handler != nil {
-		d.handler.OnAdd(id, key)
+		d.handler.OnUpsert(id, key)
 	}
 
 	return key, nil
@@ -89,12 +85,14 @@ func (d *dummyBackend) AcquireReference(ctx context.Context, id idpool.ID, key A
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	if _, ok := d.identities[id]; !ok {
+	if _, ok := d.masterKeys[id]; !ok {
 		return fmt.Errorf("identity does not exist")
 	}
 
+	d.slaveKeys[id] = key
+
 	if d.handler != nil {
-		d.handler.OnModify(id, key)
+		d.handler.OnUpsert(id, key)
 	}
 
 	return nil
@@ -106,7 +104,7 @@ func (d *dummyLock) Unlock(ctx context.Context) error {
 	return nil
 }
 
-func (d *dummyLock) Comparator() interface{} {
+func (d *dummyLock) Comparator() any {
 	return nil
 }
 
@@ -114,12 +112,41 @@ func (d *dummyBackend) Lock(ctx context.Context, key AllocatorKey) (kvstore.KVLo
 	return &dummyLock{}, nil
 }
 
-func (d *dummyBackend) UpdateKey(ctx context.Context, id idpool.ID, key AllocatorKey, reliablyMissing bool) error {
+func (d *dummyBackend) setUpdateMasterKeyMutator(mutator func(ctx context.Context, id idpool.ID, key AllocatorKey) error) {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
-	d.identities[id] = key
-	if d.updateKey != nil {
-		return d.updateKey(ctx, id, key)
+	d.updateMasterKeyHandler = mutator
+}
+
+func (d *dummyBackend) setUpdateSlaveKeyMutator(mutator func(ctx context.Context, id idpool.ID, key AllocatorKey) error) {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	d.updateSlaveKeyHandler = mutator
+}
+
+func (d *dummyBackend) UpdateKey(ctx context.Context, id idpool.ID, key AllocatorKey, reliablyMissing bool) error {
+	if err := d.updateMasterKey(ctx, id, key, reliablyMissing); err != nil {
+		return err
+	}
+	return d.updateSlaveKey(ctx, id, key, reliablyMissing)
+}
+
+func (d *dummyBackend) updateMasterKey(ctx context.Context, id idpool.ID, key AllocatorKey, reliablyMissing bool) error {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	d.masterKeys[id] = key
+	if d.updateMasterKeyHandler != nil {
+		return d.updateMasterKeyHandler(ctx, id, key)
+	}
+	return nil
+}
+
+func (d *dummyBackend) updateSlaveKey(ctx context.Context, id idpool.ID, key AllocatorKey, reliablyMissing bool) error {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	d.slaveKeys[id] = key
+	if d.updateSlaveKeyHandler != nil {
+		return d.updateSlaveKeyHandler(ctx, id, key)
 	}
 	return nil
 }
@@ -131,7 +158,8 @@ func (d *dummyBackend) UpdateKeyIfLocked(ctx context.Context, id idpool.ID, key 
 func (d *dummyBackend) Get(ctx context.Context, key AllocatorKey) (idpool.ID, error) {
 	d.mutex.RLock()
 	defer d.mutex.RUnlock()
-	for id, k := range d.identities {
+	// This loops through slaveKeys to mimic the kvstore implementation
+	for id, k := range d.slaveKeys {
 		if key.GetKey() == k.GetKey() {
 			return id, nil
 		}
@@ -146,7 +174,7 @@ func (d *dummyBackend) GetIfLocked(ctx context.Context, key AllocatorKey, lock k
 func (d *dummyBackend) GetByID(ctx context.Context, id idpool.ID) (AllocatorKey, error) {
 	d.mutex.RLock()
 	defer d.mutex.RUnlock()
-	if key, ok := d.identities[id]; ok {
+	if key, ok := d.masterKeys[id]; ok {
 		return key, nil
 	}
 	return nil, nil
@@ -155,10 +183,10 @@ func (d *dummyBackend) GetByID(ctx context.Context, id idpool.ID) (AllocatorKey,
 func (d *dummyBackend) Release(ctx context.Context, id idpool.ID, key AllocatorKey) error {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
-	for idtyID, k := range d.identities {
+	for idtyID, k := range d.slaveKeys {
 		if k.GetKey() == key.GetKey() &&
 			idtyID == id {
-			delete(d.identities, id)
+			delete(d.slaveKeys, id)
 			if d.handler != nil {
 				d.handler.OnDelete(id, k)
 			}
@@ -168,15 +196,20 @@ func (d *dummyBackend) Release(ctx context.Context, id idpool.ID, key AllocatorK
 	return fmt.Errorf("identity does not exist")
 }
 
-func (d *dummyBackend) ListAndWatch(ctx context.Context, handler CacheMutations, stopChan chan struct{}) {
+func (d *dummyBackend) ListIDs(ctx context.Context) (identityIDs []idpool.ID, err error) {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
+	return slices.Collect(maps.Keys(d.masterKeys)), nil
+}
+
+func (d *dummyBackend) ListAndWatch(ctx context.Context, handler CacheMutations) {
 	d.mutex.Lock()
 	d.handler = handler
 
 	// Sort by ID to ensure consistent ordering
-	ids := maps.Keys(d.identities)
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	for _, id := range ids {
-		d.handler.OnModify(id, d.identities[id])
+	for _, id := range slices.Sorted(maps.Keys(d.masterKeys)) {
+		d.handler.OnUpsert(id, d.masterKeys[id])
 	}
 	d.mutex.Unlock()
 
@@ -184,7 +217,7 @@ func (d *dummyBackend) ListAndWatch(ctx context.Context, handler CacheMutations,
 		d.handler.OnListDone()
 	}
 
-	<-stopChan
+	<-ctx.Done()
 }
 
 func (d *dummyBackend) RunLocksGC(_ context.Context, _ map[string]kvstore.Value) (map[string]kvstore.Value, error) {
@@ -193,10 +226,6 @@ func (d *dummyBackend) RunLocksGC(_ context.Context, _ map[string]kvstore.Value)
 
 func (d *dummyBackend) RunGC(context.Context, *rate.Limiter, map[string]uint64, idpool.ID, idpool.ID) (map[string]uint64, *GCStats, error) {
 	return nil, nil, nil
-}
-
-func (d *dummyBackend) Status() (string, error) {
-	return "", nil
 }
 
 type TestAllocatorKey string
@@ -225,23 +254,19 @@ func (t TestAllocatorKey) Value(any) any {
 	panic("not implemented")
 }
 
-func randomTestName() string {
-	return rand.RandomStringWithPrefix(testPrefix, 12)
-}
-
-func (s *AllocatorSuite) TestSelectID(c *C) {
+func TestSelectID(t *testing.T) {
 	minID, maxID := idpool.ID(1), idpool.ID(5)
 	backend := newDummyBackend()
-	a, err := NewAllocator(TestAllocatorKey(""), backend, WithMin(minID), WithMax(maxID))
-	c.Assert(err, IsNil)
-	c.Assert(a, Not(IsNil))
+	a, err := NewAllocator(hivetest.Logger(t), TestAllocatorKey(""), backend, WithMin(minID), WithMax(maxID))
+	require.NoError(t, err)
+	require.NotNil(t, a)
 
 	// allocate all available IDs
 	for i := minID; i <= maxID; i++ {
 		id, val, unmaskedID := a.selectAvailableID()
-		c.Assert(id, Not(Equals), idpool.NoID)
-		c.Assert(val, Equals, id.String())
-		c.Assert(id, Equals, unmaskedID)
+		require.NotEqual(t, idpool.NoID, id)
+		require.Equal(t, id.String(), val)
+		require.Equal(t, unmaskedID, id)
 		a.mainCache.mutex.Lock()
 		a.mainCache.cache[id] = TestAllocatorKey(fmt.Sprintf("key-%d", i))
 		a.mainCache.mutex.Unlock()
@@ -249,35 +274,35 @@ func (s *AllocatorSuite) TestSelectID(c *C) {
 
 	// we should be out of IDs
 	id, val, unmaskedID := a.selectAvailableID()
-	c.Assert(id, Equals, idpool.ID(0))
-	c.Assert(id, Equals, unmaskedID)
-	c.Assert(val, Equals, "")
+	require.Equal(t, idpool.ID(0), id)
+	require.Equal(t, unmaskedID, id)
+	require.Empty(t, val)
 }
 
-func (s *AllocatorSuite) TestPrefixMask(c *C) {
+func TestPrefixMask(t *testing.T) {
 	minID, maxID := idpool.ID(1), idpool.ID(5)
 	backend := newDummyBackend()
-	a, err := NewAllocator(TestAllocatorKey(""), backend, WithMin(minID), WithMax(maxID), WithPrefixMask(1<<16))
-	c.Assert(err, IsNil)
-	c.Assert(a, Not(IsNil))
+	a, err := NewAllocator(hivetest.Logger(t), TestAllocatorKey(""), backend, WithMin(minID), WithMax(maxID), WithPrefixMask(1<<16))
+	require.NoError(t, err)
+	require.NotNil(t, a)
 
 	// allocate all available IDs
 	for i := minID; i <= maxID; i++ {
 		id, val, unmaskedID := a.selectAvailableID()
-		c.Assert(id, Not(Equals), idpool.NoID)
-		c.Assert(id>>16, Equals, idpool.ID(1))
-		c.Assert(id, Not(Equals), unmaskedID)
-		c.Assert(val, Equals, id.String())
+		require.NotEqual(t, idpool.NoID, id)
+		require.Equal(t, idpool.ID(1), id>>16)
+		require.NotEqual(t, unmaskedID, id)
+		require.Equal(t, id.String(), val)
 	}
 
 	a.Delete()
 }
 
-func testAllocator(c *C, maxID idpool.ID, allocatorName string, suffix string) {
+func testAllocator(t *testing.T, maxID idpool.ID) {
 	backend := newDummyBackend()
-	allocator, err := NewAllocator(TestAllocatorKey(""), backend, WithMax(maxID), WithoutGC())
-	c.Assert(err, IsNil)
-	c.Assert(allocator, Not(IsNil))
+	allocator, err := NewAllocator(hivetest.Logger(t), TestAllocatorKey(""), backend, WithMax(maxID), WithoutGC())
+	require.NoError(t, err)
+	require.NotNil(t, allocator)
 
 	// remove any keys which might be leftover
 	allocator.DeleteAllKeys()
@@ -286,13 +311,13 @@ func testAllocator(c *C, maxID idpool.ID, allocatorName string, suffix string) {
 	for i := idpool.ID(1); i <= maxID; i++ {
 		key := TestAllocatorKey(fmt.Sprintf("key%04d", i))
 		id, new, firstUse, err := allocator.Allocate(context.Background(), key)
-		c.Assert(err, IsNil)
-		c.Assert(id, Not(Equals), 0)
-		c.Assert(new, Equals, true)
-		c.Assert(firstUse, Equals, true)
+		require.NoError(t, err)
+		require.NotEqual(t, 0, id)
+		require.True(t, new)
+		require.True(t, firstUse)
 
 		// refcnt must be 1
-		c.Assert(allocator.localKeys.keys[allocator.encodeKey(key)].refcnt, Equals, uint64(1))
+		require.Equal(t, uint64(1), allocator.localKeys.keys[key.GetKey()].refcnt)
 	}
 
 	saved := allocator.backoffTemplate.Factor
@@ -300,9 +325,9 @@ func testAllocator(c *C, maxID idpool.ID, allocatorName string, suffix string) {
 
 	// we should be out of id space here
 	_, new, firstUse, err := allocator.Allocate(context.Background(), TestAllocatorKey(fmt.Sprintf("key%04d", maxID+1)))
-	c.Assert(err, Not(IsNil))
-	c.Assert(new, Equals, false)
-	c.Assert(firstUse, Equals, false)
+	require.Error(t, err)
+	require.False(t, new)
+	require.False(t, firstUse)
 
 	allocator.backoffTemplate.Factor = saved
 
@@ -310,34 +335,34 @@ func testAllocator(c *C, maxID idpool.ID, allocatorName string, suffix string) {
 	for i := idpool.ID(1); i <= maxID; i++ {
 		key := TestAllocatorKey(fmt.Sprintf("key%04d", i))
 		id, new, firstUse, err := allocator.Allocate(context.Background(), key)
-		c.Assert(err, IsNil)
-		c.Assert(id, Not(Equals), 0)
-		c.Assert(new, Equals, false)
-		c.Assert(firstUse, Equals, false)
+		require.NoError(t, err)
+		require.NotEqual(t, 0, id)
+		require.False(t, new)
+		require.False(t, firstUse)
 
 		// refcnt must now be 2
-		c.Assert(allocator.localKeys.keys[allocator.encodeKey(key)].refcnt, Equals, uint64(2))
+		require.Equal(t, uint64(2), allocator.localKeys.keys[key.GetKey()].refcnt)
 	}
 
 	// Create a 2nd allocator, refill it
-	allocator2, err := NewAllocator(TestAllocatorKey(""), backend, WithMax(maxID), WithoutGC())
-	c.Assert(err, IsNil)
-	c.Assert(allocator2, Not(IsNil))
+	allocator2, err := NewAllocator(hivetest.Logger(t), TestAllocatorKey(""), backend, WithMax(maxID), WithoutGC())
+	require.NoError(t, err)
+	require.NotNil(t, allocator2)
 
 	// allocate all IDs again using the same set of keys, refcnt should go to 2
 	for i := idpool.ID(1); i <= maxID; i++ {
 		key := TestAllocatorKey(fmt.Sprintf("key%04d", i))
 		id, new, firstUse, err := allocator2.Allocate(context.Background(), key)
-		c.Assert(err, IsNil)
-		c.Assert(id, Not(Equals), 0)
-		c.Assert(new, Equals, false)
-		c.Assert(firstUse, Equals, true)
+		require.NoError(t, err)
+		require.NotEqual(t, 0, id)
+		require.False(t, new)
+		require.True(t, firstUse)
 
-		localKey := allocator2.localKeys.keys[allocator.encodeKey(key)]
-		c.Assert(localKey, Not(IsNil))
+		localKey := allocator2.localKeys.keys[key.GetKey()]
+		require.NotNil(t, localKey)
 
 		// refcnt in the 2nd allocator is 1
-		c.Assert(localKey.refcnt, Equals, uint64(1))
+		require.Equal(t, uint64(1), localKey.refcnt)
 
 		allocator2.Release(context.Background(), key)
 	}
@@ -350,13 +375,13 @@ func testAllocator(c *C, maxID idpool.ID, allocatorName string, suffix string) {
 	// refcnt should be back to 1
 	for i := idpool.ID(1); i <= maxID; i++ {
 		key := TestAllocatorKey(fmt.Sprintf("key%04d", i))
-		c.Assert(allocator.localKeys.keys[allocator.encodeKey(key)].refcnt, Equals, uint64(1))
+		require.Equal(t, uint64(1), allocator.localKeys.keys[key.GetKey()].refcnt)
 	}
 
 	rateLimiter := rate.NewLimiter(10*time.Second, 100)
 
 	// running the GC should not evict any entries
-	allocator.RunGC(rateLimiter, nil)
+	allocator.RunGC(context.Background(), rateLimiter, nil)
 
 	// release final reference of all IDs
 	for i := idpool.ID(1); i <= maxID; i++ {
@@ -365,31 +390,31 @@ func testAllocator(c *C, maxID idpool.ID, allocatorName string, suffix string) {
 
 	for i := idpool.ID(1); i <= maxID; i++ {
 		key := TestAllocatorKey(fmt.Sprintf("key%04d", i))
-		c.Assert(allocator.localKeys.keys[allocator.encodeKey(key)], IsNil)
+		require.NotContains(t, allocator.localKeys.keys, key.GetKey())
 	}
 
 	// running the GC should evict all entries
-	allocator.RunGC(rateLimiter, nil)
+	allocator.RunGC(context.Background(), rateLimiter, nil)
 
 	allocator.DeleteAllKeys()
 	allocator.Delete()
 	allocator2.Delete()
 }
 
-func (s *AllocatorSuite) TestAllocateCached(c *C) {
-	testAllocator(c, idpool.ID(256), randomTestName(), "a") // enable use of local cache
+func TestAllocateCached(t *testing.T) {
+	testAllocator(t, idpool.ID(256)) // enable use of local cache
 }
 
 func TestObserveAllocatorChanges(t *testing.T) {
 	backend := newDummyBackend()
-	allocator, err := NewAllocator(TestAllocatorKey(""), backend, WithMin(idpool.ID(1)), WithMax(idpool.ID(256)), WithoutGC())
+	allocator, err := NewAllocator(hivetest.Logger(t), TestAllocatorKey(""), backend, WithMin(idpool.ID(1)), WithMax(idpool.ID(256)), WithoutGC())
 	require.NoError(t, err)
 	require.NotNil(t, allocator)
 
 	numAllocations := 10
 
 	// Allocate few ids
-	for i := 0; i < numAllocations; i++ {
+	for i := range numAllocations {
 		key := TestAllocatorKey(fmt.Sprintf("key%04d", i))
 		id, new, firstUse, err := allocator.Allocate(context.Background(), key)
 		require.NoError(t, err)
@@ -398,13 +423,13 @@ func TestObserveAllocatorChanges(t *testing.T) {
 		require.True(t, firstUse)
 
 		// refcnt must be 1
-		require.Equal(t, uint64(1), allocator.localKeys.keys[allocator.encodeKey(key)].refcnt)
+		require.Equal(t, uint64(1), allocator.localKeys.keys[key.GetKey()].refcnt)
 	}
 
 	// Subscribe to the changes. This should replay the current state.
 	ctx, cancel := context.WithCancel(context.Background())
 	changes := stream.ToChannel[AllocatorChange](ctx, allocator)
-	for i := 0; i < numAllocations; i++ {
+	for range numAllocations {
 		change := <-changes
 		// Since these are replayed in hash map traversal order, just validate that
 		// the fields are set.
@@ -419,7 +444,7 @@ func TestObserveAllocatorChanges(t *testing.T) {
 
 	// Simulate changes to the allocations via the backend
 	go func() {
-		backend.handler.OnAdd(idpool.ID(123), TestAllocatorKey("remote"))
+		backend.handler.OnUpsert(idpool.ID(123), TestAllocatorKey("remote"))
 		backend.handler.OnDelete(idpool.ID(123), TestAllocatorKey("remote"))
 	}()
 
@@ -445,7 +470,7 @@ func TestHandleK8sDelete(t *testing.T) {
 	masterKeyRecreateMaxInterval = time.Millisecond
 	backend := newDummyBackend()
 
-	alloc, err := NewAllocator(TestAllocatorKey(""), backend)
+	alloc, err := NewAllocator(hivetest.Logger(t), TestAllocatorKey(""), backend)
 	alloc.idPool = idpool.NewIDPool(1234, 1234)
 	alloc.enableMasterKeyProtection = true
 	require.NoError(t, err)
@@ -456,13 +481,13 @@ func TestHandleK8sDelete(t *testing.T) {
 	require.True(t, newlyAllocated)
 
 	var counter atomic.Uint32
-	backend.updateKey = func(ctx context.Context, id idpool.ID, key AllocatorKey) error {
+	backend.setUpdateMasterKeyMutator(func(ctx context.Context, id idpool.ID, key AllocatorKey) error {
 		counter.Add(1)
 		if counter.Load() <= 2 {
 			return fmt.Errorf("updateKey failed: %d", counter.Load())
 		}
 		return nil
-	}
+	})
 
 	assertBackendContains := func(t assert.TestingT, id int, key string) {
 		k, err := backend.GetByID(context.TODO(), idpool.ID(id))
@@ -492,7 +517,7 @@ func TestHandleK8sDelete(t *testing.T) {
 	// 3. Simulate delete event where master key protection is enabled
 	// but the identity is not owned locally.
 	alloc.enableMasterKeyProtection = true
-	alloc.mainCache.OnAdd(4321, TestAllocatorKey("bar"))
+	alloc.mainCache.OnUpsert(4321, TestAllocatorKey("bar"))
 	assert.Contains(t, alloc.mainCache.nextCache, idpool.ID(4321))
 	assert.Contains(t, alloc.mainCache.nextKeyCache, "bar")
 	alloc.mainCache.OnDelete(idpool.ID(4321), TestAllocatorKey("bar"))
@@ -502,13 +527,13 @@ func TestHandleK8sDelete(t *testing.T) {
 
 func TestWatchRemoteKVStore(t *testing.T) {
 	var wg sync.WaitGroup
-	var synced bool
+	var synced atomic.Bool
 
-	run := func(ctx context.Context, rc *RemoteCache) context.CancelFunc {
+	run := func(ctx context.Context, rc RemoteIDCache) context.CancelFunc {
 		ctx, cancel := context.WithCancel(ctx)
 		wg.Add(1)
 		go func() {
-			rc.Watch(ctx, func(context.Context) { synced = true })
+			rc.Watch(ctx, func(context.Context) { synced.Store(true) })
 			wg.Done()
 		}()
 		return cancel
@@ -517,10 +542,10 @@ func TestWatchRemoteKVStore(t *testing.T) {
 	stop := func(cancel context.CancelFunc) {
 		cancel()
 		wg.Wait()
-		synced = false
+		synced.Store(false)
 	}
 
-	global := Allocator{remoteCaches: make(map[string]*RemoteCache)}
+	global := Allocator{logger: hivetest.Logger(t), remoteCaches: make(map[string]*remoteCache)}
 	events := make(AllocatorEventChan, 10)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -529,7 +554,7 @@ func TestWatchRemoteKVStore(t *testing.T) {
 	defer stop(cancel)
 
 	newRemoteAllocator := func(backend Backend) *Allocator {
-		remote, err := NewAllocator(TestAllocatorKey(""), backend, WithEvents(events), WithoutAutostart(), WithoutGC())
+		remote, err := NewAllocator(hivetest.Logger(t), TestAllocatorKey(""), backend, WithEvents(events), WithoutAutostart(), WithoutGC())
 		require.NoError(t, err)
 
 		return remote
@@ -547,8 +572,8 @@ func TestWatchRemoteKVStore(t *testing.T) {
 	require.False(t, rc.Synced(), "The cache should not be synchronized")
 	cancel = run(ctx, rc)
 
-	require.Equal(t, AllocatorEvent{ID: idpool.ID(1), Key: TestAllocatorKey("foo"), Typ: kvstore.EventTypeModify}, <-events)
-	require.Equal(t, AllocatorEvent{ID: idpool.ID(2), Key: TestAllocatorKey("baz"), Typ: kvstore.EventTypeModify}, <-events)
+	require.Equal(t, AllocatorEvent{ID: idpool.ID(1), Key: TestAllocatorKey("foo"), Typ: AllocatorChangeUpsert}, <-events)
+	require.Equal(t, AllocatorEvent{ID: idpool.ID(2), Key: TestAllocatorKey("baz"), Typ: AllocatorChangeUpsert}, <-events)
 
 	require.Eventually(t, func() bool {
 		global.remoteCachesMutex.RLock()
@@ -557,7 +582,7 @@ func TestWatchRemoteKVStore(t *testing.T) {
 	}, 1*time.Second, 10*time.Millisecond)
 
 	require.True(t, rc.Synced(), "The cache should now be synchronized")
-	require.True(t, synced, "The on-sync callback should have been executed")
+	require.True(t, synced.Load(), "The on-sync callback should have been executed")
 	stop(cancel)
 	require.False(t, rc.Synced(), "The cache should no longer be synchronized when stopped")
 
@@ -573,9 +598,9 @@ func TestWatchRemoteKVStore(t *testing.T) {
 	rc = global.NewRemoteCache("remote", remote)
 	cancel = run(ctx, rc)
 
-	require.Equal(t, AllocatorEvent{ID: idpool.ID(1), Key: TestAllocatorKey("qux"), Typ: kvstore.EventTypeModify}, <-events)
-	require.Equal(t, AllocatorEvent{ID: idpool.ID(5), Key: TestAllocatorKey("bar"), Typ: kvstore.EventTypeModify}, <-events)
-	require.Equal(t, AllocatorEvent{ID: idpool.ID(2), Key: TestAllocatorKey("baz"), Typ: kvstore.EventTypeDelete}, <-events)
+	require.Equal(t, AllocatorEvent{ID: idpool.ID(1), Key: TestAllocatorKey("qux"), Typ: AllocatorChangeUpsert}, <-events)
+	require.Equal(t, AllocatorEvent{ID: idpool.ID(5), Key: TestAllocatorKey("bar"), Typ: AllocatorChangeUpsert}, <-events)
+	require.Equal(t, AllocatorEvent{ID: idpool.ID(2), Key: TestAllocatorKey("baz"), Typ: AllocatorChangeDelete}, <-events)
 
 	require.Eventually(t, func() bool {
 		global.remoteCachesMutex.RLock()
@@ -599,17 +624,17 @@ func TestWatchRemoteKVStore(t *testing.T) {
 	oc := global.NewRemoteCache("remote", remote)
 	cancel = run(ctx, oc)
 
-	require.Equal(t, AllocatorEvent{ID: idpool.ID(1), Key: TestAllocatorKey("qux"), Typ: kvstore.EventTypeModify}, <-events)
-	require.Equal(t, AllocatorEvent{ID: idpool.ID(7), Key: TestAllocatorKey("foo"), Typ: kvstore.EventTypeModify}, <-events)
+	require.Equal(t, AllocatorEvent{ID: idpool.ID(1), Key: TestAllocatorKey("qux"), Typ: AllocatorChangeUpsert}, <-events)
+	require.Equal(t, AllocatorEvent{ID: idpool.ID(7), Key: TestAllocatorKey("foo"), Typ: AllocatorChangeUpsert}, <-events)
 	require.False(t, rc.Synced(), "The cache should not be synchronized if the ListDone event has not been received")
-	require.False(t, synced, "The on-sync callback should not have been executed if the ListDone event has not been received")
+	require.False(t, synced.Load(), "The on-sync callback should not have been executed if the ListDone event has not been received")
 
 	stop(cancel)
 
-	require.Equal(t, AllocatorEvent{ID: idpool.ID(7), Key: TestAllocatorKey("foo"), Typ: kvstore.EventTypeDelete}, <-events)
+	require.Equal(t, AllocatorEvent{ID: idpool.ID(7), Key: TestAllocatorKey("foo"), Typ: AllocatorChangeDelete}, <-events)
 	require.Equal(t, rc, global.remoteCaches["remote"])
 
-	require.Len(t, events, 0)
+	require.Empty(t, events)
 
 	// Remove the remote caches and assert that a deletion event is triggered
 	// for all entries.
@@ -624,6 +649,180 @@ func TestWatchRemoteKVStore(t *testing.T) {
 	drained[1] = <-events
 	sort.Slice(drained, func(i, j int) bool { return drained[i].ID < drained[j].ID })
 
-	require.Equal(t, AllocatorEvent{ID: idpool.ID(1), Key: TestAllocatorKey("qux"), Typ: kvstore.EventTypeDelete}, drained[0])
-	require.Equal(t, AllocatorEvent{ID: idpool.ID(5), Key: TestAllocatorKey("bar"), Typ: kvstore.EventTypeDelete}, drained[1])
+	require.Equal(t, AllocatorEvent{ID: idpool.ID(1), Key: TestAllocatorKey("qux"), Typ: AllocatorChangeDelete}, drained[0])
+	require.Equal(t, AllocatorEvent{ID: idpool.ID(5), Key: TestAllocatorKey("bar"), Typ: AllocatorChangeDelete}, drained[1])
+}
+
+func TestCacheValidators(t *testing.T) {
+	const (
+		validID   = 10
+		invalidID = 11
+		key       = TestAllocatorKey("key")
+	)
+
+	var (
+		kind    AllocatorChangeKind
+		backend = &dummyBackend{disableListDone: true}
+		events  = make(chan AllocatorEvent, 1)
+	)
+
+	allocator, err := NewAllocator(
+		hivetest.Logger(t),
+		TestAllocatorKey(""), backend,
+		WithEvents(events), WithoutGC(),
+		WithCacheValidator(func(k AllocatorChangeKind, id idpool.ID, _ AllocatorKey) error {
+			kind = k
+			if id == invalidID {
+				return errors.New("invalid")
+			}
+			return nil
+		}),
+	)
+	require.NoError(t, err)
+	allocator.mainCache.OnListDone()
+
+	t.Cleanup(func() { allocator.Delete() })
+
+	allocator.mainCache.OnUpsert(validID, key)
+	require.Len(t, events, 1, "Valid upsert event should be propagated")
+	require.Equal(t, AllocatorEvent{AllocatorChangeUpsert, validID, key}, <-events)
+	require.Equal(t, key, allocator.mainCache.getByID(validID))
+	require.Equal(t, AllocatorChangeUpsert, kind)
+
+	allocator.mainCache.OnDelete(validID, key)
+	require.Len(t, events, 1, "Valid deletion event should be propagated")
+	require.Equal(t, AllocatorEvent{AllocatorChangeDelete, validID, key}, <-events)
+	require.Nil(t, allocator.mainCache.getByID(validID))
+	require.Equal(t, AllocatorChangeDelete, kind)
+
+	allocator.mainCache.OnUpsert(invalidID, key)
+	require.Empty(t, events, "Invalid upsert event should not be propagated")
+	require.Nil(t, allocator.mainCache.getByID(invalidID))
+	require.Equal(t, AllocatorChangeUpsert, kind)
+
+	allocator.mainCache.OnDelete(invalidID, key)
+	require.Empty(t, events, "Invalid delete event should not be propagated")
+	require.Nil(t, allocator.mainCache.getByID(invalidID))
+	require.Equal(t, AllocatorChangeDelete, kind)
+}
+
+func TestSyncLocalKeys(t *testing.T) {
+	numIDs := idpool.ID(3)
+	backend := newDummyBackend()
+	allocator, err := NewAllocator(hivetest.Logger(t), TestAllocatorKey(""), backend, WithMax(numIDs))
+	require.NoError(t, err)
+	require.NotNil(t, allocator)
+
+	var ids []idpool.ID
+
+	// allocate IDs
+	for i := idpool.ID(1); i <= numIDs; i++ {
+		key := TestAllocatorKey(fmt.Sprintf("key-%04d", i))
+		id, _, _, err := allocator.Allocate(context.Background(), key)
+		require.NoError(t, err)
+		require.NotEqual(t, idpool.NoID, id)
+		ids = append(ids, id)
+
+		// Ensure id stored in backend is the same
+		backendID, err := backend.Get(context.TODO(), key)
+		require.NoError(t, err)
+		require.Equal(t, backendID, id)
+	}
+
+	allocator.syncLocalKeys()
+
+	// Release the use one id/delete the slave key
+	key, err := backend.GetByID(context.TODO(), ids[0])
+	require.NoError(t, err)
+	err = backend.Release(context.TODO(), ids[0], key)
+	require.NoError(t, err)
+
+	// Delete the master key of one ID
+	err = backend.DeleteID(context.TODO(), ids[1])
+	require.NoError(t, err)
+
+	// Delete both master and slave key for another ID
+	key, err = backend.GetByID(context.TODO(), ids[2])
+	require.NoError(t, err)
+	err = backend.Release(context.TODO(), ids[2], key)
+	require.NoError(t, err)
+	err = backend.DeleteID(context.TODO(), ids[2])
+	require.NoError(t, err)
+
+	allocator.syncLocalKeys()
+
+	// Ensure all IDs are present
+	for i := idpool.ID(1); i <= numIDs; i++ {
+		key := TestAllocatorKey(fmt.Sprintf("key-%04d", i))
+
+		// Ensure all slave keys are present via Get
+		backendID, err := backend.Get(context.TODO(), key)
+		require.NoError(t, err)
+		require.NotEqual(t, idpool.NoID, backendID)
+
+		// Ensure all master keys are present via GetById
+		backendKey, err := backend.GetByID(context.TODO(), backendID)
+		require.NoError(t, err)
+		require.Equal(t, key, backendKey)
+	}
+
+}
+
+func TestSyncLocalKeysWithIdentityAllocations(t *testing.T) {
+	numIDs := idpool.ID(500)
+	backend := newDummyBackend()
+	allocator, err := NewAllocator(hivetest.Logger(t), TestAllocatorKey(""), backend, WithMax(100*numIDs))
+	require.NoError(t, err)
+	require.NotNil(t, allocator)
+
+	allocateKeys := func(prefix string) func() {
+		// allocate IDs
+		for i := idpool.ID(1); i <= numIDs; i++ {
+			key := TestAllocatorKey(fmt.Sprintf("%s-key-%04d", prefix, i))
+			id, _, _, err := allocator.Allocate(context.Background(), key)
+			require.NoError(t, err)
+			require.NotEqual(t, idpool.NoID, id)
+		}
+		return func() {
+			for i := idpool.ID(1); i <= numIDs; i++ {
+				key := TestAllocatorKey(fmt.Sprintf("%s-key-%04d", prefix, i))
+				_, err := allocator.Release(context.TODO(), key)
+				require.NoError(t, err)
+			}
+		}
+	}
+	releaseKeys := allocateKeys("initial")
+
+	backend.setUpdateSlaveKeyMutator(func(ctx context.Context, id idpool.ID, key AllocatorKey) error {
+		time.Sleep(time.Microsecond)
+		return nil
+	})
+	done := make(chan struct{})
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		for {
+			select {
+			case <-done:
+				wg.Done()
+				return
+			default:
+				allocator.syncLocalKeys()
+			}
+		}
+	}()
+
+	// Release keys concurrently with syncLocalKeys
+	go func() {
+		releaseKeys()
+		releaseExtraKeys := allocateKeys("extra")
+		releaseExtraKeys()
+		close(done)
+	}()
+
+	wg.Wait()
+
+	// Ensure all slave keys are deleted, and non are leaked
+	assert.Empty(t, backend.slaveKeys)
 }

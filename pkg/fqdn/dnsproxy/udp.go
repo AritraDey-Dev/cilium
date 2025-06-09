@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 	"sync"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
 	"github.com/cilium/cilium/pkg/fqdn/proxy/ipfamily"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
 )
 
@@ -44,16 +46,17 @@ var udpOOBSize = func() int {
 //     v4 address from a socket bound to "::1" does not work due to kernel
 //     checking that a route exists from the source address before
 //     the source address is replaced with the (transparently) changed one
-func NewSessionUDPFactory(ipFamily ipfamily.IPFamily) (dns.SessionUDPFactory, error) {
+func NewSessionUDPFactory(logger *slog.Logger, ipFamily ipfamily.IPFamily) (dns.SessionUDPFactory, error) {
 	rawResponseConn, err := bindResponseUDPConnection(ipFamily)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open raw UDP %s socket for DNS Proxy: %w", ipFamily.Name, err)
 	}
 
-	return &sessionUDPFactory{rawResponseConn: rawResponseConn}, nil
+	return &sessionUDPFactory{logger: logger, rawResponseConn: rawResponseConn}, nil
 }
 
 type sessionUDPFactory struct {
+	logger *slog.Logger
 	// A pool for UDP message buffers.
 	udpPool sync.Pool
 
@@ -65,15 +68,16 @@ type sessionUDPFactory struct {
 // sessionUDP implements the dns.SessionUDP, holding the remote address and the associated
 // out-of-band data.
 type sessionUDP struct {
-	f     *sessionUDPFactory // owner
-	conn  *net.UDPConn       // UDP socket for receiving both IPv4 and IPv6
-	raddr *net.UDPAddr
-	laddr *net.UDPAddr
-	m     []byte
-	oob   []byte
+	logger *slog.Logger
+	f      *sessionUDPFactory // owner
+	conn   *net.UDPConn       // UDP socket for receiving both IPv4 and IPv6
+	raddr  *net.UDPAddr
+	laddr  *net.UDPAddr
+	m      []byte
+	oob    []byte
 }
 
-// Set the socket options needed for tranparent proxying for the listening socket
+// Set the socket options needed for transparent proxying for the listening socket
 // IP(V6)_TRANSPARENT allows socket to receive packets with any destination address/port
 // IP(V6)_RECVORIGDSTADDR tells the kernel to pass the original destination address/port on recvmsg
 // By design, a socket of a DNS Server can only receive IPv4 or IPv6 traffic.
@@ -90,7 +94,7 @@ func transparentSetsockopt(fd int, ipFamily ipfamily.IPFamily) error {
 
 // listenConfig sets the socket options for the fqdn proxy transparent socket.
 // Note that it is also used for TCP sockets.
-func listenConfig(mark int, ipFamily ipfamily.IPFamily) *net.ListenConfig {
+func listenConfig(mark uint32, ipFamily ipfamily.IPFamily) *net.ListenConfig {
 	return &net.ListenConfig{
 		Control: func(_, _ string, c syscall.RawConn) error {
 			var opErr error
@@ -100,7 +104,7 @@ func listenConfig(mark int, ipFamily ipfamily.IPFamily) *net.ListenConfig {
 					return
 				}
 				if mark != 0 {
-					if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, mark); err != nil {
+					if err := unix.SetsockoptUint64(int(fd), unix.SOL_SOCKET, unix.SO_MARK, uint64(mark)); err != nil {
 						opErr = fmt.Errorf("setsockopt(SO_MARK) failed: %w", err)
 						return
 					}
@@ -143,11 +147,12 @@ func (f *sessionUDPFactory) SetSocketOptions(_ *net.UDPConn) error {
 
 // InitPool initializes a pool of buffers to be used with SessionUDP.
 func (f *sessionUDPFactory) InitPool(msgSize int) {
-	f.udpPool.New = func() interface{} {
+	f.udpPool.New = func() any {
 		return &sessionUDP{
-			f:   f,
-			m:   make([]byte, msgSize),
-			oob: make([]byte, udpOOBSize),
+			logger: f.logger,
+			f:      f,
+			m:      make([]byte, msgSize),
+			oob:    make([]byte, udpOOBSize),
 		}
 	}
 }
@@ -222,9 +227,14 @@ func (s *sessionUDP) WriteResponse(b []byte) (int, error) {
 
 	n, _, err = s.f.rawResponseConn.WriteMsgIP(buf, s.controlMessage(s.laddr), &dst)
 	if err != nil {
-		log.WithError(err).Warning("WriteMsgIP failed")
+		s.logger.Warn("WriteMsgIP failed", logfields.Error, err)
 	} else {
-		log.Debugf("dnsproxy: Wrote DNS response (%d/%d bytes) from %s to %s", n-8, l, s.laddr.String(), s.raddr.String())
+		s.logger.Debug("dnsproxy: Wrote DNS response",
+			logfields.WrittenBytes, n-8,
+			logfields.TotalBytes, l,
+			logfields.Source, s.laddr,
+			logfields.Destination, s.raddr,
+		)
 	}
 	return n, err
 }
@@ -233,46 +243,30 @@ func (s *sessionUDP) WriteResponse(b []byte) (int, error) {
 func parseDstFromOOB(oob []byte) (*net.UDPAddr, error) {
 	msgs, err := unix.ParseSocketControlMessage(oob)
 	if err != nil {
-		return nil, fmt.Errorf("parsing socket control message: %s", err)
+		return nil, fmt.Errorf("parsing socket control message: %w", err)
 	}
 
 	for _, msg := range msgs {
-		if msg.Header.Level == unix.SOL_IP && msg.Header.Type == unix.IP_ORIGDSTADDR {
-			pp := &unix.RawSockaddrInet4{}
-			// Address family is in native byte order
-			family := *(*uint16)(unsafe.Pointer(&msg.Data[unsafe.Offsetof(pp.Family)]))
-			if family != unix.AF_INET {
-				return nil, fmt.Errorf("original destination is not IPv4")
-			}
-			// Port is in big-endian byte order
-			if err = binary.Read(bytes.NewReader(msg.Data), binary.BigEndian, pp); err != nil {
-				return nil, fmt.Errorf("reading original destination address: %s", err)
-			}
-			laddr := &net.UDPAddr{
-				IP:   net.IPv4(pp.Addr[0], pp.Addr[1], pp.Addr[2], pp.Addr[3]),
-				Port: int(pp.Port),
-			}
-			return laddr, nil
+		sockaddr, err := unix.ParseOrigDstAddr(&msg)
+		if err != nil {
+			// The above will _only_ fail if the message was not a OrigDstAddr,
+			// hence we just skip here and error later if we don't find any.
+			continue
 		}
-		if msg.Header.Level == unix.SOL_IPV6 && msg.Header.Type == unix.IPV6_ORIGDSTADDR {
-			pp := &unix.RawSockaddrInet6{}
-			// Address family is in native byte order
-			family := *(*uint16)(unsafe.Pointer(&msg.Data[unsafe.Offsetof(pp.Family)]))
-			if family != unix.AF_INET6 {
-				return nil, fmt.Errorf("original destination is not IPv6")
-			}
-			// Scope ID is in native byte order
-			scopeId := *(*uint32)(unsafe.Pointer(&msg.Data[unsafe.Offsetof(pp.Scope_id)]))
-			// Rest of the data is big-endian (port)
-			if err = binary.Read(bytes.NewReader(msg.Data), binary.BigEndian, pp); err != nil {
-				return nil, fmt.Errorf("reading original destination address: %s", err)
-			}
-			laddr := &net.UDPAddr{
-				IP:   net.IP(pp.Addr[:]),
-				Port: int(pp.Port),
-				Zone: strconv.Itoa(int(scopeId)),
-			}
-			return laddr, nil
+		switch sa := sockaddr.(type) {
+		case *unix.SockaddrInet4:
+			return &net.UDPAddr{
+				IP:   net.IP(sa.Addr[:]),
+				Port: sa.Port,
+			}, nil
+		case *unix.SockaddrInet6:
+			return &net.UDPAddr{
+				IP:   net.IP(sa.Addr[:]),
+				Port: sa.Port,
+				Zone: strconv.Itoa(int(sa.ZoneId)),
+			}, nil
+		default:
+			return nil, fmt.Errorf("original destination is neither IPv4 nor IPv6")
 		}
 	}
 	return nil, fmt.Errorf("no original destination found")

@@ -4,18 +4,18 @@
 package iptables
 
 import (
-	"github.com/cilium/cilium/pkg/sysctl"
+	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 )
 
-func enableIPForwarding(ipv6 bool) error {
-	if err := sysctl.Enable("net.ipv4.ip_forward"); err != nil {
+func enableIPForwarding(sysctl sysctl.Sysctl, ipv6 bool) error {
+	if err := sysctl.Enable([]string{"net", "ipv4", "ip_forward"}); err != nil {
 		return err
 	}
-	if err := sysctl.Enable("net.ipv4.conf.all.forwarding"); err != nil {
+	if err := sysctl.Enable([]string{"net", "ipv4", "conf", "all", "forwarding"}); err != nil {
 		return err
 	}
 	if ipv6 {
-		if err := sysctl.Enable("net.ipv6.conf.all.forwarding"); err != nil {
+		if err := sysctl.Enable([]string{"net", "ipv6", "conf", "all", "forwarding"}); err != nil {
 			return err
 		}
 	}

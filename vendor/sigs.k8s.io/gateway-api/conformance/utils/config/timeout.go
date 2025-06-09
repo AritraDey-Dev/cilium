@@ -19,6 +19,10 @@ package config
 import "time"
 
 type TimeoutConfig struct {
+	// TestIsolation represents the time block between test cases to enhance test isolation.
+	// Max value for conformant implementation: None
+	TestIsolation time.Duration
+
 	// CreateTimeout represents the maximum time for a Kubernetes object to be created.
 	// Max value for conformant implementation: None
 	CreateTimeout time.Duration
@@ -44,9 +48,9 @@ type TimeoutConfig struct {
 	// Max value for conformant implementation: None
 	GatewayStatusMustHaveListeners time.Duration
 
-	// GatewayListenersMustHaveCondition represents the maximum time for a Gateway to have all listeners with a specific condition.
+	// GatewayListenersMustHaveConditions represents the maximum time for a Gateway to have all listeners with a specific condition.
 	// Max value for conformant implementation: None
-	GatewayListenersMustHaveCondition time.Duration
+	GatewayListenersMustHaveConditions time.Duration
 
 	// GWCMustBeAccepted represents the maximum time for a GatewayClass to have an Accepted condition set to true.
 	// Max value for conformant implementation: None
@@ -60,7 +64,7 @@ type TimeoutConfig struct {
 	// Max value for conformant implementation: None
 	HTTPRouteMustHaveCondition time.Duration
 
-	// TLSRouteMustHaveCondition represents the maximum time for an TLSRoute to have the supplied Condition.
+	// TLSRouteMustHaveCondition represents the maximum time for a TLSRoute to have the supplied Condition.
 	// Max value for conformant implementation: None
 	TLSRouteMustHaveCondition time.Duration
 
@@ -91,6 +95,9 @@ type TimeoutConfig struct {
 	// Max value for conformant implementation: None
 	LatestObservedGenerationSet time.Duration
 
+	// DefaultTestTimeout is the default amount of time to wait for a test to complete
+	DefaultTestTimeout time.Duration
+
 	// RequiredConsecutiveSuccesses is the number of requests that must succeed in a row
 	// to consider a response "consistent" before making additional assertions on the response body.
 	// If this number is not reached within MaxTimeToConsistency, the test will fail.
@@ -100,24 +107,25 @@ type TimeoutConfig struct {
 // DefaultTimeoutConfig populates a TimeoutConfig with the default values.
 func DefaultTimeoutConfig() TimeoutConfig {
 	return TimeoutConfig{
-		CreateTimeout:                     60 * time.Second,
-		DeleteTimeout:                     10 * time.Second,
-		GetTimeout:                        10 * time.Second,
-		GatewayMustHaveAddress:            180 * time.Second,
-		GatewayMustHaveCondition:          180 * time.Second,
-		GatewayStatusMustHaveListeners:    60 * time.Second,
-		GatewayListenersMustHaveCondition: 60 * time.Second,
-		GWCMustBeAccepted:                 180 * time.Second,
-		HTTPRouteMustNotHaveParents:       60 * time.Second,
-		HTTPRouteMustHaveCondition:        60 * time.Second,
-		TLSRouteMustHaveCondition:         60 * time.Second,
-		RouteMustHaveParents:              60 * time.Second,
-		ManifestFetchTimeout:              10 * time.Second,
-		MaxTimeToConsistency:              30 * time.Second,
-		NamespacesMustBeReady:             300 * time.Second,
-		RequestTimeout:                    10 * time.Second,
-		LatestObservedGenerationSet:       60 * time.Second,
-		RequiredConsecutiveSuccesses:      3,
+		CreateTimeout:                      60 * time.Second,
+		DeleteTimeout:                      10 * time.Second,
+		GetTimeout:                         10 * time.Second,
+		GatewayMustHaveAddress:             180 * time.Second,
+		GatewayMustHaveCondition:           180 * time.Second,
+		GatewayStatusMustHaveListeners:     60 * time.Second,
+		GatewayListenersMustHaveConditions: 60 * time.Second,
+		GWCMustBeAccepted:                  180 * time.Second,
+		HTTPRouteMustNotHaveParents:        60 * time.Second,
+		HTTPRouteMustHaveCondition:         60 * time.Second,
+		TLSRouteMustHaveCondition:          60 * time.Second,
+		RouteMustHaveParents:               60 * time.Second,
+		ManifestFetchTimeout:               10 * time.Second,
+		MaxTimeToConsistency:               30 * time.Second,
+		NamespacesMustBeReady:              300 * time.Second,
+		RequestTimeout:                     10 * time.Second,
+		LatestObservedGenerationSet:        60 * time.Second,
+		DefaultTestTimeout:                 60 * time.Second,
+		RequiredConsecutiveSuccesses:       3,
 	}
 }
 
@@ -141,8 +149,8 @@ func SetupTimeoutConfig(timeoutConfig *TimeoutConfig) {
 	if timeoutConfig.GatewayStatusMustHaveListeners == 0 {
 		timeoutConfig.GatewayStatusMustHaveListeners = defaultTimeoutConfig.GatewayStatusMustHaveListeners
 	}
-	if timeoutConfig.GatewayListenersMustHaveCondition == 0 {
-		timeoutConfig.GatewayListenersMustHaveCondition = defaultTimeoutConfig.GatewayListenersMustHaveCondition
+	if timeoutConfig.GatewayListenersMustHaveConditions == 0 {
+		timeoutConfig.GatewayListenersMustHaveConditions = defaultTimeoutConfig.GatewayListenersMustHaveConditions
 	}
 	if timeoutConfig.GWCMustBeAccepted == 0 {
 		timeoutConfig.GWCMustBeAccepted = defaultTimeoutConfig.GWCMustBeAccepted
@@ -173,5 +181,8 @@ func SetupTimeoutConfig(timeoutConfig *TimeoutConfig) {
 	}
 	if timeoutConfig.TLSRouteMustHaveCondition == 0 {
 		timeoutConfig.TLSRouteMustHaveCondition = defaultTimeoutConfig.TLSRouteMustHaveCondition
+	}
+	if timeoutConfig.DefaultTestTimeout == 0 {
+		timeoutConfig.DefaultTestTimeout = defaultTimeoutConfig.DefaultTestTimeout
 	}
 }

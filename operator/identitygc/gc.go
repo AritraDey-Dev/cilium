@@ -5,17 +5,16 @@ package identitygc
 
 import (
 	"fmt"
+	"log/slog"
 	"time"
 
+	"github.com/cilium/hive/cell"
 	"github.com/cilium/workerpool"
-	"github.com/sirupsen/logrus"
 
 	authIdentity "github.com/cilium/cilium/operator/auth/identity"
 	"github.com/cilium/cilium/pkg/allocator"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	"github.com/cilium/cilium/pkg/controller"
-	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2alpha1"
 	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
@@ -30,8 +29,8 @@ import (
 type params struct {
 	cell.In
 
-	Logger    logrus.FieldLogger
-	Lifecycle hive.Lifecycle
+	Logger    *slog.Logger
+	Lifecycle cell.Lifecycle
 
 	Clientset           k8sClient.Clientset
 	Identity            resource.Resource[*v2.CiliumIdentity]
@@ -48,7 +47,7 @@ type params struct {
 
 // GC represents the Cilium identities periodic GC.
 type GC struct {
-	logger logrus.FieldLogger
+	logger *slog.Logger
 
 	clientset           ciliumV2.CiliumIdentityInterface
 	identity            resource.Resource[*v2.CiliumIdentity]
@@ -80,13 +79,9 @@ type GC struct {
 	// processing each one individually.
 	rateLimiter *rate.Limiter
 
-	allocationCfg identityAllocationConfig
-	allocator     *allocator.Allocator
+	allocator *allocator.Allocator
 
-	// counters for GC failed/successful runs
-	failedRuns     int
-	successfulRuns int
-	metrics        *Metrics
+	metrics *Metrics
 }
 
 func registerGC(p params) {
@@ -109,31 +104,42 @@ func registerGC(p params) {
 		gcRateLimit:         p.Cfg.RateLimit,
 		heartbeatStore: newHeartbeatStore(
 			p.Cfg.HeartbeatTimeout,
+			p.Logger,
 		),
 		rateLimiter: rate.NewLimiter(
 			p.Cfg.RateInterval,
 			p.Cfg.RateLimit,
 		),
-		allocationCfg: identityAllocationConfig{
-			k8sNamespace: p.SharedCfg.K8sNamespace,
-		},
 		metrics: p.Metrics,
 	}
-	p.Lifecycle.Append(hive.Hook{
-		OnStart: func(ctx hive.HookContext) error {
-			gc.wp = workerpool.New(1)
-
+	p.Lifecycle.Append(cell.Hook{
+		OnStart: func(ctx cell.HookContext) error {
 			switch gc.allocationMode {
 			case option.IdentityAllocationModeCRD:
+				gc.wp = workerpool.New(1)
 				return gc.startCRDModeGC(ctx)
 			case option.IdentityAllocationModeKVstore:
+				gc.wp = workerpool.New(1)
 				return gc.startKVStoreModeGC(ctx)
+			case option.IdentityAllocationModeDoubleWriteReadCRD, option.IdentityAllocationModeDoubleWriteReadKVstore:
+				gc.wp = workerpool.New(2)
+				err := gc.startCRDModeGC(ctx)
+				if err != nil {
+					return err
+				}
+				err = gc.startKVStoreModeGC(ctx)
+				if err != nil {
+					return err
+				}
+				return nil
 			default:
 				return fmt.Errorf("unknown Cilium identity allocation mode: %q", gc.allocationMode)
 			}
 		},
-		OnStop: func(ctx hive.HookContext) error {
-			if gc.allocationMode == option.IdentityAllocationModeCRD {
+		OnStop: func(ctx cell.HookContext) error {
+			if gc.allocationMode == option.IdentityAllocationModeCRD ||
+				gc.allocationMode == option.IdentityAllocationModeDoubleWriteReadCRD ||
+				gc.allocationMode == option.IdentityAllocationModeDoubleWriteReadKVstore {
 				// CRD mode GC runs in an additional goroutine
 				gc.mgr.RemoveAllAndWait()
 			}
@@ -143,13 +149,4 @@ func registerGC(p params) {
 			return nil
 		},
 	})
-}
-
-// identityAllocationConfig is a helper struct that satisfies the Configuration interface.
-type identityAllocationConfig struct {
-	k8sNamespace string
-}
-
-func (cfg identityAllocationConfig) CiliumNamespaceName() string {
-	return cfg.k8sNamespace
 }

@@ -5,9 +5,10 @@ package cmd
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"reflect"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -84,10 +85,14 @@ func configDaemon(cmd *cobra.Command, opts []string) {
 			continue
 		}
 
-		name, value, err := option.ParseDaemonOption(opts[k])
+		name, value, deprecated, err := option.ParseDaemonOption(opts[k])
 		if err != nil {
 			fmt.Printf("%s\n", err)
 			os.Exit(1)
+		}
+
+		if deprecated {
+			fmt.Fprintf(os.Stderr, "Option %s is deprecated", name)
 		}
 
 		if opt, ok := option.DaemonMutableOptionLibrary[name]; !ok || opt.Parse == nil {
@@ -136,16 +141,11 @@ func printConfigurations(cfgStatus *models.DaemonConfigurationStatus) {
 
 func dumpReadOnlyConfigs(cfgStatus *models.DaemonConfigurationStatus) {
 	fmt.Println("#### Read-only configurations ####")
-	keys := make([]string, 0, len(cfgStatus.DaemonConfigurationMap))
-	for k := range cfgStatus.DaemonConfigurationMap {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
+	for _, k := range slices.Sorted(maps.Keys(cfgStatus.DaemonConfigurationMap)) {
 		v := cfgStatus.DaemonConfigurationMap[k]
 		if reflect.ValueOf(v).Kind() == reflect.Map {
 			mapString := make(map[string]string)
-			m, ok := v.(map[string]interface{})
+			m, ok := v.(map[string]any)
 			if ok {
 				fmt.Println(k)
 				for key, value := range m {
