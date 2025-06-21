@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"runtime"
 	"testing"
 
 	"github.com/cilium/ebpf/rlimit"
@@ -18,6 +19,7 @@ import (
 	"github.com/spf13/afero"
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netns"
 
 	"github.com/cilium/cilium/pkg/cidr"
 	fakeTypes "github.com/cilium/cilium/pkg/datapath/fake/types"
@@ -117,7 +119,36 @@ func writeConfig(t *testing.T, header string, write writeFn) {
 	}
 }
 
+func setupTestNetnsWithDevices(t *testing.T) (cleanup func()) {
+	runtime.LockOSThread()
+	origNS, err := netns.Get()
+	require.NoError(t, err)
+
+	testNS, err := netns.New()
+	require.NoError(t, err)
+
+	err = netns.Set(testNS)
+	require.NoError(t, err)
+
+	ciliumNet := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "cilium_net"}}
+	require.NoError(t, netlink.LinkAdd(ciliumNet))
+	require.NoError(t, netlink.LinkSetUp(ciliumNet))
+
+	ciliumHost := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "cilium_host"}}
+	require.NoError(t, netlink.LinkAdd(ciliumHost))
+	require.NoError(t, netlink.LinkSetUp(ciliumHost))
+
+	return func() {
+		netns.Set(origNS)
+		testNS.Close()
+		origNS.Close()
+		runtime.UnlockOSThread()
+	}
+}
+
 func TestWriteNodeConfig(t *testing.T) {
+	cleanup := setupTestNetnsWithDevices(t)
+	defer cleanup()
 	setupConfigSuite(t)
 	writeConfig(t, "node", func(w io.Writer, dp datapath.ConfigWriter) error {
 		return dp.WriteNodeConfig(w, &dummyNodeCfg)
@@ -234,6 +265,8 @@ return false;`, main1.Index, main2.Index), m)
 }
 
 func TestWriteNodeConfigExtraDefines(t *testing.T) {
+	cleanup := setupTestNetnsWithDevices(t)
+	defer cleanup()
 	testutils.PrivilegedTest(t)
 	setupConfigSuite(t)
 
@@ -382,6 +415,8 @@ func TestPreferredIPv6Address(t *testing.T) {
 }
 
 func TestNewHeaderfileWriter(t *testing.T) {
+	cleanup := setupTestNetnsWithDevices(t)
+	defer cleanup()
 	testutils.PrivilegedTest(t)
 	setupConfigSuite(t)
 
