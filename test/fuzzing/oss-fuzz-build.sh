@@ -18,6 +18,7 @@ ln -s "$SRC"/cilium/pkg/policy/resolve_test{,_fuzz}.go
 ln -s "$SRC"/cilium/pkg/policy/resolve_deny_test{,_fuzz}.go
 ln -s "$SRC"/cilium/pkg/policy/rule_test{,_fuzz}.go
 ln -s "$SRC"/cilium/pkg/policy/selectorcache_test{,_fuzz}.go
+ln -s "$SRC"/cilium/pkg/policy/fuzz_test{,_fuzz}.go
 
 
 compile_native_go_fuzzer github.com/cilium/cilium/pkg/container/bitlpm FuzzUint8 FuzzUint8
